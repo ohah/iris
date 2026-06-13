@@ -61,6 +61,7 @@ pub const HERMES_OPCODE_COUNT: usize = 220;
 const HERMES_SOURCE_HASH_SIZE: usize = 20;
 const SMALL_FUNC_HEADER_SIZE: usize = 12;
 const LARGE_FUNC_HEADER_SIZE: usize = 36;
+const STRING_TABLE_ENTRY_SIZE: usize = 8;
 const STRING_KIND_ENTRY_SIZE: usize = 4;
 const IDENTIFIER_HASH_SIZE: usize = 4;
 const SMALL_STRING_TABLE_ENTRY_SIZE: usize = 4;
@@ -71,6 +72,10 @@ const REG_EXP_TABLE_ENTRY_SIZE: usize = 8;
 const U32_PAIR_ENTRY_SIZE: usize = 8;
 const EXCEPTION_HANDLER_TABLE_HEADER_SIZE: usize = 4;
 const EXCEPTION_HANDLER_ENTRY_SIZE: usize = 12;
+const DEBUG_INFO_HEADER_SIZE: usize = 16;
+const DEBUG_FILE_REGION_SIZE: usize = 12;
+const DEBUG_OFFSETS_SIZE: usize = 4;
+const DEBUG_OFFSETS_NO_OFFSET: u32 = u32::MAX;
 const FUNCTION_INFO_ALIGNMENT: u32 = 4;
 const SWITCH_TABLE_CASE_SIZE: usize = 8;
 const SWITCH_TABLE_ALIGNMENT: u32 = 4;
@@ -502,6 +507,7 @@ impl<'a> HermesBytecodeSections<'a> {
             reg_exp_table.bytes,
             header.reg_exp_storage_size,
         )?;
+        let debug_info = parse_debug_info(bytes, header)?;
         validate_function_headers(
             bytes,
             header,
@@ -509,6 +515,7 @@ impl<'a> HermesBytecodeSections<'a> {
             function_bodies_offset,
             literal_value_buffer,
             obj_shape_table,
+            debug_info,
         )?;
         validate_cjs_module_table(cjs_module_table.bytes, header)?;
         validate_function_source_table(function_source_table.bytes, header)?;
@@ -1260,6 +1267,24 @@ pub enum ParseError {
         /// Exclusive function info region end offset.
         limit: u32,
     },
+    /// The global debug info section extends outside the declared file body.
+    DebugInfoOutOfBounds {
+        /// Debug info byte offset.
+        offset: u32,
+        /// Debug info byte size.
+        size: u32,
+        /// Exclusive debug info section limit before the footer.
+        limit: u32,
+    },
+    /// A function points at debug data outside the global debug data payload.
+    InvalidDebugOffset {
+        /// Function id whose debug offsets are invalid.
+        function_id: u32,
+        /// Offset into the global debug data payload.
+        source_locations: u32,
+        /// Declared global debug data byte length.
+        debug_data_size: u32,
+    },
     /// An exception handler entry points outside the function body boundaries.
     InvalidExceptionHandler {
         /// Function id whose exception table is invalid.
@@ -1546,6 +1571,22 @@ impl fmt::Display for ParseError {
             } => write!(
                 formatter,
                 "Hermes bytecode function {function_id} info table at {offset} with size {size} exceeds function info limit {limit}",
+            ),
+            Self::DebugInfoOutOfBounds {
+                offset,
+                size,
+                limit,
+            } => write!(
+                formatter,
+                "Hermes bytecode debug info at {offset} with size {size} exceeds debug info limit {limit}",
+            ),
+            Self::InvalidDebugOffset {
+                function_id,
+                source_locations,
+                debug_data_size,
+            } => write!(
+                formatter,
+                "Hermes bytecode function {function_id} debug source locations offset {source_locations} exceeds debug data size {debug_data_size}",
             ),
             Self::InvalidExceptionHandler {
                 function_id,
@@ -2107,6 +2148,11 @@ struct DecodedFunctionHeader {
     large_header_offset: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DebugInfoBounds {
+    debug_data_size: u32,
+}
+
 fn function_header_at(
     bytes: &[u8],
     header: HermesBytecodeHeader,
@@ -2216,6 +2262,94 @@ fn large_header_offset_from_small(header: HermesFunctionHeader) -> u32 {
     ((header.function_name & 0xff) << 24) | (header.offset & 0x00ff_ffff)
 }
 
+fn parse_debug_info(
+    bytes: &[u8],
+    header: HermesBytecodeHeader,
+) -> Result<Option<DebugInfoBounds>, ParseError> {
+    if header.debug_info_offset == 0 {
+        return Ok(None);
+    }
+
+    let limit = header
+        .file_length
+        .saturating_sub(HERMES_BYTECODE_FOOTER_SIZE as u32);
+    let debug_header = debug_info_bytes(
+        bytes,
+        header.debug_info_offset,
+        DEBUG_INFO_HEADER_SIZE as u32,
+        limit,
+    )?;
+    let filename_count = read_u32(debug_header, 0);
+    let filename_storage_size = read_u32(debug_header, 4);
+    let file_region_count = read_u32(debug_header, 8);
+    let debug_data_size = read_u32(debug_header, 12);
+
+    let filename_table_size = filename_count
+        .checked_mul(STRING_TABLE_ENTRY_SIZE as u32)
+        .ok_or(ParseError::DebugInfoOutOfBounds {
+            offset: header
+                .debug_info_offset
+                .saturating_add(DEBUG_INFO_HEADER_SIZE as u32),
+            size: u32::MAX,
+            limit,
+        })?;
+    let file_region_table_size = file_region_count
+        .checked_mul(DEBUG_FILE_REGION_SIZE as u32)
+        .ok_or(ParseError::DebugInfoOutOfBounds {
+            offset: header
+                .debug_info_offset
+                .saturating_add(DEBUG_INFO_HEADER_SIZE as u32),
+            size: u32::MAX,
+            limit,
+        })?;
+
+    let mut cursor = header
+        .debug_info_offset
+        .checked_add(DEBUG_INFO_HEADER_SIZE as u32)
+        .ok_or(ParseError::DebugInfoOutOfBounds {
+            offset: header.debug_info_offset,
+            size: DEBUG_INFO_HEADER_SIZE as u32,
+            limit,
+        })?;
+    cursor = checked_debug_info_end(cursor, filename_table_size, limit)?;
+    cursor = checked_debug_info_end(cursor, filename_storage_size, limit)?;
+    cursor = checked_debug_info_end(cursor, file_region_table_size, limit)?;
+    checked_debug_info_end(cursor, debug_data_size, limit)?;
+
+    Ok(Some(DebugInfoBounds { debug_data_size }))
+}
+
+fn checked_debug_info_end(offset: u32, size: u32, limit: u32) -> Result<u32, ParseError> {
+    let end = offset
+        .checked_add(size)
+        .ok_or(ParseError::DebugInfoOutOfBounds {
+            offset,
+            size,
+            limit,
+        })?;
+    if end > limit {
+        return Err(ParseError::DebugInfoOutOfBounds {
+            offset,
+            size,
+            limit,
+        });
+    }
+    Ok(end)
+}
+
+fn debug_info_bytes(bytes: &[u8], offset: u32, size: u32, limit: u32) -> Result<&[u8], ParseError> {
+    let end = checked_debug_info_end(offset, size, limit)?;
+    let start = usize::try_from(offset).expect("u32 always fits in usize on supported targets");
+    let end = usize::try_from(end).expect("u32 always fits in usize on supported targets");
+    bytes
+        .get(start..end)
+        .ok_or(ParseError::DebugInfoOutOfBounds {
+            offset,
+            size,
+            limit,
+        })
+}
+
 fn validate_function_headers(
     bytes: &[u8],
     header: HermesBytecodeHeader,
@@ -2223,6 +2357,7 @@ fn validate_function_headers(
     function_bodies_offset: u32,
     literal_value_buffer: SectionView<'_>,
     obj_shape_table: SectionView<'_>,
+    debug_info: Option<DebugInfoBounds>,
 ) -> Result<(), ParseError> {
     let body_limit = function_body_limit(bytes, header, function_headers)?;
     let mut decoded_headers = Vec::with_capacity(
@@ -2263,6 +2398,7 @@ fn validate_function_headers(
             function_id,
             decoded,
             function_info_region_limit(header, decoded.large_header_offset, &decoded_headers),
+            debug_info,
         )?;
     }
     Ok(())
@@ -2301,6 +2437,7 @@ fn validate_function_info(
     function_id: u32,
     decoded: DecodedFunctionHeader,
     limit: u32,
+    debug_info: Option<DebugInfoBounds>,
 ) -> Result<(), ParseError> {
     if !decoded.header.has_exception_handler() && !decoded.header.has_debug_info() {
         return Ok(());
@@ -2308,11 +2445,8 @@ fn validate_function_info(
     let Some(info_offset) = decoded.large_header_offset else {
         return Err(ParseError::MissingFunctionInfo { function_id });
     };
-    if !decoded.header.has_exception_handler() {
-        return Ok(());
-    }
 
-    let table_header_offset = info_offset
+    let mut cursor = info_offset
         .checked_add(LARGE_FUNC_HEADER_SIZE as u32)
         .and_then(|offset| align_u32(offset, FUNCTION_INFO_ALIGNMENT))
         .ok_or(ParseError::FunctionInfoOutOfBounds {
@@ -2321,44 +2455,97 @@ fn validate_function_info(
             size: EXCEPTION_HANDLER_TABLE_HEADER_SIZE as u32,
             limit,
         })?;
-    let table_header = function_info_bytes(
-        bytes,
-        function_id,
-        table_header_offset,
-        EXCEPTION_HANDLER_TABLE_HEADER_SIZE as u32,
-        limit,
-    )?;
-    let entry_count = read_u32(table_header, 0);
-    let table_offset = table_header_offset
-        .checked_add(EXCEPTION_HANDLER_TABLE_HEADER_SIZE as u32)
-        .ok_or(ParseError::FunctionInfoOutOfBounds {
-            function_id,
-            offset: table_header_offset,
-            size: EXCEPTION_HANDLER_TABLE_HEADER_SIZE as u32,
-            limit,
-        })?;
-    let table_size = entry_count
-        .checked_mul(EXCEPTION_HANDLER_ENTRY_SIZE as u32)
-        .ok_or(ParseError::FunctionInfoOutOfBounds {
-            function_id,
-            offset: table_offset,
-            size: u32::MAX,
-            limit,
-        })?;
-    let table = function_info_bytes(bytes, function_id, table_offset, table_size, limit)?;
-    let body = function_body(bytes, function_id, decoded.header)?;
-    let boundaries = instruction_boundaries(function_id, body)?;
 
-    for (entry_index, entry) in table.chunks_exact(EXCEPTION_HANDLER_ENTRY_SIZE).enumerate() {
-        validate_exception_handler(
+    if decoded.header.has_exception_handler() {
+        let table_header = function_info_bytes(
+            bytes,
             function_id,
-            body,
-            &boundaries,
-            u32::try_from(entry_index).expect("validated exception handler index fits in u32"),
-            read_u32(entry, 0),
-            read_u32(entry, 4),
-            read_u32(entry, 8),
+            cursor,
+            EXCEPTION_HANDLER_TABLE_HEADER_SIZE as u32,
+            limit,
         )?;
+        let entry_count = read_u32(table_header, 0);
+        let table_offset = cursor
+            .checked_add(EXCEPTION_HANDLER_TABLE_HEADER_SIZE as u32)
+            .ok_or(ParseError::FunctionInfoOutOfBounds {
+                function_id,
+                offset: cursor,
+                size: EXCEPTION_HANDLER_TABLE_HEADER_SIZE as u32,
+                limit,
+            })?;
+        let table_size = entry_count
+            .checked_mul(EXCEPTION_HANDLER_ENTRY_SIZE as u32)
+            .ok_or(ParseError::FunctionInfoOutOfBounds {
+                function_id,
+                offset: table_offset,
+                size: u32::MAX,
+                limit,
+            })?;
+        let table_end =
+            table_offset
+                .checked_add(table_size)
+                .ok_or(ParseError::FunctionInfoOutOfBounds {
+                    function_id,
+                    offset: table_offset,
+                    size: table_size,
+                    limit,
+                })?;
+        let table = function_info_bytes(bytes, function_id, table_offset, table_size, limit)?;
+        let body = function_body(bytes, function_id, decoded.header)?;
+        let boundaries = instruction_boundaries(function_id, body)?;
+
+        for (entry_index, entry) in table.chunks_exact(EXCEPTION_HANDLER_ENTRY_SIZE).enumerate() {
+            validate_exception_handler(
+                function_id,
+                body,
+                &boundaries,
+                u32::try_from(entry_index).expect("validated exception handler index fits in u32"),
+                read_u32(entry, 0),
+                read_u32(entry, 4),
+                read_u32(entry, 8),
+            )?;
+        }
+        cursor = table_end;
+    }
+
+    if decoded.header.has_debug_info() {
+        let debug_offsets_offset = align_u32(cursor, FUNCTION_INFO_ALIGNMENT).ok_or(
+            ParseError::FunctionInfoOutOfBounds {
+                function_id,
+                offset: cursor,
+                size: DEBUG_OFFSETS_SIZE as u32,
+                limit,
+            },
+        )?;
+        let debug_offsets = function_info_bytes(
+            bytes,
+            function_id,
+            debug_offsets_offset,
+            DEBUG_OFFSETS_SIZE as u32,
+            limit,
+        )?;
+        validate_debug_offsets(function_id, read_u32(debug_offsets, 0), debug_info)?;
+    }
+    Ok(())
+}
+
+fn validate_debug_offsets(
+    function_id: u32,
+    source_locations: u32,
+    debug_info: Option<DebugInfoBounds>,
+) -> Result<(), ParseError> {
+    if source_locations == DEBUG_OFFSETS_NO_OFFSET {
+        return Ok(());
+    }
+    let debug_data_size = debug_info
+        .map(|bounds| bounds.debug_data_size)
+        .unwrap_or_default();
+    if source_locations >= debug_data_size {
+        return Err(ParseError::InvalidDebugOffset {
+            function_id,
+            source_locations,
+            debug_data_size,
+        });
     }
     Ok(())
 }
@@ -3395,6 +3582,18 @@ mod tests {
         declared_count: u32,
         entries: &[(u32, u32, u32)],
     ) -> u32 {
+        add_global_function_info(bytes, Some((declared_count, entries)), None)
+    }
+
+    fn add_global_debug_offsets(bytes: &mut Vec<u8>, source_locations: u32) -> u32 {
+        add_global_function_info(bytes, None, Some(source_locations))
+    }
+
+    fn add_global_function_info(
+        bytes: &mut Vec<u8>,
+        exception_table: Option<(u32, &[(u32, u32, u32)])>,
+        debug_source_locations: Option<u32>,
+    ) -> u32 {
         let (header, function_headers_offset, global) = {
             let bytecode = HermesBytecode::parse(bytes).expect("valid fixture");
             (
@@ -3413,6 +3612,13 @@ mod tests {
                 * SMALL_FUNC_HEADER_SIZE;
 
         let mut info = Vec::new();
+        let mut flags = global.flags;
+        if exception_table.is_some() {
+            flags |= 0b0000_1000;
+        }
+        if debug_source_locations.is_some() {
+            flags |= 0b0001_0000;
+        }
         info.extend_from_slice(&encode_large_function_header(SmallFunctionHeaderFixture {
             offset: global.offset,
             bytecode_size_in_bytes: global.bytecode_size_in_bytes,
@@ -3426,22 +3632,36 @@ mod tests {
             read_cache_size: global.read_cache_size,
             write_cache_size: global.write_cache_size,
             private_name_cache_size: global.private_name_cache_size,
-            flags: global.flags | 0b0000_1000,
+            flags,
         }));
-        info.extend_from_slice(&declared_count.to_le_bytes());
-        for (start, end, target) in entries {
-            info.extend_from_slice(&start.to_le_bytes());
-            info.extend_from_slice(&end.to_le_bytes());
-            info.extend_from_slice(&target.to_le_bytes());
+        if let Some((declared_count, entries)) = exception_table {
+            while !(info_offset + info.len()).is_multiple_of(
+                usize::try_from(FUNCTION_INFO_ALIGNMENT)
+                    .expect("test fixture alignment fits in usize"),
+            ) {
+                info.push(0);
+            }
+            info.extend_from_slice(&declared_count.to_le_bytes());
+            for (start, end, target) in entries {
+                info.extend_from_slice(&start.to_le_bytes());
+                info.extend_from_slice(&end.to_le_bytes());
+                info.extend_from_slice(&target.to_le_bytes());
+            }
+        }
+        if let Some(source_locations) = debug_source_locations {
+            while !(info_offset + info.len()).is_multiple_of(
+                usize::try_from(FUNCTION_INFO_ALIGNMENT)
+                    .expect("test fixture alignment fits in usize"),
+            ) {
+                info.push(0);
+            }
+            info.extend_from_slice(&source_locations.to_le_bytes());
         }
 
+        let info_size = u32::try_from(info.len()).expect("test fixture info length fits in u32");
         bytes.splice(info_offset..info_offset, info);
         let info_offset_u32 = u32::try_from(info_offset).expect("test fixture offset fits in u32");
-        let new_debug_offset = header.debug_info_offset
-            + LARGE_FUNC_HEADER_SIZE as u32
-            + EXCEPTION_HANDLER_TABLE_HEADER_SIZE as u32
-            + u32::try_from(entries.len()).expect("test fixture entry count fits in u32")
-                * EXCEPTION_HANDLER_ENTRY_SIZE as u32;
+        let new_debug_offset = header.debug_info_offset + info_size;
         let new_file_length = u32::try_from(bytes.len()).expect("test fixture length fits in u32");
         write_u32(bytes, DEBUG_INFO_OFFSET_OFFSET, new_debug_offset);
         write_u32(bytes, FILE_LENGTH_OFFSET, new_file_length);
@@ -3886,7 +4106,7 @@ mod tests {
                 read_cache_size: 1,
                 write_cache_size: 2,
                 private_name_cache_size: 1,
-                flags: 0b0001_0100,
+                flags: 0b0000_0100,
             }),
         );
         bytes[function_headers_offset..function_headers_offset + SMALL_FUNC_HEADER_SIZE]
@@ -3973,6 +4193,76 @@ mod tests {
                     + LARGE_FUNC_HEADER_SIZE as u32
                     + EXCEPTION_HANDLER_TABLE_HEADER_SIZE as u32
                     + EXCEPTION_HANDLER_ENTRY_SIZE as u32,
+            },
+        );
+    }
+
+    #[test]
+    fn accepts_debug_offsets_without_source_locations() {
+        let mut bytes = fixture_bytecode();
+        add_global_debug_offsets(&mut bytes, DEBUG_OFFSETS_NO_OFFSET);
+
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid debug offsets");
+        assert!(
+            bytecode
+                .global_function_header()
+                .expect("valid global function")
+                .has_debug_info()
+        );
+    }
+
+    #[test]
+    fn accepts_exception_table_with_debug_offsets() {
+        let mut bytes = fixture_bytecode();
+        add_global_function_info(
+            &mut bytes,
+            Some((1, &[(0, 2, 0)])),
+            Some(DEBUG_OFFSETS_NO_OFFSET),
+        );
+
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid function info");
+        let global = bytecode
+            .global_function_header()
+            .expect("valid global function");
+        assert!(global.has_exception_handler());
+        assert!(global.has_debug_info());
+    }
+
+    #[test]
+    fn rejects_debug_offset_outside_debug_data() {
+        let mut bytes = fixture_bytecode();
+        add_global_debug_offsets(&mut bytes, 0);
+
+        let error = HermesBytecode::parse(&bytes).expect_err("invalid debug offset must fail");
+        assert_eq!(
+            error,
+            ParseError::InvalidDebugOffset {
+                function_id: 1,
+                source_locations: 0,
+                debug_data_size: 0,
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_debug_info_section_outside_footer() {
+        let mut bytes = fixture_bytecode();
+        let (debug_info_offset, file_length) = {
+            let bytecode = HermesBytecode::parse(&bytes).expect("valid fixture");
+            (
+                bytecode.header().debug_info_offset,
+                bytecode.header().file_length,
+            )
+        };
+        write_u32(&mut bytes, DEBUG_INFO_OFFSET_OFFSET, debug_info_offset + 8);
+
+        let error = HermesBytecode::parse(&bytes).expect_err("short debug info must fail");
+        assert_eq!(
+            error,
+            ParseError::DebugInfoOutOfBounds {
+                offset: debug_info_offset + 8,
+                size: DEBUG_INFO_HEADER_SIZE as u32,
+                limit: file_length - HERMES_BYTECODE_FOOTER_SIZE as u32,
             },
         );
     }

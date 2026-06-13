@@ -1309,6 +1309,15 @@ pub enum ParseError {
         /// Declared debug data byte length.
         debug_data_size: u32,
     },
+    /// Debug file regions are not sorted by debug data address.
+    InvalidDebugFileRegionOrder {
+        /// Debug file region entry index.
+        region_index: u32,
+        /// Previous file region debug data offset.
+        previous_from_address: u32,
+        /// Current file region debug data offset.
+        from_address: u32,
+    },
     /// A function points at debug data outside the global debug data payload.
     InvalidDebugOffset {
         /// Function id whose debug offsets are invalid.
@@ -1641,6 +1650,14 @@ impl fmt::Display for ParseError {
             } => write!(
                 formatter,
                 "Hermes bytecode debug file region {region_index} at debug data offset {from_address} references filename {filename_id} and source map URL {source_mapping_url_id}; filename count is {filename_count}, debug data size is {debug_data_size}",
+            ),
+            Self::InvalidDebugFileRegionOrder {
+                region_index,
+                previous_from_address,
+                from_address,
+            } => write!(
+                formatter,
+                "Hermes bytecode debug file region {region_index} starts at {from_address}, not after previous region start {previous_from_address}",
             ),
             Self::InvalidDebugOffset {
                 function_id,
@@ -2448,10 +2465,21 @@ fn validate_debug_file_regions(
     filename_count: u32,
     debug_data_size: u32,
 ) -> Result<(), ParseError> {
+    let mut previous_from_address = None;
     for (index, region) in bytes.chunks_exact(DEBUG_FILE_REGION_SIZE).enumerate() {
         let from_address = read_u32(region, 0);
         let filename_id = read_u32(region, 4);
         let source_mapping_url_id = read_u32(region, 8);
+        if let Some(previous) = previous_from_address {
+            if from_address <= previous {
+                return Err(ParseError::InvalidDebugFileRegionOrder {
+                    region_index: u32::try_from(index)
+                        .expect("validated debug file region index fits in u32"),
+                    previous_from_address: previous,
+                    from_address,
+                });
+            }
+        }
         let valid_source_mapping_url = source_mapping_url_id == DEBUG_SOURCE_MAPPING_URL_INVALID
             || source_mapping_url_id < filename_count;
         if from_address >= debug_data_size
@@ -2468,6 +2496,7 @@ fn validate_debug_file_regions(
                 debug_data_size,
             });
         }
+        previous_from_address = Some(from_address);
     }
     Ok(())
 }
@@ -4676,6 +4705,20 @@ mod tests {
     }
 
     #[test]
+    fn accepts_ordered_debug_file_regions() {
+        let mut bytes = fixture_bytecode();
+        set_debug_info(
+            &mut bytes,
+            &[(0, 1, false), (1, 1, false)],
+            b"ab",
+            &[(0, 0, 0), (1, 1, 0)],
+            &[0, 0],
+        );
+
+        HermesBytecode::parse(&bytes).expect("ordered debug file regions");
+    }
+
+    #[test]
     fn accepts_exception_table_with_debug_offsets() {
         let mut bytes = fixture_bytecode();
         add_global_function_info(
@@ -4762,6 +4805,28 @@ mod tests {
                 source_mapping_url_id: 0,
                 filename_count: 1,
                 debug_data_size: 1,
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_unsorted_debug_file_regions() {
+        let mut bytes = fixture_bytecode();
+        set_debug_info(
+            &mut bytes,
+            &[(0, 1, false), (1, 1, false)],
+            b"ab",
+            &[(1, 1, 0), (0, 0, 0)],
+            &[0, 0],
+        );
+
+        let error = HermesBytecode::parse(&bytes).expect_err("unsorted file regions must fail");
+        assert_eq!(
+            error,
+            ParseError::InvalidDebugFileRegionOrder {
+                region_index: 1,
+                previous_from_address: 1,
+                from_address: 0,
             },
         );
     }

@@ -99,7 +99,7 @@ Iris AAR은 `docs/iris-android-engine-contract.md`의 `IrisJSRuntimeFactoryProvi
 mise run rn-android-build-iris-release-local
 ```
 
-이 APK는 `libirisengine.so`와 hermesc bytecode bundle이 같이 패키징되고 RN이 Iris-owned JSI runtime 객체 및 초기화용 host surface를 받는지 확인하기 위한 것이다. 아직 Iris runtime의 JS 실행 기능이 구현되지 않았으므로 벤치마크 비교값으로 쓰지 않는다.
+이 APK는 `libirisengine.so`와 hermesc bytecode bundle이 같이 패키징되고 RN이 Iris-owned JSI runtime 객체, 초기화용 host surface, Hermes bytecode header 검증 경계를 받는지 확인하기 위한 것이다. 아직 Iris runtime의 JS 실행 기능이 구현되지 않았으므로 벤치마크 비교값으로 쓰지 않는다.
 
 자동화 스크립트는 다른 엔진 APK가 생겼을 때 다음처럼 같은 하네스에 연결한다.
 

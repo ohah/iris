@@ -60,7 +60,7 @@ mise run check
 - `rn-ios-build-release`와 `rn-android-build-release`는 최적화된 RN/Hermes 기준선 수집 전 release 빌드가 가능한지 확인한다. Android release는 Hermes flavor를 기준으로 한다.
 - `rn-android-build-iris-engine`은 로컬 Iris Android 엔진 AAR skeleton을 빌드한다.
 - `rn-android-build-iris-release`는 `IRIS_ENGINE_AAR`가 실제 RN 호환 Iris 엔진 artifact를 가리킬 때만 Iris release APK를 빌드한다. AAR 계약은 `docs/iris-android-engine-contract.md`를 따른다.
-- `rn-android-build-iris-release-local`은 로컬 skeleton AAR을 `irisRelease`에 주입해 앱과 엔진 AAR 계약, Iris-owned JSI runtime 생성, RN 초기화용 host surface 경계를 확인한다.
+- `rn-android-build-iris-release-local`은 로컬 skeleton AAR을 `irisRelease`에 주입해 앱과 엔진 AAR 계약, Iris-owned JSI runtime 생성, RN 초기화용 host surface, Hermes bytecode header 검증 경계를 확인한다.
 - `bench-android-release-repeat`는 Android 물리 기기의 release APK에서 3회 반복 측정 summary를 남긴다.
 - `bench-android-engine-compare`는 Hermes/Iris release APK를 같은 물리 기기에서 순서대로 측정한다.
 - `bench-extract-hermes-release`는 release, Hermes, New Architecture, Iris module compute, TurboModule 경계 case를 모두 요구한다.

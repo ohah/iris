@@ -2,6 +2,7 @@
 
 #include <jsi/jsi.h>
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -137,6 +138,22 @@ class IrisRuntime final : public jsi::Runtime {
     bool isArray{false};
   };
 
+  struct HermesBytecodeHeader {
+    uint32_t version;
+    uint32_t fileLength;
+  };
+
+  struct IrisPreparedJavaScript final : public jsi::PreparedJavaScript {
+    IrisPreparedJavaScript(
+        std::shared_ptr<const jsi::Buffer> buffer,
+        std::string sourceURL,
+        HermesBytecodeHeader header);
+
+    std::shared_ptr<const jsi::Buffer> buffer;
+    std::string sourceURL;
+    HermesBytecodeHeader header;
+  };
+
   struct PointerState final : public PointerValue {
     enum class Kind {
       PropNameID,
@@ -171,6 +188,14 @@ class IrisRuntime final : public jsi::Runtime {
       jsi::HostFunctionType);
 
   void installBootstrapGlobals();
+  HermesBytecodeHeader validateHermesBytecodeBuffer(
+      const std::shared_ptr<const jsi::Buffer>&,
+      const std::string&) const;
+  [[noreturn]] void abortBytecodeExecutionUnavailable(
+      const char*,
+      const HermesBytecodeHeader&,
+      const std::string&) const;
+  [[noreturn]] void abortBundleContractViolation(const std::string&) const;
 
   std::shared_ptr<ObjectState> globalObject_;
 };

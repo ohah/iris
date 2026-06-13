@@ -35,6 +35,7 @@ mise run rn-android-build-release
 mise run rn-ios-build-release
 mise run bench-smoke
 mise run bench-js
+mise run bench-android-release
 mise run bench-extract-fixture
 mise run bench-extract-release-fixture
 mise run bench-extract-android-release-fixture

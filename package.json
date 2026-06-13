@@ -8,6 +8,7 @@
     "packages/*"
   ],
   "scripts": {
+    "bench:android-release": "bun run tools/bench/run-android-release-benchmark.ts",
     "bench:extract-hermes": "bun run tools/bench/extract-hermes-report.ts",
     "bench:extract-hermes:android-release-fixture": "bun run tools/bench/extract-hermes-report.ts --input=tools/bench/fixtures/hermes-android-release.txt --output=artifacts/bench/hermes-android-release-baseline-fixture.json --require-release --require-new-architecture --require-case=turbomodule-number-round-trip --require-case=turbomodule-string-round-trip",
     "bench:extract-hermes:fixture": "bun run tools/bench/extract-hermes-report.ts --input=tools/bench/fixtures/hermes-metro.txt --output=artifacts/bench/hermes-baseline-fixture.json",

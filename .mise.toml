@@ -110,6 +110,11 @@ run = "bun run bench:js"
 description = "Run a short benchmark harness smoke test and write artifacts/bench/js-baseline-smoke.json"
 run = "bun run bench:smoke"
 
+[tasks.bench-android-release]
+description = "Build, install, run, and extract the Android physical release Hermes benchmark"
+depends = ["rn-android-build-release"]
+run = "bun run bench:android-release"
+
 [tasks.bench-extract-hermes]
 description = "Extract a Hermes app benchmark report from artifacts/bench/metro-hermes.log"
 run = "bun run bench:extract-hermes --input=artifacts/bench/metro-hermes.log --output=artifacts/bench/hermes-baseline.json"

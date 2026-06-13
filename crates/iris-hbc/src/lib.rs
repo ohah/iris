@@ -1228,7 +1228,7 @@ pub enum ParseError {
         offset: u32,
         /// Referenced string id.
         string_id: u32,
-        /// Declared string table count.
+        /// Valid string id limit for this literal buffer.
         string_count: u32,
     },
     /// A requested function id is outside the function table.
@@ -1599,7 +1599,7 @@ impl fmt::Display for ParseError {
                 string_count,
             } => write!(
                 formatter,
-                "Hermes bytecode {buffer} at offset {offset} references string id {string_id}, but the string table count is {string_count}",
+                "Hermes bytecode {buffer} at offset {offset} references string id {string_id}, but the string reference limit is {string_count}",
             ),
             Self::InvalidFunctionIndex {
                 function_id,
@@ -2168,7 +2168,11 @@ fn validate_serialized_literal_buffer(
             cursor,
             to_read,
             tag_type,
-            header.string_count,
+            if is_key_buffer {
+                header.identifier_count
+            } else {
+                header.string_count
+            },
         )?;
         cursor = end;
         remaining -= to_read;
@@ -4559,6 +4563,29 @@ mod tests {
                 offset: 99,
                 element_count: 1,
                 buffer_size: 5,
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_object_key_buffer_string_reference_outside_identifiers() {
+        let mut bytes = fixture_bytecode();
+        let key_buffer_offset = HermesBytecode::parse(&bytes)
+            .expect("valid fixture")
+            .sections()
+            .obj_key_buffer()
+            .offset() as usize;
+        bytes[key_buffer_offset] = SERIALIZED_LITERAL_TAG_SHORT_STRING | 1;
+        bytes[key_buffer_offset + 1..key_buffer_offset + 3].copy_from_slice(&1_u16.to_le_bytes());
+
+        let error = HermesBytecode::parse(&bytes).expect_err("non-identifier object key must fail");
+        assert_eq!(
+            error,
+            ParseError::InvalidSerializedLiteralStringReference {
+                buffer: "obj_key_buffer",
+                offset: 1,
+                string_id: 1,
+                string_count: 1,
             },
         );
     }

@@ -1,9 +1,11 @@
 #include "IrisRuntime.h"
+#include "rust/cxx.h"
+#include "iris_hbc.h"
 
 #include <android/log.h>
 
-#include <cstdlib>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <utility>
 
@@ -18,24 +20,6 @@ namespace {
       "Iris JSI operation is not implemented yet: %s. This is an Iris-owned Runtime scaffold, not a Hermes/JSC fallback.",
       operation);
   std::abort();
-}
-
-constexpr uint64_t kHermesBytecodeMagic = 0x1F1903C103BC1FC6ULL;
-constexpr size_t kHermesBytecodeVersionOffset = 8;
-constexpr size_t kHermesBytecodeFileLengthOffset = 32;
-constexpr size_t kHermesBytecodeMinimumHeaderSize =
-    kHermesBytecodeFileLengthOffset + sizeof(uint32_t);
-
-uint32_t readLittleEndianU32(const uint8_t* data) {
-  return static_cast<uint32_t>(data[0]) |
-      (static_cast<uint32_t>(data[1]) << 8) |
-      (static_cast<uint32_t>(data[2]) << 16) |
-      (static_cast<uint32_t>(data[3]) << 24);
-}
-
-uint64_t readLittleEndianU64(const uint8_t* data) {
-  return static_cast<uint64_t>(readLittleEndianU32(data)) |
-      (static_cast<uint64_t>(readLittleEndianU32(data + 4)) << 32);
 }
 
 } // namespace
@@ -168,31 +152,22 @@ IrisRuntime::HermesBytecodeHeader IrisRuntime::validateHermesBytecodeBuffer(
 
   const size_t size = buffer->size();
   const uint8_t* data = buffer->data();
-  if (data == nullptr || size < kHermesBytecodeMinimumHeaderSize) {
+  if (data == nullptr) {
     abortBundleContractViolation(
         "Iris expected Hermes bytecode for " + sourceURL +
-        ", but the buffer is too small for an HBC header.");
+        ", but the buffer has a null data pointer.");
   }
 
-  const uint64_t magic = readLittleEndianU64(data);
-  if (magic != kHermesBytecodeMagic) {
+  try {
+    const auto metadata = iris::hbc::parse_hbc_metadata(
+        rust::Slice<const uint8_t>(data, size));
+    return HermesBytecodeHeader{metadata.version, metadata.file_length};
+  } catch (const rust::Error& error) {
     abortBundleContractViolation(
         "Iris expected Hermes bytecode for " + sourceURL +
-        ", but the buffer is not an HBC bundle. Plain JS, JSC, V8, or QuickJS"
-        " fallback is not allowed.");
+        ", but Rust HBC metadata parsing failed: " + error.what() +
+        ". Plain JS, JSC, V8, or QuickJS fallback is not allowed.");
   }
-
-  const uint32_t version =
-      readLittleEndianU32(data + kHermesBytecodeVersionOffset);
-  const uint32_t fileLength =
-      readLittleEndianU32(data + kHermesBytecodeFileLengthOffset);
-  if (fileLength > size) {
-    abortBundleContractViolation(
-        "Iris received Hermes bytecode for " + sourceURL +
-        ", but the HBC fileLength exceeds the provided buffer.");
-  }
-
-  return HermesBytecodeHeader{version, fileLength};
 }
 
 void IrisRuntime::abortBytecodeExecutionUnavailable(

@@ -5,6 +5,25 @@
 
 use std::fmt;
 
+#[cxx::bridge(namespace = "iris::hbc")]
+mod ffi {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct HbcMetadata {
+        pub version: u32,
+        pub file_length: u32,
+        pub global_code_index: u32,
+        pub function_count: u32,
+        pub string_count: u32,
+        pub cjs_module_count: u32,
+        pub debug_info_offset: u32,
+        pub options: u8,
+    }
+
+    extern "Rust" {
+        fn parse_hbc_metadata(bytes: &[u8]) -> Result<HbcMetadata>;
+    }
+}
+
 /// Hermes bytecode magic value from `BytecodeFileFormat.h`.
 pub const HERMES_BYTECODE_MAGIC: u64 = 0x1F19_03C1_03BC_1FC6;
 
@@ -263,6 +282,20 @@ impl fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+fn parse_hbc_metadata(bytes: &[u8]) -> Result<ffi::HbcMetadata, ParseError> {
+    let header = HermesBytecodeHeader::parse(bytes)?;
+    Ok(ffi::HbcMetadata {
+        version: header.version,
+        file_length: header.file_length,
+        global_code_index: header.global_code_index,
+        function_count: header.function_count,
+        string_count: header.string_count,
+        cjs_module_count: header.cjs_module_count,
+        debug_info_offset: header.debug_info_offset,
+        options: header.options.flags(),
+    })
+}
+
 fn read_u32(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(bytes[offset..offset + size_of::<u32>()].try_into().expect(
         "HermesBytecodeHeader::parse validates the full header length before reading fields",
@@ -350,6 +383,21 @@ mod tests {
         assert_eq!(header.options.flags(), 0b0000_0011);
         assert!(header.options.static_builtins());
         assert!(header.options.cjs_modules_statically_resolved());
+    }
+
+    #[test]
+    fn exposes_metadata_for_cxx_hosts() {
+        let bytes = fixture_header();
+        let metadata = parse_hbc_metadata(&bytes).expect("valid Hermes bytecode metadata");
+
+        assert_eq!(metadata.version, 98);
+        assert_eq!(metadata.file_length, HERMES_BYTECODE_HEADER_SIZE as u32);
+        assert_eq!(metadata.global_code_index, 17);
+        assert_eq!(metadata.function_count, 29);
+        assert_eq!(metadata.string_count, 11);
+        assert_eq!(metadata.cjs_module_count, 10);
+        assert_eq!(metadata.debug_info_offset, 120);
+        assert_eq!(metadata.options, 0b0000_0011);
     }
 
     #[test]

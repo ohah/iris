@@ -17,6 +17,7 @@ mise run rn-android-build-iris-release-local
 - skeleton은 `facebook::react::JSIRuntimeHolder`에 담긴 Iris-owned `jsi::Runtime` 객체를 반환한다.
 - skeleton runtime은 RN 초기화가 요구하는 최소 JSI host surface를 제공한다. 현재 포함된 범위는 global object, string/property key, plain object property storage, host object/function registration, array slot storage, native state, empty microtask drain이다.
 - skeleton runtime은 Hermes bytecode header magic, version, fileLength를 확인한다. 아직 JS 실행 기능은 제공하지 않으므로 RN이 유효한 Hermes bytecode를 `evaluateJavaScript(...)`나 `evaluatePreparedJavaScript(...)`로 넘기면 bytecode 실행기 미구현 메시지로 실패한다.
+- Rust `iris-hbc` crate는 cross-platform HBC metadata parser의 기준 구현이다. Android skeleton의 C++ header 검증은 현재 연결 경계이며, 다음 runtime 단계에서 `cxx`를 통해 Rust parser로 수렴시킨다.
 
 ## 앱 연결점
 

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/iris-core", "crates/iris-jsi", "crates/iris-qjs"]
+members = ["crates/iris-core", "crates/iris-hbc", "crates/iris-jsi", "crates/iris-qjs"]
 resolver = "3"
 
 [workspace.package]
@@ -20,3 +20,4 @@ pedantic = "warn"
 [workspace.dependencies]
 cxx = "1.0.194"
 iris-core = { path = "crates/iris-core" }
+iris-hbc = { path = "crates/iris-hbc" }

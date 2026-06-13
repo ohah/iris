@@ -1,6 +1,25 @@
 apply plugin: "com.android.library"
 apply plugin: "org.jetbrains.kotlin.android"
 
+def repoRoot = rootProject.projectDir.parentFile.parentFile.parentFile
+def buildIrisHbcRustAndroid = tasks.register("buildIrisHbcRustAndroid", Exec) {
+    workingDir repoRoot
+    commandLine(
+        "sh",
+        file("${repoRoot}/tools/build-android-rust.sh").absolutePath,
+        layout.buildDirectory.get().asFile.absolutePath,
+        rootProject.ext.ndkVersion.toString(),
+        rootProject.ext.minSdkVersion.toString()
+    )
+    inputs.file("${repoRoot}/Cargo.lock")
+    inputs.file("${repoRoot}/Cargo.toml")
+    inputs.file("${repoRoot}/crates/iris-hbc/Cargo.toml")
+    inputs.file("${repoRoot}/crates/iris-hbc/src/lib.rs")
+    inputs.file("${repoRoot}/tools/build-android-rust.sh")
+    outputs.dir(layout.buildDirectory.dir("generated/rust"))
+    outputs.dir(layout.buildDirectory.dir("rust"))
+}
+
 android {
     namespace "com.iris.engine.react"
     ndkVersion rootProject.ext.ndkVersion
@@ -11,7 +30,11 @@ android {
 
         externalNativeBuild {
             cmake {
-                arguments "-DANDROID_STL=c++_shared"
+                arguments(
+                    "-DANDROID_STL=c++_shared",
+                    "-DIRIS_RUST_BUILD_DIR=${layout.buildDirectory.get().asFile.absolutePath}/rust",
+                    "-DIRIS_RUST_GENERATED_DIR=${layout.buildDirectory.get().asFile.absolutePath}/generated/rust"
+                )
             }
         }
     }
@@ -38,4 +61,14 @@ android {
 
 dependencies {
     compileOnly("com.facebook.react:react-android")
+}
+
+afterEvaluate {
+    tasks.matching {
+        it.name.startsWith("configureCMake") ||
+            it.name.startsWith("buildCMake") ||
+            it.name.startsWith("externalNativeBuild")
+    }.configureEach {
+        dependsOn(buildIrisHbcRustAndroid)
+    }
 }

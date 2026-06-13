@@ -21,6 +21,9 @@ export default defineConfig({
           "bun run --cwd apps/rn-bench test --runInBand",
         ],
       },
+      "bench-extract-fixture": "bun run bench:extract-hermes:fixture",
+      "bench-extract-hermes":
+        "bun run bench:extract-hermes --input=artifacts/bench/metro-hermes.log --output=artifacts/bench/hermes-baseline.json",
       "bench-js": "bun run bench:js",
       "bench-smoke": "bun run bench:smoke",
       "rn-android": "bun run --cwd apps/rn-bench android",

@@ -86,6 +86,14 @@ run = "bun run bench:js"
 description = "Run a short benchmark harness smoke test and write artifacts/bench/js-baseline-smoke.json"
 run = "bun run bench:smoke"
 
+[tasks.bench-extract-hermes]
+description = "Extract a Hermes app benchmark report from artifacts/bench/metro-hermes.log"
+run = "bun run bench:extract-hermes --input=artifacts/bench/metro-hermes.log --output=artifacts/bench/hermes-baseline.json"
+
+[tasks.bench-extract-fixture]
+description = "Validate Hermes benchmark log extraction with a local fixture"
+run = "bun run bench:extract-hermes:fixture"
+
 [tasks.perf]
 description = "Run the core performance budget gate"
 run = "sh tools/perf/core-budget.sh"

@@ -23,6 +23,8 @@ mise run sync-labels
 mise run perf
 mise run bench-smoke
 mise run bench-js
+mise run bench-extract-fixture
+mise run bench-extract-hermes
 mise run rn-start
 mise run rn-ios
 mise run rn-android

@@ -118,6 +118,10 @@ run = "bun run bench:extract-hermes --input=artifacts/bench/metro-hermes.log --o
 description = "Validate Hermes benchmark log extraction with a local fixture"
 run = "bun run bench:extract-hermes:fixture"
 
+[tasks.bench-extract-android-release-fixture]
+description = "Validate Android release Hermes benchmark log extraction with a local fixture"
+run = "bun run bench:extract-hermes:android-release-fixture"
+
 [tasks.bench-extract-hermes-release]
 description = "Extract a release Hermes app benchmark report from artifacts/bench/rn-release-hermes.log"
 run = "bun run bench:extract-hermes:release --input=artifacts/bench/rn-release-hermes.log --output=artifacts/bench/hermes-release-baseline.json"

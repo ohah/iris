@@ -9,6 +9,7 @@ mise run bench-smoke
 mise run bench-js
 mise run bench-extract-fixture
 mise run bench-extract-release-fixture
+mise run bench-extract-android-release-fixture
 mise run rn-codegen
 mise run rn-android-build-debug
 mise run rn-ios-build-debug
@@ -20,6 +21,7 @@ mise run rn-ios-build-release
 - `bench-js`는 Hermes 기준선 앱과 같은 JS benchmark case를 로컬 JavaScript runtime에서 실행한다.
 - `bench-extract-fixture`는 fixture 로그에서 Hermes report를 추출해 파서와 검증 규칙을 확인한다.
 - `bench-extract-release-fixture`는 release/Hermes/New Architecture/TurboModule case 요구 조건을 확인한다.
+- `bench-extract-android-release-fixture`는 Android logcat의 quoted JSON 형식과 RN 0.85 bridgeless Android의 TurboModule case 기준 검증을 확인한다.
 - `rn-codegen`은 TurboModule spec이 RN codegen에서 생성되는지 로컬에서 확인한다.
 - `rn-android-build-debug`와 `rn-ios-build-debug`는 네이티브 연결 확인용이며 성능 기준선으로 쓰지 않는다.
 - `rn-android-build-release`와 `rn-ios-build-release`는 최적화된 RN/Hermes 기준선 수집 전 release 빌드를 확인한다. iOS task는 simulator build 확인용이며 최종 성능 기준선은 물리 기기에서 남긴다.
@@ -32,6 +34,7 @@ artifacts/bench/js-baseline-smoke.json
 artifacts/bench/js-baseline.json
 artifacts/bench/hermes-baseline-fixture.json
 artifacts/bench/hermes-release-baseline-fixture.json
+artifacts/bench/hermes-android-release-baseline-fixture.json
 artifacts/bench/hermes-baseline.json
 artifacts/bench/hermes-release-baseline.json
 ```
@@ -80,8 +83,9 @@ release 추출은 다음 조건을 모두 요구한다.
 - `metadata.build.mode`가 `release`
 - Hermes runtime
 - New Architecture
-- TurboModule proxy
 - `turbomodule-number-round-trip`
 - `turbomodule-string-round-trip`
+
+RN 0.85 bridgeless Android에서는 `global.__turboModuleProxy`가 노출되지 않을 수 있다. 따라서 release 추출은 전역 proxy 플래그가 아니라 실제 Codegen TurboModule number/string benchmark case가 포함됐는지로 TurboModule 경계를 검증한다.
 
 TurboModule 경계 기준선은 `docs/turbomodule-baseline.md`의 release 측정 절차를 따른다.

@@ -21,12 +21,28 @@ function readArgs(name: string) {
     .map((arg) => arg.slice(prefix.length));
 }
 
+function extractJsonPayload(line: string) {
+  const markerIndex = line.indexOf(marker);
+  if (markerIndex === -1) {
+    return null;
+  }
+
+  const payload = line.slice(markerIndex + marker.length);
+  const jsonStart = payload.indexOf("{");
+  const jsonEnd = payload.lastIndexOf("}");
+
+  if (jsonStart === -1 || jsonEnd === -1 || jsonEnd <= jsonStart) {
+    return null;
+  }
+
+  return payload.slice(jsonStart, jsonEnd + 1);
+}
+
 function parseReport(logText: string): BenchmarkSuiteReport {
   const candidates = logText
     .split(/\r?\n/)
-    .filter((line) => line.includes(marker))
-    .map((line) => line.slice(line.indexOf(marker) + marker.length).trim())
-    .filter((line) => line.startsWith("{"));
+    .map((line) => extractJsonPayload(line))
+    .filter((payload): payload is string => payload != null);
 
   if (candidates.length === 0) {
     throw new Error(`No ${marker} JSON payload was found.`);

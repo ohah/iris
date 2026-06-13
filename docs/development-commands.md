@@ -21,6 +21,11 @@ mise run vp-check
 mise run fetch-references
 mise run sync-labels
 mise run perf
+mise run rn-start
+mise run rn-ios
+mise run rn-android
+mise run rn-typecheck
+mise run rn-test
 mise run rust-check
 mise run test
 mise run check
@@ -32,4 +37,5 @@ mise run check
 - Rust는 별도 `rustfmt.toml` 없이 기본 `rustfmt` 스타일을 사용한다.
 - Bun은 `package.json`의 `packageManager`와 `.mise.toml`의 `bun = "1.3.14"`로 고정한다.
 - Vite+는 로컬 `vite-plus` 패키지와 `bunx vp`로 실행한다.
-- `mise run check`가 PR 전 기본 검증 경로다.
+- React Native PoC 앱은 `apps/rn-bench`에 두고 `mise run rn-*` 명령으로 실행한다.
+- `mise run check`가 PR 전 기본 검증 경로이며 RN 타입체크와 smoke test를 포함한다.

@@ -1,0 +1,59 @@
+[tools]
+bun = "1.3.14"
+node = "26.3.0"
+rust = "1.96.0"
+
+[env]
+_.path = ["node_modules/.bin"]
+
+[tasks.install]
+description = "Install JavaScript tooling"
+run = "bun install"
+
+[tasks.fetch-references]
+description = "Fetch local gitignored runtime references"
+run = "sh tools/fetch-references.sh"
+
+[tasks.fmt-js]
+description = "Format JavaScript and TypeScript with Oxfmt"
+run = "bunx oxfmt --write ."
+
+[tasks.fmt-rust]
+description = "Format Rust with the default rustfmt style"
+run = "cargo fmt --all"
+
+[tasks.fmt]
+description = "Format all source files"
+depends = ["fmt-js", "fmt-rust"]
+
+[tasks.fmt-js-check]
+description = "Check JavaScript and TypeScript formatting with Oxfmt"
+run = "bunx oxfmt --check ."
+
+[tasks.fmt-rust-check]
+description = "Check Rust formatting with the default rustfmt style"
+run = "cargo fmt --all --check"
+
+[tasks.fmt-check]
+description = "Check all source formatting"
+depends = ["fmt-js-check", "fmt-rust-check"]
+
+[tasks.lint]
+description = "Lint JavaScript and TypeScript with Oxlint"
+run = "bunx oxlint ."
+
+[tasks.vp-check]
+description = "Run Vite+ check"
+run = "bunx vp check"
+
+[tasks.rust-check]
+description = "Check all Rust crates"
+run = "cargo check --workspace --all-targets"
+
+[tasks.test]
+description = "Run all Rust tests"
+run = "cargo test --workspace"
+
+[tasks.check]
+description = "Run formatting, lint, Rust checks, and tests"
+depends = ["fmt-check", "lint", "rust-check", "test"]

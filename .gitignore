@@ -1,0 +1,15 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+
+node_modules/
+target/
+dist/
+build/
+coverage/
+.vite-task/
+references/
+
+*.log
+*.tmp

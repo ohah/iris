@@ -37,8 +37,10 @@ mise run rn-android-build-debug
 mise run rn-ios-pods
 mise run rn-ios-build-debug
 mise run rn-android-build-release
+mise run rn-android-build-iris-release
 mise run rn-ios-build-release
 mise run bench-android-release-repeat
+mise run bench-android-engine-compare
 mise run bench-extract-release-fixture
 mise run bench-extract-android-release-fixture
 ```
@@ -54,12 +56,19 @@ Android는 물리 기기의 release variant를 기준으로 실행한다.
 mise run bench-android-release
 ```
 
-이 명령은 release APK 빌드, 물리 Android 기기 설치, 앱 실행, `Run suite`, 로그 저장, release artifact 추출을 한 번에 수행한다.
+이 명령은 Hermes release APK 빌드, 물리 Android 기기 설치, 앱 실행, `Run suite`, 로그 저장, release artifact 추출을 한 번에 수행한다.
 
 성능 판단용 반복 기준선은 다음 명령으로 남긴다.
 
 ```sh
 mise run bench-android-release-repeat
+```
+
+Iris 엔진 artifact가 준비되면 Android 엔진 비교는 같은 앱 소스의 두 release APK를 기준으로 실행한다.
+
+```sh
+IRIS_ENGINE_AAR=/absolute/path/to/iris-engine.aar mise run rn-android-build-iris-release
+mise run bench-android-engine-compare
 ```
 
 iOS는 물리 기기의 Release configuration을 기준으로 실행한다. `rn-ios-build-release`는 simulator release build 확인용이며 최종 성능 기준선으로 쓰지 않는다.

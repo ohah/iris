@@ -71,12 +71,16 @@ description = "Run the React Native benchmark app on Android"
 run = "bun run --cwd apps/rn-bench android"
 
 [tasks.rn-android-build-debug]
-description = "Build the React Native benchmark Android debug APK locally"
-run = "cd apps/rn-bench/android && ./gradlew :app:assembleDebug -x lint -x test"
+description = "Build the React Native benchmark Android Hermes debug APK locally"
+run = "cd apps/rn-bench/android && ./gradlew :app:assembleHermesDebug -x lint -x test"
 
 [tasks.rn-android-build-release]
-description = "Build the React Native benchmark Android release APK locally"
-run = "cd apps/rn-bench/android && ./gradlew :app:assembleRelease -x lint -x test"
+description = "Build the React Native benchmark Android Hermes release APK locally"
+run = "cd apps/rn-bench/android && ./gradlew :app:assembleHermesRelease -x lint -x test"
+
+[tasks.rn-android-build-iris-release]
+description = "Build the React Native benchmark Android Iris release APK with a real Iris engine artifact"
+run = "test -n \"$IRIS_ENGINE_AAR\" || { echo 'Set IRIS_ENGINE_AAR to a real Iris engine AAR before building irisRelease.' >&2; exit 1; }; cd apps/rn-bench/android && ./gradlew :app:assembleIrisRelease -PirisEngineAar=\"$IRIS_ENGINE_AAR\" -x lint -x test"
 
 [tasks.rn-ios-pods]
 description = "Install CocoaPods dependencies for the React Native benchmark app"
@@ -119,6 +123,11 @@ run = "bun run bench:android-release"
 description = "Run three Android physical release Hermes benchmark iterations and write a summary"
 depends = ["rn-android-build-release"]
 run = "bun run bench:android-release:repeat"
+
+[tasks.bench-android-engine-compare]
+description = "Run Android physical release benchmarks for Hermes and Iris engine APKs"
+depends = ["rn-android-build-release"]
+run = "bun run bench:android-engine-compare"
 
 [tasks.bench-extract-hermes]
 description = "Extract a Hermes app benchmark report from artifacts/bench/metro-hermes.log"

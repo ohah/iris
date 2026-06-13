@@ -2,6 +2,20 @@
 
 Iris Android 엔진은 React Native 앱 포크가 아니라 `apps/rn-bench`의 `irisRelease` flavor에 주입되는 AAR artifact로 연결한다. 앱은 Hermes/JSC fallback을 만들지 않는다. AAR이 계약을 만족하지 못하면 `irisRelease` 빌드나 앱 시작이 실패해야 한다.
 
+## 로컬 skeleton
+
+현재 로컬 skeleton은 `apps/rn-bench/android/iris-engine`에 있다.
+
+```sh
+mise run rn-android-build-iris-engine
+mise run rn-android-build-iris-release-local
+```
+
+- `rn-android-build-iris-engine`은 `iris-engine-release.aar`를 만든다.
+- `rn-android-build-iris-release-local`은 그 AAR을 Gradle `irisEngineAar` property로 주입해 `irisRelease` APK를 빌드한다.
+- skeleton AAR에는 provider class와 `libirisengine.so`만 들어간다. `libreactnative.so`, `libjsi.so`, `libfbjni.so`는 앱의 RN dependency에서 온다.
+- skeleton은 아직 JS runtime을 만들지 않는다. `createJSRuntime(...)`에 도달하면 명확한 abort 메시지로 실패한다.
+
 ## 앱 연결점
 
 React Native 0.85 Android New Architecture의 연결점은 `DefaultReactHost.getDefaultReactHost(..., jsRuntimeFactory)`다.
@@ -40,6 +54,7 @@ Iris는 Hermes 대체 엔진으로 비교한다. 따라서 `irisRelease`도 Herm
 - `irisRelease`의 `index.android.bundle`은 hermesc가 만든 bytecode bundle이다.
 - plain JS bundle이나 JSC fallback을 Iris 성능값으로 측정하지 않는다.
 - Iris가 이 bytecode를 아직 실행할 수 없다면 실패가 맞다. 성공한 것처럼 우회하지 않는다.
+- skeleton `irisRelease` APK에는 `libhermesvm.so`가 없어야 한다. `libhermestooling.so`는 RN의 hermesc bytecode/tooling packaging 경로 때문에 남을 수 있지만 runtime factory는 Iris AAR에서 온다.
 
 ## 호환성 기준
 

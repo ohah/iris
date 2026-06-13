@@ -82,6 +82,15 @@ run = "cd apps/rn-bench/android && ./gradlew :app:assembleHermesRelease -x lint 
 description = "Build the React Native benchmark Android Iris release APK with a real Iris engine artifact"
 run = "test -n \"$IRIS_ENGINE_AAR\" || { echo 'Set IRIS_ENGINE_AAR to a real Iris engine AAR before building irisRelease.' >&2; exit 1; }; cd apps/rn-bench/android && ./gradlew :app:assembleIrisRelease -PirisEngineAar=\"$IRIS_ENGINE_AAR\" -x lint -x test"
 
+[tasks.rn-android-build-iris-engine]
+description = "Build the Iris Android engine AAR skeleton"
+run = "cd apps/rn-bench/android && ./gradlew :iris-engine:assembleRelease -x lint -x test"
+
+[tasks.rn-android-build-iris-release-local]
+description = "Build irisRelease with the local Iris Android engine AAR skeleton"
+depends = ["rn-android-build-iris-engine"]
+run = "cd apps/rn-bench/android && ./gradlew :app:assembleIrisRelease -PirisEngineAar=\"$(pwd)/iris-engine/build/outputs/aar/iris-engine-release.aar\" -x lint -x test"
+
 [tasks.rn-ios-pods]
 description = "Install CocoaPods dependencies for the React Native benchmark app"
 run = "cd apps/rn-bench/ios && bundle install && bundle exec pod install"

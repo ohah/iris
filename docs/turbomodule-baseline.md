@@ -23,6 +23,9 @@ Iris 경로를 비교하기 전에는 React Native/Hermes의 최적화된 정상
 
 - `turbomodule-number-round-trip`
 - `turbomodule-string-round-trip`
+- `iris-module-native-compute`
+
+`iris-module-native-compute`는 Iris 엔진 대체 수치가 아니다. Hermes 앱 안에서 Iris native module 경로가 release artifact에 안정적으로 잡히는지 확인하는 probe이며, 최종 엔진 비교는 같은 앱 소스의 `Hermes release`와 `Iris release` variant를 별도 APK로 빌드해 비교한다.
 
 ## 로컬 검증
 
@@ -35,6 +38,7 @@ mise run rn-ios-pods
 mise run rn-ios-build-debug
 mise run rn-android-build-release
 mise run rn-ios-build-release
+mise run bench-android-release-repeat
 mise run bench-extract-release-fixture
 mise run bench-extract-android-release-fixture
 ```
@@ -51,6 +55,12 @@ mise run bench-android-release
 ```
 
 이 명령은 release APK 빌드, 물리 Android 기기 설치, 앱 실행, `Run suite`, 로그 저장, release artifact 추출을 한 번에 수행한다.
+
+성능 판단용 반복 기준선은 다음 명령으로 남긴다.
+
+```sh
+mise run bench-android-release-repeat
+```
 
 iOS는 물리 기기의 Release configuration을 기준으로 실행한다. `rn-ios-build-release`는 simulator release build 확인용이며 최종 성능 기준선으로 쓰지 않는다.
 
@@ -82,4 +92,4 @@ xcrun simctl spawn booted log stream --style compact --predicate 'eventMessage C
 mise run bench-extract-hermes-release
 ```
 
-release 추출은 `metadata.build.mode = release`, Hermes, New Architecture, TurboModule number/string case를 모두 요구한다. RN 0.85 bridgeless Android에서는 `global.__turboModuleProxy`가 노출되지 않을 수 있으므로 전역 proxy 플래그가 아니라 실제 Codegen TurboModule benchmark case 실행 여부로 TurboModule 경계를 검증한다. 이 산출물을 Iris 경로와 비교할 때의 기준으로 사용한다.
+release 추출은 `metadata.build.mode = release`, Hermes, New Architecture, `iris-module-native-compute`, TurboModule number/string case를 모두 요구한다. RN 0.85 bridgeless Android에서는 `global.__turboModuleProxy`가 노출되지 않을 수 있으므로 전역 proxy 플래그가 아니라 실제 Codegen TurboModule benchmark case 실행 여부로 TurboModule 경계를 검증한다. 이 산출물을 Iris 경로와 비교할 때의 기준으로 사용한다.

@@ -3,9 +3,11 @@ import { TurboModuleRegistry } from "react-native";
 
 export interface Spec extends TurboModule {
   readonly echoNumber: (value: number) => number;
+  readonly getIrisRuntimeLabel: () => string;
   readonly getRuntimeLabel: () => string;
   readonly noop: () => void;
   readonly roundTripString: (value: string) => string;
+  readonly runIrisNumericWorkload: (iterations: number) => number;
 }
 
 export default TurboModuleRegistry.get<Spec>("IrisBenchTurboModule");

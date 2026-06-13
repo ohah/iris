@@ -104,8 +104,11 @@ function BenchmarkScreen() {
       value: metadata.runtime.fabric ? "ready" : "not detected",
     },
     {
-      label: "Native module",
-      value: isIrisBenchTurboModuleAvailable() ? "ready" : "not detected",
+      label: "Iris module",
+      value:
+        isIrisBenchTurboModuleAvailable() && nativeModule
+          ? nativeModule.getIrisRuntimeLabel()
+          : "not detected",
     },
     {
       label: "Rows",

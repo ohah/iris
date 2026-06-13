@@ -82,6 +82,8 @@ const DEBUG_DATA_LEB_OVERFLOW: &str = "signed LEB128 exceeds i64";
 const DEBUG_DATA_FUNCTION_MISMATCH: &str = "function id mismatch";
 const DEBUG_DATA_ADDRESS_OUT_OF_BOUNDS: &str = "address outside function body";
 const DEBUG_DATA_ADDRESS_NOT_BOUNDARY: &str = "address is not an instruction boundary";
+const DEBUG_DATA_SOURCE_VALUE_OUT_OF_BOUNDS: &str = "source location value outside u32";
+const DEBUG_DATA_LOCATION_NOT_ONE_BASED: &str = "source location line or column is not one-based";
 const STRING_TABLE_ENTRY_UTF16_MASK: u32 = 1 << 31;
 const FUNCTION_INFO_ALIGNMENT: u32 = 4;
 const SWITCH_TABLE_CASE_SIZE: usize = 8;
@@ -2790,9 +2792,17 @@ fn validate_debug_source_locations(
         });
     }
 
-    read_signed_leb128(data, &mut cursor, function_id, source_locations)?;
-    read_signed_leb128(data, &mut cursor, function_id, source_locations)?;
-    read_signed_leb128(data, &mut cursor, function_id, source_locations)?;
+    let mut current_line = read_debug_u32(data, &mut cursor, function_id, source_locations)?;
+    let mut current_column = read_debug_u32(data, &mut cursor, function_id, source_locations)?;
+    let mut current_statement = 0_u32;
+    let mut current_env_idx = read_debug_u32(data, &mut cursor, function_id, source_locations)?;
+    validate_debug_location_line_column(
+        function_id,
+        source_locations,
+        current_line,
+        current_column,
+        true,
+    )?;
 
     let mut current_address = 0_i64;
     loop {
@@ -2826,18 +2836,102 @@ fn validate_debug_source_locations(
             });
         }
 
+        let line_delta_offset = debug_data_offset(source_locations, cursor);
         let line_delta = read_signed_leb128(data, &mut cursor, function_id, source_locations)?;
         if line_delta & 1 == 0 {
             continue;
         }
-        read_signed_leb128(data, &mut cursor, function_id, source_locations)?;
+        let column_delta_offset = debug_data_offset(source_locations, cursor);
+        let column_delta = read_signed_leb128(data, &mut cursor, function_id, source_locations)?;
+        let mut statement_delta = 0_i64;
         if line_delta & 2 != 0 {
-            read_signed_leb128(data, &mut cursor, function_id, source_locations)?;
+            statement_delta = read_signed_leb128(data, &mut cursor, function_id, source_locations)?;
         }
+        let mut env_idx_delta = 0_i64;
         if line_delta & 4 != 0 {
-            read_signed_leb128(data, &mut cursor, function_id, source_locations)?;
+            env_idx_delta = read_signed_leb128(data, &mut cursor, function_id, source_locations)?;
         }
+        current_line = add_debug_u32_delta(
+            current_line,
+            line_delta >> 3,
+            function_id,
+            line_delta_offset,
+        )?;
+        current_column = add_debug_u32_delta(
+            current_column,
+            column_delta,
+            function_id,
+            column_delta_offset,
+        )?;
+        current_statement = add_debug_u32_delta(
+            current_statement,
+            statement_delta,
+            function_id,
+            line_delta_offset,
+        )?;
+        current_env_idx = add_debug_u32_delta(
+            current_env_idx,
+            env_idx_delta,
+            function_id,
+            line_delta_offset,
+        )?;
+        validate_debug_location_line_column(
+            function_id,
+            line_delta_offset,
+            current_line,
+            current_column,
+            false,
+        )?;
     }
+}
+
+fn read_debug_u32(
+    data: &[u8],
+    cursor: &mut usize,
+    function_id: u32,
+    source_locations: u32,
+) -> Result<u32, ParseError> {
+    let start = *cursor;
+    let value = read_signed_leb128(data, cursor, function_id, source_locations)?;
+    u32::try_from(value).map_err(|_| ParseError::InvalidDebugData {
+        function_id,
+        offset: debug_data_offset(source_locations, start),
+        reason: DEBUG_DATA_SOURCE_VALUE_OUT_OF_BOUNDS,
+    })
+}
+
+fn add_debug_u32_delta(
+    value: u32,
+    delta: i64,
+    function_id: u32,
+    offset: u32,
+) -> Result<u32, ParseError> {
+    let value = i128::from(value) + i128::from(delta);
+    u32::try_from(value).map_err(|_| ParseError::InvalidDebugData {
+        function_id,
+        offset,
+        reason: DEBUG_DATA_SOURCE_VALUE_OUT_OF_BOUNDS,
+    })
+}
+
+fn validate_debug_location_line_column(
+    function_id: u32,
+    offset: u32,
+    line: u32,
+    column: u32,
+    allow_missing_location: bool,
+) -> Result<(), ParseError> {
+    if allow_missing_location && line == 0 && column == 0 {
+        return Ok(());
+    }
+    if line == 0 || column == 0 {
+        return Err(ParseError::InvalidDebugData {
+            function_id,
+            offset,
+            reason: DEBUG_DATA_LOCATION_NOT_ONE_BASED,
+        });
+    }
+    Ok(())
 }
 
 fn read_signed_leb128(
@@ -4002,6 +4096,24 @@ mod tests {
         data
     }
 
+    fn debug_source_stream_with_location_delta(
+        function_id: u32,
+        address_delta: i64,
+        line_delta: i64,
+        column_delta: i64,
+    ) -> Vec<u8> {
+        let mut data = Vec::new();
+        append_signed_leb128(&mut data, i64::from(function_id));
+        append_signed_leb128(&mut data, 1);
+        append_signed_leb128(&mut data, 1);
+        append_signed_leb128(&mut data, 0);
+        append_signed_leb128(&mut data, address_delta);
+        append_signed_leb128(&mut data, (line_delta << 3) | 1);
+        append_signed_leb128(&mut data, column_delta);
+        append_signed_leb128(&mut data, -1);
+        data
+    }
+
     fn debug_source_stream_without_sentinel(function_id: u32) -> Vec<u8> {
         let mut data = Vec::new();
         append_signed_leb128(&mut data, i64::from(function_id));
@@ -4662,6 +4774,18 @@ mod tests {
     }
 
     #[test]
+    fn accepts_debug_source_location_delta() {
+        let mut bytes = fixture_bytecode();
+        set_debug_data(
+            &mut bytes,
+            &debug_source_stream_with_location_delta(1, 0, 1, 1),
+        );
+        add_global_debug_offsets(&mut bytes, 0);
+
+        HermesBytecode::parse(&bytes).expect("valid debug source location delta");
+    }
+
+    #[test]
     fn accepts_debug_filename_table_and_file_region() {
         let mut bytes = fixture_bytecode();
         set_debug_info(
@@ -4861,6 +4985,26 @@ mod tests {
                 function_id: 1,
                 offset: 4,
                 reason: DEBUG_DATA_TRUNCATED_LEB,
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_debug_source_location_zero_column() {
+        let mut bytes = fixture_bytecode();
+        set_debug_data(
+            &mut bytes,
+            &debug_source_stream_with_location_delta(1, 0, 0, -1),
+        );
+        add_global_debug_offsets(&mut bytes, 0);
+
+        let error = HermesBytecode::parse(&bytes).expect_err("zero column location must fail");
+        assert_eq!(
+            error,
+            ParseError::InvalidDebugData {
+                function_id: 1,
+                offset: 5,
+                reason: DEBUG_DATA_LOCATION_NOT_ONE_BASED,
             },
         );
     }

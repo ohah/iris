@@ -1,7 +1,7 @@
 #include "JIrisJSRuntimeFactory.h"
 
-#include <android/log.h>
-#include <cstdlib>
+#include "IrisRuntime.h"
+
 #include <memory>
 
 namespace facebook::react {
@@ -19,11 +19,8 @@ void JIrisJSRuntimeFactory::registerNatives() {
 
 std::unique_ptr<JSRuntime> JIrisJSRuntimeFactory::createJSRuntime(
     std::shared_ptr<MessageQueueThread>) noexcept {
-  __android_log_assert(
-      "IrisRuntimeImplemented",
-      "IrisEngine",
-      "Iris JS runtime is not implemented yet. This AAR only validates the React Native JSRuntimeFactory ABI.");
-  std::abort();
+  return std::make_unique<JSIRuntimeHolder>(
+      std::make_unique<iris::runtime::IrisRuntime>());
 }
 
 } // namespace facebook::react

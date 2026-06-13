@@ -461,6 +461,16 @@ impl<'a> HermesBytecodeSections<'a> {
             header.overflow_string_count,
             header.string_storage_size,
         )?;
+        validate_storage_table(
+            "big_int_table",
+            big_int_table.bytes,
+            header.big_int_storage_size,
+        )?;
+        validate_storage_table(
+            "reg_exp_table",
+            reg_exp_table.bytes,
+            header.reg_exp_storage_size,
+        )?;
         validate_function_headers(bytes, header, function_headers, function_bodies_offset)?;
         validate_cjs_module_table(cjs_module_table.bytes, header)?;
         validate_function_source_table(function_source_table.bytes, header)?;
@@ -1058,6 +1068,19 @@ pub enum ParseError {
         /// Declared string storage byte length.
         storage_size: u32,
     },
+    /// A storage-backed table entry points outside its byte storage section.
+    StorageTableEntryOutOfBounds {
+        /// Table section name.
+        section: &'static str,
+        /// Table entry index.
+        entry_index: u32,
+        /// Byte offset into the storage section.
+        offset: u32,
+        /// Entry byte length.
+        length: u32,
+        /// Declared storage section byte length.
+        storage_size: u32,
+    },
     /// A requested function id is outside the function table.
     InvalidFunctionIndex {
         /// Function id being read.
@@ -1284,6 +1307,16 @@ impl fmt::Display for ParseError {
             } => write!(
                 formatter,
                 "Hermes bytecode string entry {string_index} at offset {offset} with length {length} exceeds string storage size {storage_size}",
+            ),
+            Self::StorageTableEntryOutOfBounds {
+                section,
+                entry_index,
+                offset,
+                length,
+                storage_size,
+            } => write!(
+                formatter,
+                "Hermes bytecode {section} entry {entry_index} at offset {offset} with length {length} exceeds storage size {storage_size}",
             ),
             Self::InvalidFunctionIndex {
                 function_id,
@@ -1585,6 +1618,31 @@ fn validate_string_table(
             return Err(ParseError::StringTableEntryOutOfBounds {
                 string_index: u32::try_from(index)
                     .expect("validated string table index fits in u32"),
+                offset,
+                length,
+                storage_size,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_storage_table(
+    section: &'static str,
+    entries: &[u8],
+    storage_size: u32,
+) -> Result<(), ParseError> {
+    for (index, entry) in entries.chunks_exact(U32_PAIR_ENTRY_SIZE).enumerate() {
+        let offset = read_u32(entry, 0);
+        let length = read_u32(entry, 4);
+        if offset
+            .checked_add(length)
+            .is_none_or(|end| end > storage_size)
+        {
+            return Err(ParseError::StorageTableEntryOutOfBounds {
+                section,
+                entry_index: u32::try_from(index)
+                    .expect("validated storage table index fits in u32"),
                 offset,
                 length,
                 storage_size,
@@ -2498,9 +2556,15 @@ mod tests {
         append_bytes(&mut bytes, &[1, 2, 3]);
         append_bytes(&mut bytes, &[4, 5, 6, 7, 8]);
         append_repeated(&mut bytes, SHAPE_TABLE_ENTRY_SIZE, 0x22);
-        append_repeated(&mut bytes, BIG_INT_TABLE_ENTRY_SIZE, 0x33);
+        append_bytes(
+            &mut bytes,
+            &[0_u32.to_le_bytes(), 4_u32.to_le_bytes()].concat(),
+        );
         append_bytes(&mut bytes, &[9, 10, 11, 12]);
-        append_repeated(&mut bytes, REG_EXP_TABLE_ENTRY_SIZE, 0x44);
+        append_bytes(
+            &mut bytes,
+            &[0_u32.to_le_bytes(), 2_u32.to_le_bytes()].concat(),
+        );
         append_bytes(&mut bytes, &[13, 14]);
         append_bytes(
             &mut bytes,
@@ -2872,6 +2936,54 @@ mod tests {
                 offset: 5,
                 length: 2,
                 storage_size: 6,
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_bigint_entries_outside_storage() {
+        let mut bytes = fixture_bytecode();
+        let big_int_offset = HermesBytecode::parse(&bytes)
+            .expect("valid fixture")
+            .sections()
+            .big_int_table()
+            .offset() as usize;
+        write_u32(&mut bytes, big_int_offset, 2);
+        write_u32(&mut bytes, big_int_offset + 4, 3);
+
+        let error = HermesBytecode::parse(&bytes).expect_err("invalid bigint entry must fail");
+        assert_eq!(
+            error,
+            ParseError::StorageTableEntryOutOfBounds {
+                section: "big_int_table",
+                entry_index: 0,
+                offset: 2,
+                length: 3,
+                storage_size: 4,
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_regexp_entries_outside_storage() {
+        let mut bytes = fixture_bytecode();
+        let reg_exp_offset = HermesBytecode::parse(&bytes)
+            .expect("valid fixture")
+            .sections()
+            .reg_exp_table()
+            .offset() as usize;
+        write_u32(&mut bytes, reg_exp_offset, 1);
+        write_u32(&mut bytes, reg_exp_offset + 4, 2);
+
+        let error = HermesBytecode::parse(&bytes).expect_err("invalid regexp entry must fail");
+        assert_eq!(
+            error,
+            ParseError::StorageTableEntryOutOfBounds {
+                section: "reg_exp_table",
+                entry_index: 0,
+                offset: 1,
+                length: 2,
+                storage_size: 2,
             },
         );
     }

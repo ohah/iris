@@ -14,6 +14,10 @@ run = "bun install"
 description = "Fetch local gitignored runtime references"
 run = "sh tools/fetch-references.sh"
 
+[tasks.sync-labels]
+description = "Create or update the repository labels used by Iris PRs"
+run = "sh tools/sync-labels.sh"
+
 [tasks.fmt-js]
 description = "Format JavaScript and TypeScript with Oxfmt"
 run = "bunx oxfmt --write ."
@@ -53,6 +57,10 @@ run = "cargo check --workspace --all-targets"
 [tasks.test]
 description = "Run all Rust tests"
 run = "cargo test --workspace"
+
+[tasks.perf]
+description = "Run the core performance budget gate"
+run = "sh tools/perf/core-budget.sh"
 
 [tasks.check]
 description = "Run formatting, lint, Rust checks, and tests"

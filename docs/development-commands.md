@@ -8,6 +8,7 @@ Iris는 `mise`를 개발 명령의 단일 진입점으로 둔다.
 mise install
 mise run install
 mise run fetch-references
+mise run sync-labels
 ```
 
 ## 자주 쓰는 명령
@@ -18,6 +19,8 @@ mise run fmt-check
 mise run lint
 mise run vp-check
 mise run fetch-references
+mise run sync-labels
+mise run perf
 mise run rust-check
 mise run test
 mise run check

@@ -69,6 +69,9 @@ const SHAPE_TABLE_ENTRY_SIZE: usize = 8;
 const BIG_INT_TABLE_ENTRY_SIZE: usize = 8;
 const REG_EXP_TABLE_ENTRY_SIZE: usize = 8;
 const U32_PAIR_ENTRY_SIZE: usize = 8;
+const EXCEPTION_HANDLER_TABLE_HEADER_SIZE: usize = 4;
+const EXCEPTION_HANDLER_ENTRY_SIZE: usize = 12;
+const FUNCTION_INFO_ALIGNMENT: u32 = 4;
 const SWITCH_TABLE_CASE_SIZE: usize = 8;
 const SWITCH_TABLE_ALIGNMENT: u32 = 4;
 const HERMES_OPCODE_WIDTHS: [u8; HERMES_OPCODE_COUNT] = [
@@ -1110,6 +1113,37 @@ pub enum ParseError {
         /// Exclusive function body region end offset.
         limit: u32,
     },
+    /// A function declares extra metadata but has no function info region.
+    MissingFunctionInfo {
+        /// Function id whose info region is missing.
+        function_id: u32,
+    },
+    /// A function info table extends outside its allowed region.
+    FunctionInfoOutOfBounds {
+        /// Function id whose info table is invalid.
+        function_id: u32,
+        /// Table byte offset.
+        offset: u32,
+        /// Table byte size.
+        size: u32,
+        /// Exclusive function info region end offset.
+        limit: u32,
+    },
+    /// An exception handler entry points outside the function body boundaries.
+    InvalidExceptionHandler {
+        /// Function id whose exception table is invalid.
+        function_id: u32,
+        /// Exception table entry index.
+        entry_index: u32,
+        /// Try range start offset relative to the function bytecode.
+        start: u32,
+        /// Try range end offset relative to the function bytecode.
+        end: u32,
+        /// Handler target offset relative to the function bytecode.
+        target: u32,
+        /// Function bytecode body size.
+        body_size: u32,
+    },
     /// A function bytecode body contains an opcode not known to this Hermes table.
     InvalidOpcode {
         /// Function id whose instruction stream is invalid.
@@ -1342,6 +1376,30 @@ impl fmt::Display for ParseError {
             } => write!(
                 formatter,
                 "Hermes bytecode function {function_id} body at {offset} with size {size} is outside function body region {function_bodies_offset}..{limit}",
+            ),
+            Self::MissingFunctionInfo { function_id } => write!(
+                formatter,
+                "Hermes bytecode function {function_id} declares function info but has no function info offset",
+            ),
+            Self::FunctionInfoOutOfBounds {
+                function_id,
+                offset,
+                size,
+                limit,
+            } => write!(
+                formatter,
+                "Hermes bytecode function {function_id} info table at {offset} with size {size} exceeds function info limit {limit}",
+            ),
+            Self::InvalidExceptionHandler {
+                function_id,
+                entry_index,
+                start,
+                end,
+                target,
+                body_size,
+            } => write!(
+                formatter,
+                "Hermes bytecode function {function_id} exception handler {entry_index} has range {start}..{end} and target {target}, outside function body size {body_size}",
             ),
             Self::InvalidOpcode {
                 function_id,
@@ -1785,7 +1843,7 @@ fn validate_function_headers(
             .expect("u32 always fits in usize on supported targets"),
     );
     for function_id in 0..header.function_count {
-        decoded_headers.push(function_header_at(
+        decoded_headers.push(decoded_function_header_at(
             bytes,
             header,
             function_headers,
@@ -1794,8 +1852,9 @@ fn validate_function_headers(
     }
 
     for function_id in 0..header.function_count {
-        let function_header = decoded_headers
+        let decoded = decoded_headers
             [usize::try_from(function_id).expect("u32 always fits in usize on supported targets")];
+        let function_header = decoded.header;
         let function_region_limit = function_region_limit(function_header, &decoded_headers)
             .unwrap_or(body_limit)
             .min(body_limit);
@@ -1809,6 +1868,12 @@ fn validate_function_headers(
                 header,
                 function_region_limit,
             },
+        )?;
+        validate_function_info(
+            bytes,
+            function_id,
+            decoded,
+            function_info_region_limit(header, decoded.large_header_offset, &decoded_headers),
         )?;
     }
     Ok(())
@@ -1842,15 +1907,191 @@ fn validate_function_body(
     )
 }
 
+fn validate_function_info(
+    bytes: &[u8],
+    function_id: u32,
+    decoded: DecodedFunctionHeader,
+    limit: u32,
+) -> Result<(), ParseError> {
+    if !decoded.header.has_exception_handler() && !decoded.header.has_debug_info() {
+        return Ok(());
+    }
+    let Some(info_offset) = decoded.large_header_offset else {
+        return Err(ParseError::MissingFunctionInfo { function_id });
+    };
+    if !decoded.header.has_exception_handler() {
+        return Ok(());
+    }
+
+    let table_header_offset = info_offset
+        .checked_add(LARGE_FUNC_HEADER_SIZE as u32)
+        .and_then(|offset| align_u32(offset, FUNCTION_INFO_ALIGNMENT))
+        .ok_or(ParseError::FunctionInfoOutOfBounds {
+            function_id,
+            offset: u32::MAX,
+            size: EXCEPTION_HANDLER_TABLE_HEADER_SIZE as u32,
+            limit,
+        })?;
+    let table_header = function_info_bytes(
+        bytes,
+        function_id,
+        table_header_offset,
+        EXCEPTION_HANDLER_TABLE_HEADER_SIZE as u32,
+        limit,
+    )?;
+    let entry_count = read_u32(table_header, 0);
+    let table_offset = table_header_offset
+        .checked_add(EXCEPTION_HANDLER_TABLE_HEADER_SIZE as u32)
+        .ok_or(ParseError::FunctionInfoOutOfBounds {
+            function_id,
+            offset: table_header_offset,
+            size: EXCEPTION_HANDLER_TABLE_HEADER_SIZE as u32,
+            limit,
+        })?;
+    let table_size = entry_count
+        .checked_mul(EXCEPTION_HANDLER_ENTRY_SIZE as u32)
+        .ok_or(ParseError::FunctionInfoOutOfBounds {
+            function_id,
+            offset: table_offset,
+            size: u32::MAX,
+            limit,
+        })?;
+    let table = function_info_bytes(bytes, function_id, table_offset, table_size, limit)?;
+    let body = function_body(bytes, function_id, decoded.header)?;
+    let boundaries = instruction_boundaries(function_id, body)?;
+
+    for (entry_index, entry) in table.chunks_exact(EXCEPTION_HANDLER_ENTRY_SIZE).enumerate() {
+        validate_exception_handler(
+            function_id,
+            body,
+            &boundaries,
+            u32::try_from(entry_index).expect("validated exception handler index fits in u32"),
+            read_u32(entry, 0),
+            read_u32(entry, 4),
+            read_u32(entry, 8),
+        )?;
+    }
+    Ok(())
+}
+
+fn function_info_bytes(
+    bytes: &[u8],
+    function_id: u32,
+    offset: u32,
+    size: u32,
+    limit: u32,
+) -> Result<&[u8], ParseError> {
+    let end = offset
+        .checked_add(size)
+        .ok_or(ParseError::FunctionInfoOutOfBounds {
+            function_id,
+            offset,
+            size,
+            limit,
+        })?;
+    if end > limit {
+        return Err(ParseError::FunctionInfoOutOfBounds {
+            function_id,
+            offset,
+            size,
+            limit,
+        });
+    }
+
+    let start = usize::try_from(offset).expect("u32 always fits in usize on supported targets");
+    let end = usize::try_from(end).expect("u32 always fits in usize on supported targets");
+    bytes
+        .get(start..end)
+        .ok_or(ParseError::FunctionInfoOutOfBounds {
+            function_id,
+            offset,
+            size,
+            limit,
+        })
+}
+
+fn instruction_boundaries(function_id: u32, body: SectionView<'_>) -> Result<Vec<u32>, ParseError> {
+    let mut boundaries = Vec::new();
+    for instruction in HermesInstructionStream::new(function_id, body) {
+        boundaries.push(instruction?.offset);
+    }
+    Ok(boundaries)
+}
+
+fn validate_exception_handler(
+    function_id: u32,
+    body: SectionView<'_>,
+    boundaries: &[u32],
+    entry_index: u32,
+    start: u32,
+    end: u32,
+    target: u32,
+) -> Result<(), ParseError> {
+    let body_size = body.len();
+    let valid = start <= end
+        && relative_instruction_boundary(body, start, boundaries, false)
+        && relative_instruction_boundary(body, end, boundaries, true)
+        && relative_instruction_boundary(body, target, boundaries, false);
+    if !valid {
+        return Err(ParseError::InvalidExceptionHandler {
+            function_id,
+            entry_index,
+            start,
+            end,
+            target,
+            body_size,
+        });
+    }
+    Ok(())
+}
+
+fn relative_instruction_boundary(
+    body: SectionView<'_>,
+    relative_offset: u32,
+    boundaries: &[u32],
+    allow_body_end: bool,
+) -> bool {
+    if allow_body_end && relative_offset == body.len() {
+        return true;
+    }
+    let Some(target) = body.offset.checked_add(relative_offset) else {
+        return false;
+    };
+    is_instruction_boundary(body, i64::from(target), boundaries)
+}
+
 fn function_region_limit(
     function_header: HermesFunctionHeader,
-    function_headers: &[HermesFunctionHeader],
+    function_headers: &[DecodedFunctionHeader],
 ) -> Option<u32> {
     function_headers
         .iter()
-        .map(|header| header.offset)
+        .map(|decoded| decoded.header.offset)
         .filter(|offset| *offset > function_header.offset)
         .min()
+}
+
+fn function_info_region_limit(
+    header: HermesBytecodeHeader,
+    large_header_offset: Option<u32>,
+    function_headers: &[DecodedFunctionHeader],
+) -> u32 {
+    let fallback = if header.debug_info_offset == 0 {
+        header
+            .file_length
+            .saturating_sub(HERMES_BYTECODE_FOOTER_SIZE as u32)
+    } else {
+        header.debug_info_offset
+    };
+    let Some(large_header_offset) = large_header_offset else {
+        return fallback;
+    };
+    function_headers
+        .iter()
+        .filter_map(|decoded| decoded.large_header_offset)
+        .filter(|offset| *offset > large_header_offset)
+        .min()
+        .unwrap_or(fallback)
 }
 
 fn function_body_limit(
@@ -2695,6 +2936,66 @@ mod tests {
         )
     }
 
+    fn add_global_exception_info(
+        bytes: &mut Vec<u8>,
+        declared_count: u32,
+        entries: &[(u32, u32, u32)],
+    ) -> u32 {
+        let (header, function_headers_offset, global) = {
+            let bytecode = HermesBytecode::parse(bytes).expect("valid fixture");
+            (
+                bytecode.header(),
+                bytecode.sections().function_headers().offset() as usize,
+                bytecode
+                    .global_function_header()
+                    .expect("valid global function"),
+            )
+        };
+        let info_offset =
+            usize::try_from(header.debug_info_offset).expect("test fixture offset fits in usize");
+        let function_header_offset = function_headers_offset
+            + usize::try_from(header.global_code_index)
+                .expect("test fixture global index fits in usize")
+                * SMALL_FUNC_HEADER_SIZE;
+
+        let mut info = Vec::new();
+        info.extend_from_slice(&encode_large_function_header(SmallFunctionHeaderFixture {
+            offset: global.offset,
+            bytecode_size_in_bytes: global.bytecode_size_in_bytes,
+            param_count: global.param_count,
+            loop_depth: global.loop_depth,
+            function_name: global.function_name,
+            number_reg_count: global.number_reg_count,
+            non_ptr_reg_count: global.non_ptr_reg_count,
+            frame_size: u8::try_from(global.frame_size)
+                .expect("test fixture frame size fits in u8"),
+            read_cache_size: global.read_cache_size,
+            write_cache_size: global.write_cache_size,
+            private_name_cache_size: global.private_name_cache_size,
+            flags: global.flags | 0b0000_1000,
+        }));
+        info.extend_from_slice(&declared_count.to_le_bytes());
+        for (start, end, target) in entries {
+            info.extend_from_slice(&start.to_le_bytes());
+            info.extend_from_slice(&end.to_le_bytes());
+            info.extend_from_slice(&target.to_le_bytes());
+        }
+
+        bytes.splice(info_offset..info_offset, info);
+        let info_offset_u32 = u32::try_from(info_offset).expect("test fixture offset fits in u32");
+        let new_debug_offset = header.debug_info_offset
+            + LARGE_FUNC_HEADER_SIZE as u32
+            + EXCEPTION_HANDLER_TABLE_HEADER_SIZE as u32
+            + u32::try_from(entries.len()).expect("test fixture entry count fits in u32")
+                * EXCEPTION_HANDLER_ENTRY_SIZE as u32;
+        let new_file_length = u32::try_from(bytes.len()).expect("test fixture length fits in u32");
+        write_u32(bytes, DEBUG_INFO_OFFSET_OFFSET, new_debug_offset);
+        write_u32(bytes, FILE_LENGTH_OFFSET, new_file_length);
+        bytes[function_header_offset..function_header_offset + SMALL_FUNC_HEADER_SIZE]
+            .copy_from_slice(&encode_overflow_function_header(info_offset_u32));
+        info_offset_u32
+    }
+
     #[test]
     fn parses_header_without_copying_payload() {
         let bytes = fixture_bytecode();
@@ -3093,6 +3394,94 @@ mod tests {
                 limit: large_header_offset,
             },
         );
+    }
+
+    #[test]
+    fn accepts_valid_exception_handler_table() {
+        let mut bytes = fixture_bytecode();
+        add_global_exception_info(&mut bytes, 1, &[(0, 2, 0)]);
+
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid exception table");
+        assert!(
+            bytecode
+                .global_function_header()
+                .expect("valid global function")
+                .has_exception_handler()
+        );
+    }
+
+    #[test]
+    fn rejects_exception_handler_target_between_instructions() {
+        let mut bytes = fixture_bytecode();
+        add_global_exception_info(&mut bytes, 1, &[(0, 2, 1)]);
+
+        let error = HermesBytecode::parse(&bytes).expect_err("invalid exception target must fail");
+        assert_eq!(
+            error,
+            ParseError::InvalidExceptionHandler {
+                function_id: 1,
+                entry_index: 0,
+                start: 0,
+                end: 2,
+                target: 1,
+                body_size: 2,
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_exception_table_outside_function_info() {
+        let mut bytes = fixture_bytecode();
+        let info_offset = add_global_exception_info(&mut bytes, 2, &[(0, 2, 0)]);
+
+        let error = HermesBytecode::parse(&bytes).expect_err("short exception table must fail");
+        assert_eq!(
+            error,
+            ParseError::FunctionInfoOutOfBounds {
+                function_id: 1,
+                offset: info_offset
+                    + LARGE_FUNC_HEADER_SIZE as u32
+                    + EXCEPTION_HANDLER_TABLE_HEADER_SIZE as u32,
+                size: 2 * EXCEPTION_HANDLER_ENTRY_SIZE as u32,
+                limit: info_offset
+                    + LARGE_FUNC_HEADER_SIZE as u32
+                    + EXCEPTION_HANDLER_TABLE_HEADER_SIZE as u32
+                    + EXCEPTION_HANDLER_ENTRY_SIZE as u32,
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_missing_function_info_for_exception_flag() {
+        let mut bytes = fixture_bytecode();
+        let (function_headers_offset, function_body_offset) = {
+            let bytecode = HermesBytecode::parse(&bytes).expect("valid fixture");
+            (
+                bytecode.sections().function_headers().offset() as usize,
+                bytecode
+                    .function_body(0)
+                    .expect("valid function body")
+                    .offset(),
+            )
+        };
+        bytes[function_headers_offset..function_headers_offset + SMALL_FUNC_HEADER_SIZE]
+            .copy_from_slice(&encode_small_function_header(SmallFunctionHeaderFixture {
+                offset: function_body_offset,
+                bytecode_size_in_bytes: 2,
+                param_count: 1,
+                loop_depth: 0,
+                function_name: 0,
+                number_reg_count: 2,
+                non_ptr_reg_count: 1,
+                frame_size: 4,
+                read_cache_size: 1,
+                write_cache_size: 2,
+                private_name_cache_size: 1,
+                flags: 0b0000_1100,
+            }));
+
+        let error = HermesBytecode::parse(&bytes).expect_err("missing function info must fail");
+        assert_eq!(error, ParseError::MissingFunctionInfo { function_id: 0 });
     }
 
     #[test]

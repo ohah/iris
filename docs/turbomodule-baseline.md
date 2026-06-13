@@ -36,6 +36,7 @@ mise run rn-ios-build-debug
 mise run rn-android-build-release
 mise run rn-ios-build-release
 mise run bench-extract-release-fixture
+mise run bench-extract-android-release-fixture
 ```
 
 `rn-codegen`은 생성물을 `artifacts/codegen/rn-bench`에 남긴다. 이 디렉터리는 gitignore된다.
@@ -81,4 +82,4 @@ xcrun simctl spawn booted log stream --style compact --predicate 'eventMessage C
 mise run bench-extract-hermes-release
 ```
 
-release 추출은 `metadata.build.mode = release`, Hermes, New Architecture, TurboModule proxy, TurboModule number/string case를 모두 요구한다. 이 산출물을 Iris 경로와 비교할 때의 기준으로 사용한다.
+release 추출은 `metadata.build.mode = release`, Hermes, New Architecture, TurboModule number/string case를 모두 요구한다. RN 0.85 bridgeless Android에서는 `global.__turboModuleProxy`가 노출되지 않을 수 있으므로 전역 proxy 플래그가 아니라 실제 Codegen TurboModule benchmark case 실행 여부로 TurboModule 경계를 검증한다. 이 산출물을 Iris 경로와 비교할 때의 기준으로 사용한다.

@@ -74,6 +74,16 @@ const EXCEPTION_HANDLER_ENTRY_SIZE: usize = 12;
 const FUNCTION_INFO_ALIGNMENT: u32 = 4;
 const SWITCH_TABLE_CASE_SIZE: usize = 8;
 const SWITCH_TABLE_ALIGNMENT: u32 = 4;
+const SERIALIZED_LITERAL_TAG_LONG_SEQUENCE: u8 = 0x80;
+const SERIALIZED_LITERAL_TAG_MASK: u8 = 0x70;
+const SERIALIZED_LITERAL_TAG_LENGTH_MASK: u8 = 0x0f;
+const SERIALIZED_LITERAL_TAG_TRUE: u8 = 1 << 4;
+const SERIALIZED_LITERAL_TAG_FALSE: u8 = 2 << 4;
+const SERIALIZED_LITERAL_TAG_NUMBER: u8 = 3 << 4;
+const SERIALIZED_LITERAL_TAG_LONG_STRING: u8 = 4 << 4;
+const SERIALIZED_LITERAL_TAG_SHORT_STRING: u8 = 5 << 4;
+const SERIALIZED_LITERAL_TAG_UNDEFINED: u8 = 6 << 4;
+const SERIALIZED_LITERAL_TAG_INTEGER: u8 = 7 << 4;
 const HERMES_OPCODE_WIDTHS: [u8; HERMES_OPCODE_COUNT] = [
     1, 6, 10, 11, 12, 2, 3, 8, 10, 4, 5, 3, 4, 4, 3, 3, 3, 9, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4,
     4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 3, 3, 4, 4, 5, 5, 3, 4, 3, 4, 5, 4, 5, 4, 5, 2,
@@ -84,7 +94,11 @@ const HERMES_OPCODE_WIDTHS: [u8; HERMES_OPCODE_COUNT] = [
     4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7,
 ];
 
-const BYTECODE_TABLE_OPERANDS: [BytecodeTableOperand; 31] = [
+const BYTECODE_TABLE_OPERANDS: [BytecodeTableOperand; 35] = [
+    BytecodeTableOperand::new(1, 2, 2, BytecodeTable::ObjectShape),
+    BytecodeTableOperand::new(2, 2, 4, BytecodeTable::ObjectShape),
+    BytecodeTableOperand::new(3, 3, 4, BytecodeTable::ObjectShape),
+    BytecodeTableOperand::new(4, 3, 4, BytecodeTable::ObjectShape),
     BytecodeTableOperand::new(67, 1, 4, BytecodeTable::String),
     BytecodeTableOperand::new(68, 4, 1, BytecodeTable::String),
     BytecodeTableOperand::new(69, 4, 2, BytecodeTable::String),
@@ -117,6 +131,19 @@ const BYTECODE_TABLE_OPERANDS: [BytecodeTableOperand; 31] = [
     BytecodeTableOperand::new(169, 3, 2, BytecodeTable::Function),
     BytecodeTableOperand::new(170, 3, 4, BytecodeTable::Function),
 ];
+
+const OBJECT_LITERAL_OPERANDS: [ObjectLiteralOperand; 4] = [
+    ObjectLiteralOperand::new(1, 2, 2, 4, 2),
+    ObjectLiteralOperand::new(2, 2, 4, 6, 4),
+    ObjectLiteralOperand::new(3, 3, 4, 7, 4),
+    ObjectLiteralOperand::new(4, 3, 4, 7, 4),
+];
+
+const ARRAY_LITERAL_OPERANDS: [ArrayLiteralOperand; 2] = [
+    ArrayLiteralOperand::new(7, 4, 2, 6, 2),
+    ArrayLiteralOperand::new(8, 4, 2, 6, 4),
+];
+
 const JUMP_OPERANDS: [JumpOperand; 45] = [
     JumpOperand::new(175, 1, 1),
     JumpOperand::new(176, 1, 4),
@@ -464,6 +491,7 @@ impl<'a> HermesBytecodeSections<'a> {
             header.overflow_string_count,
             header.string_storage_size,
         )?;
+        validate_object_shape_table(obj_shape_table.bytes, obj_key_buffer.bytes, header)?;
         validate_storage_table(
             "big_int_table",
             big_int_table.bytes,
@@ -474,7 +502,14 @@ impl<'a> HermesBytecodeSections<'a> {
             reg_exp_table.bytes,
             header.reg_exp_storage_size,
         )?;
-        validate_function_headers(bytes, header, function_headers, function_bodies_offset)?;
+        validate_function_headers(
+            bytes,
+            header,
+            function_headers,
+            function_bodies_offset,
+            literal_value_buffer,
+            obj_shape_table,
+        )?;
         validate_cjs_module_table(cjs_module_table.bytes, header)?;
         validate_function_source_table(function_source_table.bytes, header)?;
 
@@ -704,6 +739,7 @@ enum BytecodeTable {
     String,
     Function,
     BigInt,
+    ObjectShape,
 }
 
 impl BytecodeTable {
@@ -712,6 +748,7 @@ impl BytecodeTable {
             Self::String => "string",
             Self::Function => "function",
             Self::BigInt => "bigint",
+            Self::ObjectShape => "object_shape",
         }
     }
 
@@ -720,6 +757,7 @@ impl BytecodeTable {
             Self::String => header.string_count,
             Self::Function => header.function_count,
             Self::BigInt => header.big_int_count,
+            Self::ObjectShape => header.obj_shape_table_count,
         }
     }
 }
@@ -744,6 +782,60 @@ impl BytecodeTableOperand {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ObjectLiteralOperand {
+    opcode: u8,
+    shape_offset: u8,
+    shape_width: u8,
+    value_offset: u8,
+    value_width: u8,
+}
+
+impl ObjectLiteralOperand {
+    const fn new(
+        opcode: u8,
+        shape_offset: u8,
+        shape_width: u8,
+        value_offset: u8,
+        value_width: u8,
+    ) -> Self {
+        Self {
+            opcode,
+            shape_offset,
+            shape_width,
+            value_offset,
+            value_width,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArrayLiteralOperand {
+    opcode: u8,
+    element_count_offset: u8,
+    element_count_width: u8,
+    value_offset: u8,
+    value_width: u8,
+}
+
+impl ArrayLiteralOperand {
+    const fn new(
+        opcode: u8,
+        element_count_offset: u8,
+        element_count_width: u8,
+        value_offset: u8,
+        value_width: u8,
+    ) -> Self {
+        Self {
+            opcode,
+            element_count_offset,
+            element_count_width,
+            value_offset,
+            value_width,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct JumpOperand {
     opcode: u8,
     offset: u8,
@@ -761,9 +853,17 @@ impl JumpOperand {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct InstructionValidationContext {
+struct ObjectShapeEntry {
+    key_buffer_offset: u32,
+    num_props: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InstructionValidationContext<'a> {
     header: HermesBytecodeHeader,
     function_region_limit: u32,
+    literal_value_buffer: &'a [u8],
+    obj_shape_table: &'a [u8],
 }
 
 /// Iterator over a Hermes function bytecode body.
@@ -1084,6 +1184,37 @@ pub enum ParseError {
         /// Declared storage section byte length.
         storage_size: u32,
     },
+    /// A serialized literal buffer reference cannot contain the requested items.
+    InvalidSerializedLiteralBuffer {
+        /// Buffer section name.
+        buffer: &'static str,
+        /// Byte offset into the buffer.
+        offset: u32,
+        /// Number of logical literal entries requested.
+        element_count: u32,
+        /// Buffer byte length.
+        buffer_size: u32,
+    },
+    /// A serialized literal buffer uses a tag that is invalid for the buffer kind.
+    InvalidSerializedLiteralTag {
+        /// Buffer section name.
+        buffer: &'static str,
+        /// Byte offset of the serialized tag.
+        offset: u32,
+        /// Raw tag byte.
+        tag: u8,
+    },
+    /// A serialized literal buffer references an invalid string id.
+    InvalidSerializedLiteralStringReference {
+        /// Buffer section name.
+        buffer: &'static str,
+        /// Byte offset of the serialized string id.
+        offset: u32,
+        /// Referenced string id.
+        string_id: u32,
+        /// Declared string table count.
+        string_count: u32,
+    },
     /// A requested function id is outside the function table.
     InvalidFunctionIndex {
         /// Function id being read.
@@ -1351,6 +1482,32 @@ impl fmt::Display for ParseError {
             } => write!(
                 formatter,
                 "Hermes bytecode {section} entry {entry_index} at offset {offset} with length {length} exceeds storage size {storage_size}",
+            ),
+            Self::InvalidSerializedLiteralBuffer {
+                buffer,
+                offset,
+                element_count,
+                buffer_size,
+            } => write!(
+                formatter,
+                "Hermes bytecode {buffer} at offset {offset} cannot provide {element_count} serialized literal entries within buffer size {buffer_size}",
+            ),
+            Self::InvalidSerializedLiteralTag {
+                buffer,
+                offset,
+                tag,
+            } => write!(
+                formatter,
+                "Hermes bytecode {buffer} has invalid serialized literal tag {tag:#04x} at offset {offset}",
+            ),
+            Self::InvalidSerializedLiteralStringReference {
+                buffer,
+                offset,
+                string_id,
+                string_count,
+            } => write!(
+                formatter,
+                "Hermes bytecode {buffer} at offset {offset} references string id {string_id}, but the string table count is {string_count}",
             ),
             Self::InvalidFunctionIndex {
                 function_id,
@@ -1710,6 +1867,234 @@ fn validate_storage_table(
     Ok(())
 }
 
+fn validate_object_shape_table(
+    entries: &[u8],
+    obj_key_buffer: &[u8],
+    header: HermesBytecodeHeader,
+) -> Result<(), ParseError> {
+    for entry in entries.chunks_exact(SHAPE_TABLE_ENTRY_SIZE) {
+        let shape = object_shape_entry(entry);
+        validate_serialized_literal_buffer(
+            "obj_key_buffer",
+            obj_key_buffer,
+            shape.key_buffer_offset,
+            shape.num_props,
+            true,
+            header,
+        )?;
+    }
+    Ok(())
+}
+
+fn object_shape_entry(bytes: &[u8]) -> ObjectShapeEntry {
+    ObjectShapeEntry {
+        key_buffer_offset: read_u32(bytes, 0),
+        num_props: read_u32(bytes, 4),
+    }
+}
+
+fn object_shape_entry_at(entries: &[u8], shape_index: u32) -> Option<ObjectShapeEntry> {
+    let start = usize::try_from(shape_index)
+        .expect("u32 always fits in usize on supported targets")
+        .checked_mul(SHAPE_TABLE_ENTRY_SIZE)?;
+    let end = start.checked_add(SHAPE_TABLE_ENTRY_SIZE)?;
+    entries.get(start..end).map(object_shape_entry)
+}
+
+fn validate_serialized_literal_buffer(
+    buffer_name: &'static str,
+    buffer: &[u8],
+    offset: u32,
+    element_count: u32,
+    is_key_buffer: bool,
+    header: HermesBytecodeHeader,
+) -> Result<(), ParseError> {
+    let buffer_size =
+        u32::try_from(buffer.len()).expect("validated HBC section length fits in u32");
+    if offset > buffer_size {
+        return Err(ParseError::InvalidSerializedLiteralBuffer {
+            buffer: buffer_name,
+            offset,
+            element_count,
+            buffer_size,
+        });
+    }
+
+    let mut remaining = element_count;
+    let mut cursor =
+        usize::try_from(offset).expect("u32 always fits in usize on supported targets");
+    while remaining > 0 {
+        let tag_offset = cursor;
+        let Some(&tag) = buffer.get(cursor) else {
+            return Err(ParseError::InvalidSerializedLiteralBuffer {
+                buffer: buffer_name,
+                offset,
+                element_count,
+                buffer_size,
+            });
+        };
+        cursor += 1;
+
+        let sequence_len = if tag & SERIALIZED_LITERAL_TAG_LONG_SEQUENCE != 0 {
+            let Some(&low_len) = buffer.get(cursor) else {
+                return Err(ParseError::InvalidSerializedLiteralBuffer {
+                    buffer: buffer_name,
+                    offset,
+                    element_count,
+                    buffer_size,
+                });
+            };
+            cursor += 1;
+            (u32::from(tag & SERIALIZED_LITERAL_TAG_LENGTH_MASK) << 8) | u32::from(low_len)
+        } else {
+            u32::from(tag & SERIALIZED_LITERAL_TAG_LENGTH_MASK)
+        };
+        if sequence_len == 0 {
+            return Err(ParseError::InvalidSerializedLiteralBuffer {
+                buffer: buffer_name,
+                offset,
+                element_count,
+                buffer_size,
+            });
+        }
+
+        let tag_type = tag & SERIALIZED_LITERAL_TAG_MASK;
+        if is_key_buffer
+            && matches!(
+                tag_type,
+                SERIALIZED_LITERAL_TAG_TRUE
+                    | SERIALIZED_LITERAL_TAG_FALSE
+                    | SERIALIZED_LITERAL_TAG_UNDEFINED
+            )
+        {
+            return Err(ParseError::InvalidSerializedLiteralTag {
+                buffer: buffer_name,
+                offset: u32::try_from(tag_offset)
+                    .expect("validated HBC section offset fits in u32"),
+                tag,
+            });
+        }
+
+        let to_read = remaining.min(sequence_len);
+        let data_size = serialized_literal_data_size(tag_type);
+        let bytes_to_read =
+            to_read
+                .checked_mul(data_size)
+                .ok_or(ParseError::InvalidSerializedLiteralBuffer {
+                    buffer: buffer_name,
+                    offset,
+                    element_count,
+                    buffer_size,
+                })?;
+        let end = cursor
+            .checked_add(
+                usize::try_from(bytes_to_read)
+                    .expect("u32 always fits in usize on supported targets"),
+            )
+            .ok_or(ParseError::InvalidSerializedLiteralBuffer {
+                buffer: buffer_name,
+                offset,
+                element_count,
+                buffer_size,
+            })?;
+        if end > buffer.len() {
+            return Err(ParseError::InvalidSerializedLiteralBuffer {
+                buffer: buffer_name,
+                offset,
+                element_count,
+                buffer_size,
+            });
+        }
+
+        validate_serialized_literal_strings(
+            buffer_name,
+            buffer,
+            cursor,
+            to_read,
+            tag_type,
+            header.string_count,
+        )?;
+        cursor = end;
+        remaining -= to_read;
+    }
+    Ok(())
+}
+
+fn serialized_literal_data_size(tag_type: u8) -> u32 {
+    match tag_type {
+        SERIALIZED_LITERAL_TAG_SHORT_STRING => 2,
+        SERIALIZED_LITERAL_TAG_LONG_STRING
+        | SERIALIZED_LITERAL_TAG_INTEGER
+        | SERIALIZED_LITERAL_TAG_NUMBER => {
+            if tag_type == SERIALIZED_LITERAL_TAG_NUMBER {
+                8
+            } else {
+                4
+            }
+        }
+        _ => 0,
+    }
+}
+
+fn validate_serialized_literal_strings(
+    buffer_name: &'static str,
+    buffer: &[u8],
+    start: usize,
+    element_count: u32,
+    tag_type: u8,
+    string_count: u32,
+) -> Result<(), ParseError> {
+    match tag_type {
+        SERIALIZED_LITERAL_TAG_SHORT_STRING => {
+            for index in 0..element_count {
+                let offset = start
+                    + usize::try_from(index)
+                        .expect("u32 always fits in usize on supported targets")
+                        * 2;
+                let string_id = u32::from(u16::from_le_bytes(
+                    buffer[offset..offset + 2]
+                        .try_into()
+                        .expect("validated serialized literal string id has u16 width"),
+                ));
+                validate_serialized_literal_string(buffer_name, offset, string_id, string_count)?;
+            }
+        }
+        SERIALIZED_LITERAL_TAG_LONG_STRING => {
+            for index in 0..element_count {
+                let offset = start
+                    + usize::try_from(index)
+                        .expect("u32 always fits in usize on supported targets")
+                        * 4;
+                validate_serialized_literal_string(
+                    buffer_name,
+                    offset,
+                    read_u32(buffer, offset),
+                    string_count,
+                )?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_serialized_literal_string(
+    buffer_name: &'static str,
+    offset: usize,
+    string_id: u32,
+    string_count: u32,
+) -> Result<(), ParseError> {
+    if string_id >= string_count {
+        return Err(ParseError::InvalidSerializedLiteralStringReference {
+            buffer: buffer_name,
+            offset: u32::try_from(offset).expect("validated HBC section offset fits in u32"),
+            string_id,
+            string_count,
+        });
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DecodedSmallFunctionHeader {
     header: HermesFunctionHeader,
@@ -1836,6 +2221,8 @@ fn validate_function_headers(
     header: HermesBytecodeHeader,
     function_headers: SectionView<'_>,
     function_bodies_offset: u32,
+    literal_value_buffer: SectionView<'_>,
+    obj_shape_table: SectionView<'_>,
 ) -> Result<(), ParseError> {
     let body_limit = function_body_limit(bytes, header, function_headers)?;
     let mut decoded_headers = Vec::with_capacity(
@@ -1867,6 +2254,8 @@ fn validate_function_headers(
             InstructionValidationContext {
                 header,
                 function_region_limit,
+                literal_value_buffer: literal_value_buffer.bytes,
+                obj_shape_table: obj_shape_table.bytes,
             },
         )?;
         validate_function_info(
@@ -1885,7 +2274,7 @@ fn validate_function_body(
     function_header: HermesFunctionHeader,
     function_bodies_offset: u32,
     limit: u32,
-    context: InstructionValidationContext,
+    context: InstructionValidationContext<'_>,
 ) -> Result<(), ParseError> {
     let body_end = function_header
         .offset
@@ -2154,7 +2543,7 @@ fn validate_instruction_stream(
     bytes: &[u8],
     function_id: u32,
     body: SectionView<'_>,
-    context: InstructionValidationContext,
+    context: InstructionValidationContext<'_>,
 ) -> Result<(), ParseError> {
     let mut boundaries = Vec::new();
     let mut instructions = Vec::new();
@@ -2166,6 +2555,7 @@ fn validate_instruction_stream(
 
     for instruction in instructions {
         validate_instruction_table_operands(function_id, body, instruction, context.header)?;
+        validate_instruction_literal_operands(function_id, body, instruction, context)?;
         validate_instruction_jump_operands(function_id, body, instruction, &boundaries)?;
         validate_switch_instruction(bytes, function_id, body, instruction, context, &boundaries)?;
     }
@@ -2203,6 +2593,65 @@ fn validate_instruction_table_operands(
     Ok(())
 }
 
+fn validate_instruction_literal_operands(
+    _function_id: u32,
+    body: SectionView<'_>,
+    instruction: HermesInstruction,
+    context: InstructionValidationContext<'_>,
+) -> Result<(), ParseError> {
+    let instruction_bytes = instruction_bytes(body, instruction);
+    for operand in OBJECT_LITERAL_OPERANDS
+        .iter()
+        .filter(|operand| operand.opcode == instruction.opcode)
+    {
+        let shape_index = read_unsigned_operand(
+            instruction_bytes,
+            usize::from(operand.shape_offset),
+            usize::from(operand.shape_width),
+        );
+        let shape = object_shape_entry_at(context.obj_shape_table, shape_index)
+            .expect("object shape table operand was validated before literal buffer parsing");
+        let value_offset = read_unsigned_operand(
+            instruction_bytes,
+            usize::from(operand.value_offset),
+            usize::from(operand.value_width),
+        );
+        validate_serialized_literal_buffer(
+            "literal_value_buffer",
+            context.literal_value_buffer,
+            value_offset,
+            shape.num_props,
+            false,
+            context.header,
+        )?;
+    }
+
+    for operand in ARRAY_LITERAL_OPERANDS
+        .iter()
+        .filter(|operand| operand.opcode == instruction.opcode)
+    {
+        let element_count = read_unsigned_operand(
+            instruction_bytes,
+            usize::from(operand.element_count_offset),
+            usize::from(operand.element_count_width),
+        );
+        let value_offset = read_unsigned_operand(
+            instruction_bytes,
+            usize::from(operand.value_offset),
+            usize::from(operand.value_width),
+        );
+        validate_serialized_literal_buffer(
+            "literal_value_buffer",
+            context.literal_value_buffer,
+            value_offset,
+            element_count,
+            false,
+            context.header,
+        )?;
+    }
+    Ok(())
+}
+
 fn validate_instruction_jump_operands(
     function_id: u32,
     body: SectionView<'_>,
@@ -2229,7 +2678,7 @@ fn validate_switch_instruction(
     function_id: u32,
     body: SectionView<'_>,
     instruction: HermesInstruction,
-    context: InstructionValidationContext,
+    context: InstructionValidationContext<'_>,
     boundaries: &[u32],
 ) -> Result<(), ParseError> {
     match instruction.opcode {
@@ -2258,7 +2707,7 @@ fn validate_uint_switch_instruction(
     function_id: u32,
     body: SectionView<'_>,
     instruction: HermesInstruction,
-    context: InstructionValidationContext,
+    context: InstructionValidationContext<'_>,
     boundaries: &[u32],
 ) -> Result<(), ParseError> {
     let instruction_bytes = instruction_bytes(body, instruction);
@@ -2322,7 +2771,7 @@ fn validate_string_switch_instruction(
     function_id: u32,
     body: SectionView<'_>,
     instruction: HermesInstruction,
-    context: InstructionValidationContext,
+    context: InstructionValidationContext<'_>,
     boundaries: &[u32],
 ) -> Result<(), ParseError> {
     let instruction_bytes = instruction_bytes(body, instruction);
@@ -2610,6 +3059,8 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
 mod tests {
     use super::*;
 
+    const NEW_OBJECT_WITH_BUFFER_OPCODE: u8 = 1;
+    const NEW_ARRAY_WITH_BUFFER_OPCODE: u8 = 7;
     const RET_OPCODE: u8 = 118;
     const LOAD_CONST_DOUBLE_OPCODE: u8 = 141;
     const LOAD_CONST_BIGINT_OPCODE: u8 = 142;
@@ -2796,7 +3247,10 @@ mod tests {
         append_bytes(&mut bytes, b"abcdef");
         append_bytes(&mut bytes, &[1, 2, 3]);
         append_bytes(&mut bytes, &[4, 5, 6, 7, 8]);
-        append_repeated(&mut bytes, SHAPE_TABLE_ENTRY_SIZE, 0x22);
+        append_bytes(
+            &mut bytes,
+            &[0_u32.to_le_bytes(), 1_u32.to_le_bytes()].concat(),
+        );
         append_bytes(
             &mut bytes,
             &[0_u32.to_le_bytes(), 4_u32.to_le_bytes()].concat(),
@@ -3239,6 +3693,78 @@ mod tests {
                 storage_size: 6,
             },
         );
+    }
+
+    #[test]
+    fn rejects_object_shape_entries_outside_key_buffer() {
+        let mut bytes = fixture_bytecode();
+        let shape_offset = HermesBytecode::parse(&bytes)
+            .expect("valid fixture")
+            .sections()
+            .obj_shape_table()
+            .offset() as usize;
+        write_u32(&mut bytes, shape_offset, 99);
+        write_u32(&mut bytes, shape_offset + 4, 1);
+
+        let error = HermesBytecode::parse(&bytes).expect_err("invalid shape entry must fail");
+        assert_eq!(
+            error,
+            ParseError::InvalidSerializedLiteralBuffer {
+                buffer: "obj_key_buffer",
+                offset: 99,
+                element_count: 1,
+                buffer_size: 5,
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_object_literal_shape_reference() {
+        let mut bytes = fixture_bytecode();
+        let function_body_offset =
+            replace_global_body(&mut bytes, &[NEW_OBJECT_WITH_BUFFER_OPCODE, 0, 99, 0, 0, 0]);
+
+        let error = HermesBytecode::parse(&bytes).expect_err("invalid object shape must fail");
+        assert_eq!(
+            error,
+            ParseError::InvalidInstructionTableReference {
+                function_id: 1,
+                offset: function_body_offset,
+                opcode: NEW_OBJECT_WITH_BUFFER_OPCODE,
+                table: "object_shape",
+                index: 99,
+                limit: 1,
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_array_literal_value_buffer_outside_storage() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[NEW_ARRAY_WITH_BUFFER_OPCODE, 0, 0, 0, 1, 0, 99, 0],
+        );
+
+        let error = HermesBytecode::parse(&bytes).expect_err("invalid array buffer must fail");
+        assert_eq!(
+            error,
+            ParseError::InvalidSerializedLiteralBuffer {
+                buffer: "literal_value_buffer",
+                offset: 99,
+                element_count: 1,
+                buffer_size: 3,
+            },
+        );
+    }
+
+    #[test]
+    fn accepts_valid_object_literal_buffer_reference() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(&mut bytes, &[NEW_OBJECT_WITH_BUFFER_OPCODE, 0, 0, 0, 0, 0]);
+
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid object literal buffer");
+        assert_eq!(bytecode.global_instruction_count(), Ok(1));
     }
 
     #[test]

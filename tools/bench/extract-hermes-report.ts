@@ -14,6 +14,13 @@ function hasArg(name: string) {
   return process.argv.includes(name);
 }
 
+function readArgs(name: string) {
+  const prefix = `${name}=`;
+  return process.argv
+    .filter((arg) => arg.startsWith(prefix))
+    .map((arg) => arg.slice(prefix.length));
+}
+
 function parseReport(logText: string): BenchmarkSuiteReport {
   const candidates = logText
     .split(/\r?\n/)
@@ -35,7 +42,15 @@ function assertNumber(value: unknown, fieldName: string) {
   }
 }
 
-function validateReport(report: BenchmarkSuiteReport, allowNonHermes: boolean) {
+type ValidationOptions = {
+  allowNonHermes: boolean;
+  requiredCases: string[];
+  requireNewArchitecture: boolean;
+  requireRelease: boolean;
+  requireTurboModuleProxy: boolean;
+};
+
+function validateReport(report: BenchmarkSuiteReport, options: ValidationOptions) {
   if (report.schemaVersion !== "iris.benchmark.v1") {
     throw new Error(`Unexpected benchmark schema: ${report.schemaVersion}`);
   }
@@ -44,12 +59,31 @@ function validateReport(report: BenchmarkSuiteReport, allowNonHermes: boolean) {
     throw new Error(`Unexpected benchmark suite: ${report.suite.id}`);
   }
 
-  if (!allowNonHermes && !report.metadata.runtime.hermes) {
+  if (!options.allowNonHermes && !report.metadata.runtime.hermes) {
     throw new Error("Report is not a Hermes runtime report.");
+  }
+
+  if (options.requireRelease && report.metadata.build.mode !== "release") {
+    throw new Error(`Report is not a release build report: ${report.metadata.build.mode}`);
+  }
+
+  if (options.requireNewArchitecture && !report.metadata.runtime.newArchitecture) {
+    throw new Error("Report does not have New Architecture enabled.");
+  }
+
+  if (options.requireTurboModuleProxy && !report.metadata.runtime.turboModuleProxy) {
+    throw new Error("Report does not have the TurboModule proxy enabled.");
   }
 
   if (report.cases.length === 0) {
     throw new Error("Report must include at least one benchmark case.");
+  }
+
+  const caseIds = new Set(report.cases.map((benchmarkCase) => benchmarkCase.id));
+  for (const requiredCase of options.requiredCases) {
+    if (!caseIds.has(requiredCase)) {
+      throw new Error(`Report is missing required benchmark case: ${requiredCase}`);
+    }
   }
 
   for (const benchmarkCase of report.cases) {
@@ -71,10 +105,16 @@ function validateReport(report: BenchmarkSuiteReport, allowNonHermes: boolean) {
 
 const inputPath = resolve(root, readArg("--input") ?? "artifacts/bench/metro-hermes.log");
 const outputPath = resolve(root, readArg("--output") ?? "artifacts/bench/hermes-baseline.json");
-const allowNonHermes = hasArg("--allow-non-hermes");
+const validationOptions: ValidationOptions = {
+  allowNonHermes: hasArg("--allow-non-hermes"),
+  requiredCases: readArgs("--require-case"),
+  requireNewArchitecture: hasArg("--require-new-architecture"),
+  requireRelease: hasArg("--require-release"),
+  requireTurboModuleProxy: hasArg("--require-turbo-module-proxy"),
+};
 const report = parseReport(readFileSync(inputPath, "utf8"));
 
-validateReport(report, allowNonHermes);
+validateReport(report, validationOptions);
 
 const outputReport: BenchmarkSuiteReport = {
   ...report,

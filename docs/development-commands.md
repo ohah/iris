@@ -21,6 +21,8 @@ mise run vp-check
 mise run fetch-references
 mise run sync-labels
 mise run perf
+mise run bench-smoke
+mise run bench-js
 mise run rn-start
 mise run rn-ios
 mise run rn-android
@@ -38,4 +40,5 @@ mise run check
 - Bun은 `package.json`의 `packageManager`와 `.mise.toml`의 `bun = "1.3.14"`로 고정한다.
 - Vite+는 로컬 `vite-plus` 패키지와 `bunx vp`로 실행한다.
 - React Native PoC 앱은 `apps/rn-bench`에 두고 `mise run rn-*` 명령으로 실행한다.
+- 벤치마크 하네스는 `mise run bench-*` 명령으로 로컬에서만 실행한다. 아직 CI 필수 체크에는 넣지 않는다.
 - `mise run check`가 PR 전 기본 검증 경로이며 RN 타입체크와 smoke test를 포함한다.

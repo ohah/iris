@@ -13,7 +13,7 @@ cat >"$out/core-budget.json" <<'JSON'
   "project": "iris",
   "check": "core performance budget",
   "runtime_benchmarks": false,
-  "message": "React Native PoC and JSI runtime benchmarks are not implemented yet."
+  "message": "React Native benchmark harness exists, but Iris JSI runtime budgets are not implemented yet."
 }
 JSON
 

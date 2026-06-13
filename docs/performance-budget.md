@@ -2,7 +2,7 @@
 
 `core performance budget`은 branch protection에 걸리는 필수 체크다.
 
-현재 Iris에는 React Native PoC 앱이 있지만 JSI adapter와 기기 벤치마크 하네스가 아직 없으므로, 이 체크는 성능 수치를 주장하지 않는다. 대신 성능 예산 하네스가 존재하고 산출물을 남기며, 실제 runtime 예산이 들어오기 전까지 필수 체크 이름을 안정화한다.
+현재 Iris에는 React Native PoC 앱과 로컬 JS 벤치마크 하네스가 있지만 JSI adapter와 기기 벤치마크 하네스가 아직 없으므로, 이 체크는 성능 수치를 주장하지 않는다. 대신 성능 예산 하네스가 존재하고 산출물을 남기며, 실제 runtime 예산이 들어오기 전까지 필수 체크 이름을 안정화한다.
 
 ## 현재 게이트
 

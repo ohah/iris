@@ -21,6 +21,8 @@ export default defineConfig({
           "bun run --cwd apps/rn-bench test --runInBand",
         ],
       },
+      "bench-js": "bun run bench:js",
+      "bench-smoke": "bun run bench:smoke",
       "rn-android": "bun run --cwd apps/rn-bench android",
       "rn-ios": "bun run --cwd apps/rn-bench ios",
       "rn-start": "bun run --cwd apps/rn-bench start",

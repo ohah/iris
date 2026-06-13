@@ -78,6 +78,14 @@ run = "bun run --cwd apps/rn-bench typecheck"
 description = "Run the React Native benchmark app smoke test"
 run = "bun run --cwd apps/rn-bench test --runInBand"
 
+[tasks.bench-js]
+description = "Run the JavaScript benchmark harness and write artifacts/bench/js-baseline.json"
+run = "bun run bench:js"
+
+[tasks.bench-smoke]
+description = "Run a short benchmark harness smoke test and write artifacts/bench/js-baseline-smoke.json"
+run = "bun run bench:smoke"
+
 [tasks.perf]
 description = "Run the core performance budget gate"
 run = "sh tools/perf/core-budget.sh"

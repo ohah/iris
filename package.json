@@ -8,6 +8,8 @@
     "packages/*"
   ],
   "scripts": {
+    "bench:js": "bun run tools/bench/run-js-baseline.ts",
+    "bench:smoke": "bun run tools/bench/run-js-baseline.ts --smoke",
     "format": "oxfmt --write .",
     "format:check": "oxfmt --check .",
     "lint": "oxlint .",

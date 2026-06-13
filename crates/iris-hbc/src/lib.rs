@@ -1338,6 +1338,15 @@ pub enum ParseError {
         /// Static validation failure reason.
         reason: &'static str,
     },
+    /// Referenced debug source-location streams do not cover the global debug data payload.
+    InvalidDebugDataCoverage {
+        /// Offset where the next stream was expected to start.
+        expected_offset: u32,
+        /// Offset where the next referenced stream starts, or debug data end for trailing bytes.
+        actual_offset: u32,
+        /// Declared global debug data byte length.
+        debug_data_size: u32,
+    },
     /// An exception handler entry points outside the function body boundaries.
     InvalidExceptionHandler {
         /// Function id whose exception table is invalid.
@@ -1676,6 +1685,14 @@ impl fmt::Display for ParseError {
             } => write!(
                 formatter,
                 "Hermes bytecode function {function_id} debug data at offset {offset} is invalid: {reason}",
+            ),
+            Self::InvalidDebugDataCoverage {
+                expected_offset,
+                actual_offset,
+                debug_data_size,
+            } => write!(
+                formatter,
+                "Hermes bytecode debug data coverage expected next stream at {expected_offset}, found {actual_offset}; debug data size is {debug_data_size}",
             ),
             Self::InvalidExceptionHandler {
                 function_id,
@@ -2243,6 +2260,12 @@ struct DebugInfoBounds {
     debug_data_size: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DebugSourceStream {
+    source_locations: u32,
+    end_offset: u32,
+}
+
 fn function_header_at(
     bytes: &[u8],
     header: HermesBytecodeHeader,
@@ -2557,6 +2580,7 @@ fn validate_function_headers(
         )?);
     }
 
+    let mut debug_streams = Vec::new();
     for function_id in 0..header.function_count {
         let decoded = decoded_headers
             [usize::try_from(function_id).expect("u32 always fits in usize on supported targets")];
@@ -2577,13 +2601,18 @@ fn validate_function_headers(
                 obj_shape_table: obj_shape_table.bytes,
             },
         )?;
-        validate_function_info(
+        if let Some(stream) = validate_function_info(
             bytes,
             function_id,
             decoded,
             function_info_region_limit(header, decoded.large_header_offset, &decoded_headers),
             debug_info,
-        )?;
+        )? {
+            debug_streams.push(stream);
+        }
+    }
+    if let Some(debug_info) = debug_info {
+        validate_debug_data_coverage(debug_info.debug_data_size, &mut debug_streams)?;
     }
     Ok(())
 }
@@ -2622,9 +2651,9 @@ fn validate_function_info(
     decoded: DecodedFunctionHeader,
     limit: u32,
     debug_info: Option<DebugInfoBounds>,
-) -> Result<(), ParseError> {
+) -> Result<Option<DebugSourceStream>, ParseError> {
     if !decoded.header.has_exception_handler() && !decoded.header.has_debug_info() {
-        return Ok(());
+        return Ok(None);
     }
     let Some(info_offset) = decoded.large_header_offset else {
         return Err(ParseError::MissingFunctionInfo { function_id });
@@ -2717,9 +2746,10 @@ fn validate_function_info(
             &boundaries,
             read_u32(debug_offsets, 0),
             debug_info,
-        )?;
+        )
+    } else {
+        Ok(None)
     }
-    Ok(())
 }
 
 fn validate_debug_offsets(
@@ -2729,9 +2759,9 @@ fn validate_debug_offsets(
     boundaries: &[u32],
     source_locations: u32,
     debug_info: Option<DebugInfoBounds>,
-) -> Result<(), ParseError> {
+) -> Result<Option<DebugSourceStream>, ParseError> {
     if source_locations == DEBUG_OFFSETS_NO_OFFSET {
-        return Ok(());
+        return Ok(None);
     }
     let Some(debug_info) = debug_info else {
         return Err(ParseError::InvalidDebugOffset {
@@ -2772,7 +2802,12 @@ fn validate_debug_offsets(
             reason: DEBUG_DATA_TRUNCATED_LEB,
         }
     })?;
-    validate_debug_source_locations(function_id, body, boundaries, source_locations, stream)
+    let end_offset =
+        validate_debug_source_locations(function_id, body, boundaries, source_locations, stream)?;
+    Ok(Some(DebugSourceStream {
+        source_locations,
+        end_offset,
+    }))
 }
 
 fn validate_debug_source_locations(
@@ -2781,7 +2816,7 @@ fn validate_debug_source_locations(
     boundaries: &[u32],
     source_locations: u32,
     data: &[u8],
-) -> Result<(), ParseError> {
+) -> Result<u32, ParseError> {
     let mut cursor = 0_usize;
     let stream_function_id = read_signed_leb128(data, &mut cursor, function_id, source_locations)?;
     if stream_function_id < 0 || u32::try_from(stream_function_id).ok() != Some(function_id) {
@@ -2809,7 +2844,9 @@ fn validate_debug_source_locations(
         let address_delta_offset = debug_data_offset(source_locations, cursor);
         let address_delta = read_signed_leb128(data, &mut cursor, function_id, source_locations)?;
         if address_delta == -1 {
-            return Ok(());
+            let relative_end =
+                u32::try_from(cursor).expect("debug source-location stream cursor fits in u32");
+            return Ok(source_locations + relative_end);
         }
         current_address =
             current_address
@@ -2883,6 +2920,35 @@ fn validate_debug_source_locations(
             false,
         )?;
     }
+}
+
+fn validate_debug_data_coverage(
+    debug_data_size: u32,
+    streams: &mut [DebugSourceStream],
+) -> Result<(), ParseError> {
+    if streams.is_empty() {
+        return Ok(());
+    }
+    streams.sort_by_key(|stream| stream.source_locations);
+    let mut expected_offset = 0_u32;
+    for stream in streams {
+        if stream.source_locations != expected_offset {
+            return Err(ParseError::InvalidDebugDataCoverage {
+                expected_offset,
+                actual_offset: stream.source_locations,
+                debug_data_size,
+            });
+        }
+        expected_offset = stream.end_offset;
+    }
+    if expected_offset != debug_data_size {
+        return Err(ParseError::InvalidDebugDataCoverage {
+            expected_offset,
+            actual_offset: debug_data_size,
+            debug_data_size,
+        });
+    }
+    Ok(())
 }
 
 fn read_debug_u32(
@@ -4822,8 +4888,9 @@ mod tests {
             &[(0, 1, false), (1, 1, false)],
             b"am",
             &[(0, 0, 1)],
-            &[0],
+            &debug_source_stream(1, 0),
         );
+        add_global_debug_offsets(&mut bytes, 0);
 
         HermesBytecode::parse(&bytes).expect("valid source map URL file region");
     }
@@ -4835,9 +4902,10 @@ mod tests {
             &mut bytes,
             &[(0, 1, false), (1, 1, false)],
             b"ab",
-            &[(0, 0, 0), (1, 1, 0)],
-            &[0, 0],
+            &[(0, 0, 0), (4, 1, 0)],
+            &debug_source_stream(1, 0),
         );
+        add_global_debug_offsets(&mut bytes, 0);
 
         HermesBytecode::parse(&bytes).expect("ordered debug file regions");
     }
@@ -5005,6 +5073,49 @@ mod tests {
                 function_id: 1,
                 offset: 5,
                 reason: DEBUG_DATA_LOCATION_NOT_ONE_BASED,
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_debug_data_with_leading_gap() {
+        let mut bytes = fixture_bytecode();
+        let mut debug_data = vec![0];
+        debug_data.extend_from_slice(&debug_source_stream(1, 0));
+        set_debug_data(&mut bytes, &debug_data);
+        add_global_debug_offsets(&mut bytes, 1);
+
+        let error = HermesBytecode::parse(&bytes).expect_err("debug data gap must fail");
+        assert_eq!(
+            error,
+            ParseError::InvalidDebugDataCoverage {
+                expected_offset: 0,
+                actual_offset: 1,
+                debug_data_size: u32::try_from(debug_data.len())
+                    .expect("test debug data length fits in u32"),
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_debug_data_with_trailing_bytes() {
+        let mut bytes = fixture_bytecode();
+        let mut debug_data = debug_source_stream(1, 0);
+        let valid_end =
+            u32::try_from(debug_data.len()).expect("test debug data length fits in u32");
+        debug_data.push(0);
+        set_debug_data(&mut bytes, &debug_data);
+        add_global_debug_offsets(&mut bytes, 0);
+
+        let error = HermesBytecode::parse(&bytes).expect_err("trailing debug data must fail");
+        assert_eq!(
+            error,
+            ParseError::InvalidDebugDataCoverage {
+                expected_offset: valid_end,
+                actual_offset: u32::try_from(debug_data.len())
+                    .expect("test debug data length fits in u32"),
+                debug_data_size: u32::try_from(debug_data.len())
+                    .expect("test debug data length fits in u32"),
             },
         );
     }

@@ -81,6 +81,7 @@ const DEBUG_DATA_TRUNCATED_LEB: &str = "truncated signed LEB128";
 const DEBUG_DATA_LEB_OVERFLOW: &str = "signed LEB128 exceeds i64";
 const DEBUG_DATA_FUNCTION_MISMATCH: &str = "function id mismatch";
 const DEBUG_DATA_ADDRESS_OUT_OF_BOUNDS: &str = "address outside function body";
+const DEBUG_DATA_ADDRESS_NOT_BOUNDARY: &str = "address is not an instruction boundary";
 const STRING_TABLE_ENTRY_UTF16_MASK: u32 = 1 << 31;
 const FUNCTION_INFO_ALIGNMENT: u32 = 4;
 const SWITCH_TABLE_CASE_SIZE: usize = 8;
@@ -2676,10 +2677,13 @@ fn validate_function_info(
             DEBUG_OFFSETS_SIZE as u32,
             limit,
         )?;
+        let body = function_body(bytes, function_id, decoded.header)?;
+        let boundaries = instruction_boundaries(function_id, body)?;
         validate_debug_offsets(
             bytes,
             function_id,
-            decoded.header,
+            body,
+            &boundaries,
             read_u32(debug_offsets, 0),
             debug_info,
         )?;
@@ -2690,7 +2694,8 @@ fn validate_function_info(
 fn validate_debug_offsets(
     bytes: &[u8],
     function_id: u32,
-    function_header: HermesFunctionHeader,
+    body: SectionView<'_>,
+    boundaries: &[u32],
     source_locations: u32,
     debug_info: Option<DebugInfoBounds>,
 ) -> Result<(), ParseError> {
@@ -2736,17 +2741,13 @@ fn validate_debug_offsets(
             reason: DEBUG_DATA_TRUNCATED_LEB,
         }
     })?;
-    validate_debug_source_locations(
-        function_id,
-        function_header.bytecode_size_in_bytes,
-        source_locations,
-        stream,
-    )
+    validate_debug_source_locations(function_id, body, boundaries, source_locations, stream)
 }
 
 fn validate_debug_source_locations(
     function_id: u32,
-    body_size: u32,
+    body: SectionView<'_>,
+    boundaries: &[u32],
     source_locations: u32,
     data: &[u8],
 ) -> Result<(), ParseError> {
@@ -2779,11 +2780,20 @@ fn validate_debug_source_locations(
                     offset: address_delta_offset,
                     reason: DEBUG_DATA_ADDRESS_OUT_OF_BOUNDS,
                 })?;
-        if current_address < 0 || current_address > i64::from(body_size) {
+        if current_address < 0 || current_address >= i64::from(body.len()) {
             return Err(ParseError::InvalidDebugData {
                 function_id,
                 offset: address_delta_offset,
                 reason: DEBUG_DATA_ADDRESS_OUT_OF_BOUNDS,
+            });
+        }
+        let relative_address =
+            u32::try_from(current_address).expect("validated non-negative address fits in u32");
+        if !relative_instruction_boundary(body, relative_address, boundaries, false) {
+            return Err(ParseError::InvalidDebugData {
+                function_id,
+                offset: address_delta_offset,
+                reason: DEBUG_DATA_ADDRESS_NOT_BOUNDARY,
             });
         }
 
@@ -4803,6 +4813,24 @@ mod tests {
                 function_id: 1,
                 offset: 4,
                 reason: DEBUG_DATA_ADDRESS_OUT_OF_BOUNDS,
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_debug_source_address_between_instructions() {
+        let mut bytes = fixture_bytecode();
+        set_debug_data(&mut bytes, &debug_source_stream(1, 1));
+        add_global_debug_offsets(&mut bytes, 0);
+
+        let error =
+            HermesBytecode::parse(&bytes).expect_err("non-boundary debug address must fail");
+        assert_eq!(
+            error,
+            ParseError::InvalidDebugData {
+                function_id: 1,
+                offset: 4,
+                reason: DEBUG_DATA_ADDRESS_NOT_BOUNDARY,
             },
         );
     }

@@ -8,6 +8,7 @@ target/
 dist/
 build/
 coverage/
+artifacts/
 .vite-task/
 references/
 

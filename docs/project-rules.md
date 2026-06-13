@@ -10,6 +10,7 @@ Iris에서 작업하는 모든 에이전트와 개발자는 이 규칙을 따른
 - `main`에 직접 푸시하지 않는다. 항상 브랜치와 PR을 사용한다.
 - 커밋 메시지는 conventional-commit prefix(`feat`/`fix`/`docs`/`test`/`refactor`/`build`/`ci`/`chore`)를 쓰고, prefix 뒤 제목과 본문은 한국어로 작성한다.
 - PR 제목과 본문은 한국어로 작성한다. 외부 API 이름, 파일명, 명령어, 에러 메시지는 원문을 유지한다.
+- 필요한 PR 라벨이 없으면 `mise run sync-labels`로 기본 라벨 세트를 생성하거나 갱신한다.
 - 브랜치 이름은 `type/kebab-설명` 형식을 쓴다(예: `build/tooling-foundation`).
 
 ## Iris 호환성 원칙
@@ -20,6 +21,7 @@ Iris에서 작업하는 모든 에이전트와 개발자는 이 규칙을 따른
 - 외부 런타임 소스는 `references/` 아래 read-only 참고 자료로만 사용한다. `references/`는 git에 커밋하지 않는 로컬 체크아웃이며, 무엇을 받는지는 [레퍼런스](references.md)를 단일 출처로 둔다(`mise run fetch-references`).
 - 엔진, JSI, TurboModule, Fabric, Metro, source map, debugger 경계를 바꾸는 변경은 호환성 테스트와 벤치마크 계획을 먼저 남긴다.
 - 성능 주장은 수치로 검증한다. 기준선, 기기, OS, 빌드 타입, 반복 횟수, 측정 도구를 기록하지 않은 주장은 PR에서 성능 개선으로 쓰지 않는다.
+- `core performance budget` 필수 체크는 항상 존재해야 한다. 실제 benchmark가 없는 단계에서는 placeholder 게이트임을 문서와 산출물에 명시한다.
 
 ## 의존성
 

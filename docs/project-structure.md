@@ -8,6 +8,7 @@
 │   └── iris-qjs/   # QuickJS backend 실험 경계
 ├── docs/           # 개발 규칙과 PR 기준
 ├── references/     # gitignored 외부 런타임 레퍼런스
+├── tools/          # 레퍼런스, 라벨, 성능 게이트 보조 스크립트
 ├── packages/       # 향후 JS/TS 패키지 workspace
 └── apps/           # 향후 React Native PoC 앱
 ```
@@ -19,3 +20,4 @@
 - `iris-qjs`는 QuickJS backend 실험을 캡슐화한다. production 경로로 승격하려면 별도 호환성 근거가 필요하다.
 - React Native PoC 앱은 `apps/` 아래에 둔다.
 - 외부 런타임 소스는 `references/` 아래에만 둔다. 이 디렉터리는 gitignore된다.
+- `tools/perf/`는 branch protection에 연결된 성능 예산 게이트를 둔다.

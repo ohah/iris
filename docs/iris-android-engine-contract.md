@@ -16,7 +16,7 @@ mise run rn-android-build-iris-release-local
 - skeleton AAR에는 provider class와 `libirisengine.so`만 들어간다. `libreactnative.so`, `libjsi.so`, `libfbjni.so`는 앱의 RN dependency에서 온다.
 - skeleton은 `facebook::react::JSIRuntimeHolder`에 담긴 Iris-owned `jsi::Runtime` 객체를 반환한다.
 - skeleton runtime은 RN 초기화가 요구하는 최소 JSI host surface를 제공한다. 현재 포함된 범위는 global object, string/property key, plain object property storage, host object/function registration, array slot storage, native state, empty microtask drain이다.
-- skeleton runtime은 아직 JS 실행 기능을 제공하지 않는다. RN이 bundle source나 Hermes bytecode를 `evaluateJavaScript(...)`로 넘기면 명확한 abort 메시지로 실패한다.
+- skeleton runtime은 Hermes bytecode header magic, version, fileLength를 확인한다. 아직 JS 실행 기능은 제공하지 않으므로 RN이 유효한 Hermes bytecode를 `evaluateJavaScript(...)`나 `evaluatePreparedJavaScript(...)`로 넘기면 bytecode 실행기 미구현 메시지로 실패한다.
 
 ## 앱 연결점
 
@@ -56,9 +56,9 @@ Iris는 Hermes 대체 엔진으로 비교한다. 따라서 `irisRelease`도 Herm
 - `irisRelease`의 `index.android.bundle`은 hermesc가 만든 bytecode bundle이다.
 - plain JS bundle이나 JSC fallback을 Iris 성능값으로 측정하지 않는다.
 - V8은 iOS 동일 비교축이 없으므로 Iris/Hermes 대체 성능 비교 대상에 포함하지 않는다.
-- Iris가 이 bytecode를 아직 실행할 수 없다면 실패가 맞다. 성공한 것처럼 우회하지 않는다.
+- Iris가 이 bytecode header를 검증한 뒤 아직 실행할 수 없다면 실패가 맞다. 성공한 것처럼 우회하지 않는다.
 - skeleton `irisRelease` APK에는 `libhermesvm.so`가 없어야 한다. `libhermestooling.so`는 RN의 hermesc bytecode/tooling packaging 경로 때문에 남을 수 있지만 runtime factory와 runtime object는 Iris AAR에서 온다.
-- skeleton의 실기기 smoke 기준은 RN 초기화가 Iris runtime host surface를 통과한 뒤 `IrisRuntime::evaluateJavaScript(...)`에서 실패하는 것이다.
+- skeleton의 실기기 smoke 기준은 RN 초기화가 Iris runtime host surface를 통과하고 Hermes bytecode header를 확인한 뒤 Iris bytecode execution 미구현 메시지로 실패하는 것이다.
 
 ## 호환성 기준
 

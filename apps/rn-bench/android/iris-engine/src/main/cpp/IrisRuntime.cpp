@@ -3,6 +3,7 @@
 #include <android/log.h>
 
 #include <cstdlib>
+#include <cstdint>
 #include <stdexcept>
 #include <utility>
 
@@ -19,7 +20,33 @@ namespace {
   std::abort();
 }
 
+constexpr uint64_t kHermesBytecodeMagic = 0x1F1903C103BC1FC6ULL;
+constexpr size_t kHermesBytecodeVersionOffset = 8;
+constexpr size_t kHermesBytecodeFileLengthOffset = 32;
+constexpr size_t kHermesBytecodeMinimumHeaderSize =
+    kHermesBytecodeFileLengthOffset + sizeof(uint32_t);
+
+uint32_t readLittleEndianU32(const uint8_t* data) {
+  return static_cast<uint32_t>(data[0]) |
+      (static_cast<uint32_t>(data[1]) << 8) |
+      (static_cast<uint32_t>(data[2]) << 16) |
+      (static_cast<uint32_t>(data[3]) << 24);
+}
+
+uint64_t readLittleEndianU64(const uint8_t* data) {
+  return static_cast<uint64_t>(readLittleEndianU32(data)) |
+      (static_cast<uint64_t>(readLittleEndianU32(data + 4)) << 32);
+}
+
 } // namespace
+
+IrisRuntime::IrisPreparedJavaScript::IrisPreparedJavaScript(
+    std::shared_ptr<const jsi::Buffer> buffer,
+    std::string sourceURL,
+    HermesBytecodeHeader header)
+    : buffer(std::move(buffer)),
+      sourceURL(std::move(sourceURL)),
+      header(header) {}
 
 IrisRuntime::PointerState::PointerState(std::string text, Kind kind)
     : kind(kind), text(std::move(text)) {}
@@ -131,21 +158,93 @@ void IrisRuntime::installBootstrapGlobals() {
       makeObjectValue(std::move(objectConstructor)));
 }
 
+IrisRuntime::HermesBytecodeHeader IrisRuntime::validateHermesBytecodeBuffer(
+    const std::shared_ptr<const jsi::Buffer>& buffer,
+    const std::string& sourceURL) const {
+  if (!buffer) {
+    abortBundleContractViolation(
+        "Iris received a null JavaScript buffer for " + sourceURL);
+  }
+
+  const size_t size = buffer->size();
+  const uint8_t* data = buffer->data();
+  if (data == nullptr || size < kHermesBytecodeMinimumHeaderSize) {
+    abortBundleContractViolation(
+        "Iris expected Hermes bytecode for " + sourceURL +
+        ", but the buffer is too small for an HBC header.");
+  }
+
+  const uint64_t magic = readLittleEndianU64(data);
+  if (magic != kHermesBytecodeMagic) {
+    abortBundleContractViolation(
+        "Iris expected Hermes bytecode for " + sourceURL +
+        ", but the buffer is not an HBC bundle. Plain JS, JSC, V8, or QuickJS"
+        " fallback is not allowed.");
+  }
+
+  const uint32_t version =
+      readLittleEndianU32(data + kHermesBytecodeVersionOffset);
+  const uint32_t fileLength =
+      readLittleEndianU32(data + kHermesBytecodeFileLengthOffset);
+  if (fileLength > size) {
+    abortBundleContractViolation(
+        "Iris received Hermes bytecode for " + sourceURL +
+        ", but the HBC fileLength exceeds the provided buffer.");
+  }
+
+  return HermesBytecodeHeader{version, fileLength};
+}
+
+void IrisRuntime::abortBytecodeExecutionUnavailable(
+    const char* operation,
+    const HermesBytecodeHeader& header,
+    const std::string& sourceURL) const {
+  __android_log_assert(
+      "IrisBytecodeExecutionUnavailable",
+      "IrisEngine",
+      "Iris %s accepted Hermes bytecode v%u (%u bytes, source=%s), but bytecode execution is not implemented yet. This is an Iris-owned Runtime scaffold, not a Hermes/JSC fallback.",
+      operation,
+      header.version,
+      header.fileLength,
+      sourceURL.c_str());
+  std::abort();
+}
+
+void IrisRuntime::abortBundleContractViolation(const std::string& message)
+    const {
+  __android_log_assert(
+      "IrisBundleContractViolation",
+      "IrisEngine",
+      "%s",
+      message.c_str());
+  std::abort();
+}
+
 jsi::Value IrisRuntime::evaluateJavaScript(
-    const std::shared_ptr<const jsi::Buffer>&,
-    const std::string&) {
-  abortUnimplemented("evaluateJavaScript");
+    const std::shared_ptr<const jsi::Buffer>& buffer,
+    const std::string& sourceURL) {
+  auto header = validateHermesBytecodeBuffer(buffer, sourceURL);
+  abortBytecodeExecutionUnavailable("evaluateJavaScript", header, sourceURL);
 }
 
 std::shared_ptr<const jsi::PreparedJavaScript> IrisRuntime::prepareJavaScript(
-    const std::shared_ptr<const jsi::Buffer>&,
-    std::string) {
-  abortUnimplemented("prepareJavaScript");
+    const std::shared_ptr<const jsi::Buffer>& buffer,
+    std::string sourceURL) {
+  auto header = validateHermesBytecodeBuffer(buffer, sourceURL);
+  return std::make_shared<IrisPreparedJavaScript>(
+      buffer, std::move(sourceURL), header);
 }
 
 jsi::Value IrisRuntime::evaluatePreparedJavaScript(
-    const std::shared_ptr<const jsi::PreparedJavaScript>&) {
-  abortUnimplemented("evaluatePreparedJavaScript");
+    const std::shared_ptr<const jsi::PreparedJavaScript>& js) {
+  auto prepared = dynamic_cast<const IrisPreparedJavaScript*>(js.get());
+  if (prepared == nullptr) {
+    abortBundleContractViolation(
+        "Iris evaluatePreparedJavaScript received a script prepared by a"
+        " different runtime.");
+  }
+  abortBytecodeExecutionUnavailable(
+      "evaluatePreparedJavaScript", prepared->header, prepared->sourceURL);
 }
 
 void IrisRuntime::queueMicrotask(const jsi::Function&) {

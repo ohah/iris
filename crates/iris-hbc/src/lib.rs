@@ -76,10 +76,12 @@ const DEBUG_INFO_HEADER_SIZE: usize = 16;
 const DEBUG_FILE_REGION_SIZE: usize = 12;
 const DEBUG_OFFSETS_SIZE: usize = 4;
 const DEBUG_OFFSETS_NO_OFFSET: u32 = u32::MAX;
+const DEBUG_SOURCE_MAPPING_URL_INVALID: u32 = 0;
 const DEBUG_DATA_TRUNCATED_LEB: &str = "truncated signed LEB128";
 const DEBUG_DATA_LEB_OVERFLOW: &str = "signed LEB128 exceeds i64";
 const DEBUG_DATA_FUNCTION_MISMATCH: &str = "function id mismatch";
 const DEBUG_DATA_ADDRESS_OUT_OF_BOUNDS: &str = "address outside function body";
+const STRING_TABLE_ENTRY_UTF16_MASK: u32 = 1 << 31;
 const FUNCTION_INFO_ALIGNMENT: u32 = 4;
 const SWITCH_TABLE_CASE_SIZE: usize = 8;
 const SWITCH_TABLE_ALIGNMENT: u32 = 4;
@@ -1280,6 +1282,32 @@ pub enum ParseError {
         /// Exclusive debug info section limit before the footer.
         limit: u32,
     },
+    /// A debug filename table entry points outside filename storage.
+    DebugFilenameOutOfBounds {
+        /// Filename table entry index.
+        filename_index: u32,
+        /// Filename byte offset in debug filename storage.
+        offset: u32,
+        /// Filename byte length.
+        length: u32,
+        /// Declared debug filename storage byte length.
+        storage_size: u32,
+    },
+    /// A debug file region references invalid debug data or filename ids.
+    InvalidDebugFileRegion {
+        /// Debug file region entry index.
+        region_index: u32,
+        /// Offset into the debug data payload where this region starts.
+        from_address: u32,
+        /// Referenced debug filename table id.
+        filename_id: u32,
+        /// Referenced source map URL debug filename table id.
+        source_mapping_url_id: u32,
+        /// Declared debug filename table entry count.
+        filename_count: u32,
+        /// Declared debug data byte length.
+        debug_data_size: u32,
+    },
     /// A function points at debug data outside the global debug data payload.
     InvalidDebugOffset {
         /// Function id whose debug offsets are invalid.
@@ -1592,6 +1620,26 @@ impl fmt::Display for ParseError {
             } => write!(
                 formatter,
                 "Hermes bytecode debug info at {offset} with size {size} exceeds debug info limit {limit}",
+            ),
+            Self::DebugFilenameOutOfBounds {
+                filename_index,
+                offset,
+                length,
+                storage_size,
+            } => write!(
+                formatter,
+                "Hermes bytecode debug filename {filename_index} at offset {offset} with length {length} exceeds filename storage size {storage_size}",
+            ),
+            Self::InvalidDebugFileRegion {
+                region_index,
+                from_address,
+                filename_id,
+                source_mapping_url_id,
+                filename_count,
+                debug_data_size,
+            } => write!(
+                formatter,
+                "Hermes bytecode debug file region {region_index} at debug data offset {from_address} references filename {filename_id} and source map URL {source_mapping_url_id}; filename count is {filename_count}, debug data size is {debug_data_size}",
             ),
             Self::InvalidDebugOffset {
                 function_id,
@@ -2333,16 +2381,94 @@ fn parse_debug_info(
             size: DEBUG_INFO_HEADER_SIZE as u32,
             limit,
         })?;
+    let filename_table_offset = cursor;
     cursor = checked_debug_info_end(cursor, filename_table_size, limit)?;
+    let filename_storage_offset = cursor;
     cursor = checked_debug_info_end(cursor, filename_storage_size, limit)?;
+    let file_region_table_offset = cursor;
     cursor = checked_debug_info_end(cursor, file_region_table_size, limit)?;
     let debug_data_offset = cursor;
     checked_debug_info_end(cursor, debug_data_size, limit)?;
+
+    let filename_table =
+        debug_info_bytes(bytes, filename_table_offset, filename_table_size, limit)?;
+    validate_debug_filename_table(filename_table, filename_storage_size)?;
+    debug_info_bytes(bytes, filename_storage_offset, filename_storage_size, limit)?;
+    let file_region_table = debug_info_bytes(
+        bytes,
+        file_region_table_offset,
+        file_region_table_size,
+        limit,
+    )?;
+    validate_debug_file_regions(file_region_table, filename_count, debug_data_size)?;
 
     Ok(Some(DebugInfoBounds {
         debug_data_offset,
         debug_data_size,
     }))
+}
+
+fn validate_debug_filename_table(bytes: &[u8], storage_size: u32) -> Result<(), ParseError> {
+    for (index, entry) in bytes.chunks_exact(STRING_TABLE_ENTRY_SIZE).enumerate() {
+        let offset = read_u32(entry, 0);
+        let raw_length = read_u32(entry, 4);
+        let length = raw_length & !STRING_TABLE_ENTRY_UTF16_MASK;
+        let byte_length = if raw_length & STRING_TABLE_ENTRY_UTF16_MASK == 0 {
+            length
+        } else {
+            length
+                .checked_mul(2)
+                .ok_or(ParseError::DebugFilenameOutOfBounds {
+                    filename_index: u32::try_from(index)
+                        .expect("validated debug filename index fits in u32"),
+                    offset,
+                    length: u32::MAX,
+                    storage_size,
+                })?
+        };
+        if offset
+            .checked_add(byte_length)
+            .is_none_or(|end| end > storage_size)
+        {
+            return Err(ParseError::DebugFilenameOutOfBounds {
+                filename_index: u32::try_from(index)
+                    .expect("validated debug filename index fits in u32"),
+                offset,
+                length: byte_length,
+                storage_size,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_debug_file_regions(
+    bytes: &[u8],
+    filename_count: u32,
+    debug_data_size: u32,
+) -> Result<(), ParseError> {
+    for (index, region) in bytes.chunks_exact(DEBUG_FILE_REGION_SIZE).enumerate() {
+        let from_address = read_u32(region, 0);
+        let filename_id = read_u32(region, 4);
+        let source_mapping_url_id = read_u32(region, 8);
+        let valid_source_mapping_url = source_mapping_url_id == DEBUG_SOURCE_MAPPING_URL_INVALID
+            || source_mapping_url_id < filename_count;
+        if from_address >= debug_data_size
+            || filename_id >= filename_count
+            || !valid_source_mapping_url
+        {
+            return Err(ParseError::InvalidDebugFileRegion {
+                region_index: u32::try_from(index)
+                    .expect("validated debug file region index fits in u32"),
+                from_address,
+                filename_id,
+                source_mapping_url_id,
+                filename_count,
+                debug_data_size,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn checked_debug_info_end(offset: u32, size: u32, limit: u32) -> Result<u32, ParseError> {
@@ -3759,6 +3885,16 @@ mod tests {
     }
 
     fn set_debug_data(bytes: &mut Vec<u8>, debug_data: &[u8]) {
+        set_debug_info(bytes, &[], &[], &[], debug_data);
+    }
+
+    fn set_debug_info(
+        bytes: &mut Vec<u8>,
+        filename_entries: &[(u32, u32, bool)],
+        filename_storage: &[u8],
+        file_regions: &[(u32, u32, u32)],
+        debug_data: &[u8],
+    ) {
         let (debug_info_offset, file_length) = {
             let bytecode = HermesBytecode::parse(bytes).expect("valid fixture");
             (
@@ -3766,19 +3902,51 @@ mod tests {
                 bytecode.header().file_length,
             )
         };
-        let debug_data_offset = usize::try_from(debug_info_offset)
-            .expect("test fixture offset fits in usize")
-            + DEBUG_INFO_HEADER_SIZE;
+        let debug_info_offset =
+            usize::try_from(debug_info_offset).expect("test fixture offset fits in usize");
         let footer_offset = usize::try_from(file_length)
             .expect("test fixture length fits in usize")
             - HERMES_BYTECODE_FOOTER_SIZE;
 
-        write_u32(
-            bytes,
-            usize::try_from(debug_info_offset).expect("test fixture offset fits in usize") + 12,
-            u32::try_from(debug_data.len()).expect("test fixture debug data length fits in u32"),
+        let mut debug_info = Vec::new();
+        debug_info.extend_from_slice(
+            &u32::try_from(filename_entries.len())
+                .expect("test fixture filename count fits in u32")
+                .to_le_bytes(),
         );
-        bytes.splice(debug_data_offset..footer_offset, debug_data.iter().copied());
+        debug_info.extend_from_slice(
+            &u32::try_from(filename_storage.len())
+                .expect("test fixture filename storage length fits in u32")
+                .to_le_bytes(),
+        );
+        debug_info.extend_from_slice(
+            &u32::try_from(file_regions.len())
+                .expect("test fixture file region count fits in u32")
+                .to_le_bytes(),
+        );
+        debug_info.extend_from_slice(
+            &u32::try_from(debug_data.len())
+                .expect("test fixture debug data length fits in u32")
+                .to_le_bytes(),
+        );
+        for (offset, length, is_utf16) in filename_entries {
+            debug_info.extend_from_slice(&offset.to_le_bytes());
+            let raw_length = if *is_utf16 {
+                length | STRING_TABLE_ENTRY_UTF16_MASK
+            } else {
+                *length
+            };
+            debug_info.extend_from_slice(&raw_length.to_le_bytes());
+        }
+        debug_info.extend_from_slice(filename_storage);
+        for (from_address, filename_id, source_mapping_url_id) in file_regions {
+            debug_info.extend_from_slice(&from_address.to_le_bytes());
+            debug_info.extend_from_slice(&filename_id.to_le_bytes());
+            debug_info.extend_from_slice(&source_mapping_url_id.to_le_bytes());
+        }
+        debug_info.extend_from_slice(debug_data);
+
+        bytes.splice(debug_info_offset..footer_offset, debug_info);
         let new_file_length = u32::try_from(bytes.len()).expect("test fixture length fits in u32");
         write_u32(bytes, FILE_LENGTH_OFFSET, new_file_length);
     }
@@ -4455,6 +4623,49 @@ mod tests {
     }
 
     #[test]
+    fn accepts_debug_filename_table_and_file_region() {
+        let mut bytes = fixture_bytecode();
+        set_debug_info(
+            &mut bytes,
+            &[(0, 8, false)],
+            b"file.js\0",
+            &[(0, 0, DEBUG_SOURCE_MAPPING_URL_INVALID)],
+            &debug_source_stream(1, 0),
+        );
+        add_global_debug_offsets(&mut bytes, 0);
+
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid debug file regions");
+        assert!(
+            bytecode
+                .global_function_header()
+                .expect("valid global function")
+                .has_debug_info()
+        );
+    }
+
+    #[test]
+    fn accepts_utf16_debug_filename_entry() {
+        let mut bytes = fixture_bytecode();
+        set_debug_info(&mut bytes, &[(0, 1, true)], &[0, 0], &[], &[]);
+
+        HermesBytecode::parse(&bytes).expect("valid UTF-16 debug filename entry");
+    }
+
+    #[test]
+    fn accepts_debug_file_region_source_mapping_url() {
+        let mut bytes = fixture_bytecode();
+        set_debug_info(
+            &mut bytes,
+            &[(0, 1, false), (1, 1, false)],
+            b"am",
+            &[(0, 0, 1)],
+            &[0],
+        );
+
+        HermesBytecode::parse(&bytes).expect("valid source map URL file region");
+    }
+
+    #[test]
     fn accepts_exception_table_with_debug_offsets() {
         let mut bytes = fixture_bytecode();
         add_global_function_info(
@@ -4469,6 +4680,80 @@ mod tests {
             .expect("valid global function");
         assert!(global.has_exception_handler());
         assert!(global.has_debug_info());
+    }
+
+    #[test]
+    fn rejects_debug_filename_outside_storage() {
+        let mut bytes = fixture_bytecode();
+        set_debug_info(&mut bytes, &[(1, 3, false)], b"abc", &[], &[]);
+
+        let error = HermesBytecode::parse(&bytes).expect_err("invalid debug filename must fail");
+        assert_eq!(
+            error,
+            ParseError::DebugFilenameOutOfBounds {
+                filename_index: 0,
+                offset: 1,
+                length: 3,
+                storage_size: 3,
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_debug_file_region_filename_outside_table() {
+        let mut bytes = fixture_bytecode();
+        set_debug_info(&mut bytes, &[(0, 1, false)], b"a", &[(0, 1, 0)], &[0]);
+
+        let error = HermesBytecode::parse(&bytes).expect_err("invalid filename id must fail");
+        assert_eq!(
+            error,
+            ParseError::InvalidDebugFileRegion {
+                region_index: 0,
+                from_address: 0,
+                filename_id: 1,
+                source_mapping_url_id: 0,
+                filename_count: 1,
+                debug_data_size: 1,
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_debug_file_region_source_mapping_url_outside_table() {
+        let mut bytes = fixture_bytecode();
+        set_debug_info(&mut bytes, &[(0, 1, false)], b"a", &[(0, 0, 1)], &[0]);
+
+        let error = HermesBytecode::parse(&bytes).expect_err("invalid source map URL id must fail");
+        assert_eq!(
+            error,
+            ParseError::InvalidDebugFileRegion {
+                region_index: 0,
+                from_address: 0,
+                filename_id: 0,
+                source_mapping_url_id: 1,
+                filename_count: 1,
+                debug_data_size: 1,
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_debug_file_region_outside_debug_data() {
+        let mut bytes = fixture_bytecode();
+        set_debug_info(&mut bytes, &[(0, 1, false)], b"a", &[(1, 0, 0)], &[0]);
+
+        let error = HermesBytecode::parse(&bytes).expect_err("invalid file region must fail");
+        assert_eq!(
+            error,
+            ParseError::InvalidDebugFileRegion {
+                region_index: 0,
+                from_address: 1,
+                filename_id: 0,
+                source_mapping_url_id: 0,
+                filename_count: 1,
+                debug_data_size: 1,
+            },
+        );
     }
 
     #[test]

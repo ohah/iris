@@ -76,6 +76,10 @@ const DEBUG_INFO_HEADER_SIZE: usize = 16;
 const DEBUG_FILE_REGION_SIZE: usize = 12;
 const DEBUG_OFFSETS_SIZE: usize = 4;
 const DEBUG_OFFSETS_NO_OFFSET: u32 = u32::MAX;
+const DEBUG_DATA_TRUNCATED_LEB: &str = "truncated signed LEB128";
+const DEBUG_DATA_LEB_OVERFLOW: &str = "signed LEB128 exceeds i64";
+const DEBUG_DATA_FUNCTION_MISMATCH: &str = "function id mismatch";
+const DEBUG_DATA_ADDRESS_OUT_OF_BOUNDS: &str = "address outside function body";
 const FUNCTION_INFO_ALIGNMENT: u32 = 4;
 const SWITCH_TABLE_CASE_SIZE: usize = 8;
 const SWITCH_TABLE_ALIGNMENT: u32 = 4;
@@ -1285,6 +1289,15 @@ pub enum ParseError {
         /// Declared global debug data byte length.
         debug_data_size: u32,
     },
+    /// A function debug source-location stream is not decodable by Hermes rules.
+    InvalidDebugData {
+        /// Function id whose debug data is invalid.
+        function_id: u32,
+        /// Offset into the global debug data payload where validation failed.
+        offset: u32,
+        /// Static validation failure reason.
+        reason: &'static str,
+    },
     /// An exception handler entry points outside the function body boundaries.
     InvalidExceptionHandler {
         /// Function id whose exception table is invalid.
@@ -1587,6 +1600,14 @@ impl fmt::Display for ParseError {
             } => write!(
                 formatter,
                 "Hermes bytecode function {function_id} debug source locations offset {source_locations} exceeds debug data size {debug_data_size}",
+            ),
+            Self::InvalidDebugData {
+                function_id,
+                offset,
+                reason,
+            } => write!(
+                formatter,
+                "Hermes bytecode function {function_id} debug data at offset {offset} is invalid: {reason}",
             ),
             Self::InvalidExceptionHandler {
                 function_id,
@@ -2150,6 +2171,7 @@ struct DecodedFunctionHeader {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DebugInfoBounds {
+    debug_data_offset: u32,
     debug_data_size: u32,
 }
 
@@ -2314,9 +2336,13 @@ fn parse_debug_info(
     cursor = checked_debug_info_end(cursor, filename_table_size, limit)?;
     cursor = checked_debug_info_end(cursor, filename_storage_size, limit)?;
     cursor = checked_debug_info_end(cursor, file_region_table_size, limit)?;
+    let debug_data_offset = cursor;
     checked_debug_info_end(cursor, debug_data_size, limit)?;
 
-    Ok(Some(DebugInfoBounds { debug_data_size }))
+    Ok(Some(DebugInfoBounds {
+        debug_data_offset,
+        debug_data_size,
+    }))
 }
 
 fn checked_debug_info_end(offset: u32, size: u32, limit: u32) -> Result<u32, ParseError> {
@@ -2524,22 +2550,35 @@ fn validate_function_info(
             DEBUG_OFFSETS_SIZE as u32,
             limit,
         )?;
-        validate_debug_offsets(function_id, read_u32(debug_offsets, 0), debug_info)?;
+        validate_debug_offsets(
+            bytes,
+            function_id,
+            decoded.header,
+            read_u32(debug_offsets, 0),
+            debug_info,
+        )?;
     }
     Ok(())
 }
 
 fn validate_debug_offsets(
+    bytes: &[u8],
     function_id: u32,
+    function_header: HermesFunctionHeader,
     source_locations: u32,
     debug_info: Option<DebugInfoBounds>,
 ) -> Result<(), ParseError> {
     if source_locations == DEBUG_OFFSETS_NO_OFFSET {
         return Ok(());
     }
-    let debug_data_size = debug_info
-        .map(|bounds| bounds.debug_data_size)
-        .unwrap_or_default();
+    let Some(debug_info) = debug_info else {
+        return Err(ParseError::InvalidDebugOffset {
+            function_id,
+            source_locations,
+            debug_data_size: 0,
+        });
+    };
+    let debug_data_size = debug_info.debug_data_size;
     if source_locations >= debug_data_size {
         return Err(ParseError::InvalidDebugOffset {
             function_id,
@@ -2547,7 +2586,137 @@ fn validate_debug_offsets(
             debug_data_size,
         });
     }
-    Ok(())
+
+    let stream_offset = debug_info
+        .debug_data_offset
+        .checked_add(source_locations)
+        .ok_or(ParseError::InvalidDebugData {
+            function_id,
+            offset: source_locations,
+            reason: DEBUG_DATA_ADDRESS_OUT_OF_BOUNDS,
+        })?;
+    let stream_size =
+        debug_data_size
+            .checked_sub(source_locations)
+            .ok_or(ParseError::InvalidDebugOffset {
+                function_id,
+                source_locations,
+                debug_data_size,
+            })?;
+    let stream = debug_info_bytes(bytes, stream_offset, stream_size, u32::MAX).map_err(|_| {
+        ParseError::InvalidDebugData {
+            function_id,
+            offset: source_locations,
+            reason: DEBUG_DATA_TRUNCATED_LEB,
+        }
+    })?;
+    validate_debug_source_locations(
+        function_id,
+        function_header.bytecode_size_in_bytes,
+        source_locations,
+        stream,
+    )
+}
+
+fn validate_debug_source_locations(
+    function_id: u32,
+    body_size: u32,
+    source_locations: u32,
+    data: &[u8],
+) -> Result<(), ParseError> {
+    let mut cursor = 0_usize;
+    let stream_function_id = read_signed_leb128(data, &mut cursor, function_id, source_locations)?;
+    if stream_function_id < 0 || u32::try_from(stream_function_id).ok() != Some(function_id) {
+        return Err(ParseError::InvalidDebugData {
+            function_id,
+            offset: source_locations,
+            reason: DEBUG_DATA_FUNCTION_MISMATCH,
+        });
+    }
+
+    read_signed_leb128(data, &mut cursor, function_id, source_locations)?;
+    read_signed_leb128(data, &mut cursor, function_id, source_locations)?;
+    read_signed_leb128(data, &mut cursor, function_id, source_locations)?;
+
+    let mut current_address = 0_i64;
+    loop {
+        let address_delta_offset = debug_data_offset(source_locations, cursor);
+        let address_delta = read_signed_leb128(data, &mut cursor, function_id, source_locations)?;
+        if address_delta == -1 {
+            return Ok(());
+        }
+        current_address =
+            current_address
+                .checked_add(address_delta)
+                .ok_or(ParseError::InvalidDebugData {
+                    function_id,
+                    offset: address_delta_offset,
+                    reason: DEBUG_DATA_ADDRESS_OUT_OF_BOUNDS,
+                })?;
+        if current_address < 0 || current_address > i64::from(body_size) {
+            return Err(ParseError::InvalidDebugData {
+                function_id,
+                offset: address_delta_offset,
+                reason: DEBUG_DATA_ADDRESS_OUT_OF_BOUNDS,
+            });
+        }
+
+        let line_delta = read_signed_leb128(data, &mut cursor, function_id, source_locations)?;
+        if line_delta & 1 == 0 {
+            continue;
+        }
+        read_signed_leb128(data, &mut cursor, function_id, source_locations)?;
+        if line_delta & 2 != 0 {
+            read_signed_leb128(data, &mut cursor, function_id, source_locations)?;
+        }
+        if line_delta & 4 != 0 {
+            read_signed_leb128(data, &mut cursor, function_id, source_locations)?;
+        }
+    }
+}
+
+fn read_signed_leb128(
+    data: &[u8],
+    cursor: &mut usize,
+    function_id: u32,
+    source_locations: u32,
+) -> Result<i64, ParseError> {
+    let start = *cursor;
+    let mut result = 0_i128;
+    let mut shift = 0_u32;
+    for _ in 0..10 {
+        let Some(byte) = data.get(*cursor).copied() else {
+            return Err(ParseError::InvalidDebugData {
+                function_id,
+                offset: debug_data_offset(source_locations, start),
+                reason: DEBUG_DATA_TRUNCATED_LEB,
+            });
+        };
+        *cursor += 1;
+        result |= i128::from(byte & 0x7f) << shift;
+        shift += 7;
+
+        if byte & 0x80 == 0 {
+            if shift < 64 && byte & 0x40 != 0 {
+                result |= (!0_i128) << shift;
+            }
+            return i64::try_from(result).map_err(|_| ParseError::InvalidDebugData {
+                function_id,
+                offset: debug_data_offset(source_locations, start),
+                reason: DEBUG_DATA_LEB_OVERFLOW,
+            });
+        }
+    }
+
+    Err(ParseError::InvalidDebugData {
+        function_id,
+        offset: debug_data_offset(source_locations, start),
+        reason: DEBUG_DATA_LEB_OVERFLOW,
+    })
+}
+
+fn debug_data_offset(source_locations: u32, relative_offset: usize) -> u32 {
+    source_locations.saturating_add(u32::try_from(relative_offset).unwrap_or(u32::MAX))
 }
 
 fn function_info_bytes(
@@ -3589,6 +3758,65 @@ mod tests {
         add_global_function_info(bytes, None, Some(source_locations))
     }
 
+    fn set_debug_data(bytes: &mut Vec<u8>, debug_data: &[u8]) {
+        let (debug_info_offset, file_length) = {
+            let bytecode = HermesBytecode::parse(bytes).expect("valid fixture");
+            (
+                bytecode.header().debug_info_offset,
+                bytecode.header().file_length,
+            )
+        };
+        let debug_data_offset = usize::try_from(debug_info_offset)
+            .expect("test fixture offset fits in usize")
+            + DEBUG_INFO_HEADER_SIZE;
+        let footer_offset = usize::try_from(file_length)
+            .expect("test fixture length fits in usize")
+            - HERMES_BYTECODE_FOOTER_SIZE;
+
+        write_u32(
+            bytes,
+            usize::try_from(debug_info_offset).expect("test fixture offset fits in usize") + 12,
+            u32::try_from(debug_data.len()).expect("test fixture debug data length fits in u32"),
+        );
+        bytes.splice(debug_data_offset..footer_offset, debug_data.iter().copied());
+        let new_file_length = u32::try_from(bytes.len()).expect("test fixture length fits in u32");
+        write_u32(bytes, FILE_LENGTH_OFFSET, new_file_length);
+    }
+
+    fn debug_source_stream(function_id: u32, address_delta: i64) -> Vec<u8> {
+        let mut data = Vec::new();
+        append_signed_leb128(&mut data, i64::from(function_id));
+        append_signed_leb128(&mut data, 1);
+        append_signed_leb128(&mut data, 1);
+        append_signed_leb128(&mut data, 0);
+        append_signed_leb128(&mut data, address_delta);
+        append_signed_leb128(&mut data, 0);
+        append_signed_leb128(&mut data, -1);
+        data
+    }
+
+    fn debug_source_stream_without_sentinel(function_id: u32) -> Vec<u8> {
+        let mut data = Vec::new();
+        append_signed_leb128(&mut data, i64::from(function_id));
+        append_signed_leb128(&mut data, 1);
+        append_signed_leb128(&mut data, 1);
+        append_signed_leb128(&mut data, 0);
+        data
+    }
+
+    fn append_signed_leb128(bytes: &mut Vec<u8>, mut value: i64) {
+        loop {
+            let byte = u8::try_from(value & 0x7f).expect("SLEB low bits fit in u8");
+            value >>= 7;
+            let done = (value == 0 && byte & 0x40 == 0) || (value == -1 && byte & 0x40 != 0);
+            if done {
+                bytes.push(byte);
+                return;
+            }
+            bytes.push(byte | 0x80);
+        }
+    }
+
     fn add_global_function_info(
         bytes: &mut Vec<u8>,
         exception_table: Option<(u32, &[(u32, u32, u32)])>,
@@ -4212,6 +4440,21 @@ mod tests {
     }
 
     #[test]
+    fn accepts_valid_debug_source_locations() {
+        let mut bytes = fixture_bytecode();
+        set_debug_data(&mut bytes, &debug_source_stream(1, 0));
+        add_global_debug_offsets(&mut bytes, 0);
+
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid debug source locations");
+        assert!(
+            bytecode
+                .global_function_header()
+                .expect("valid global function")
+                .has_debug_info()
+        );
+    }
+
+    #[test]
     fn accepts_exception_table_with_debug_offsets() {
         let mut bytes = fixture_bytecode();
         add_global_function_info(
@@ -4226,6 +4469,57 @@ mod tests {
             .expect("valid global function");
         assert!(global.has_exception_handler());
         assert!(global.has_debug_info());
+    }
+
+    #[test]
+    fn rejects_debug_source_locations_for_wrong_function() {
+        let mut bytes = fixture_bytecode();
+        set_debug_data(&mut bytes, &debug_source_stream(0, 0));
+        add_global_debug_offsets(&mut bytes, 0);
+
+        let error = HermesBytecode::parse(&bytes).expect_err("wrong debug function id must fail");
+        assert_eq!(
+            error,
+            ParseError::InvalidDebugData {
+                function_id: 1,
+                offset: 0,
+                reason: DEBUG_DATA_FUNCTION_MISMATCH,
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_unterminated_debug_source_locations() {
+        let mut bytes = fixture_bytecode();
+        set_debug_data(&mut bytes, &debug_source_stream_without_sentinel(1));
+        add_global_debug_offsets(&mut bytes, 0);
+
+        let error = HermesBytecode::parse(&bytes).expect_err("unterminated debug source must fail");
+        assert_eq!(
+            error,
+            ParseError::InvalidDebugData {
+                function_id: 1,
+                offset: 4,
+                reason: DEBUG_DATA_TRUNCATED_LEB,
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_debug_source_address_outside_body() {
+        let mut bytes = fixture_bytecode();
+        set_debug_data(&mut bytes, &debug_source_stream(1, 3));
+        add_global_debug_offsets(&mut bytes, 0);
+
+        let error = HermesBytecode::parse(&bytes).expect_err("invalid debug address must fail");
+        assert_eq!(
+            error,
+            ParseError::InvalidDebugData {
+                function_id: 1,
+                offset: 4,
+                reason: DEBUG_DATA_ADDRESS_OUT_OF_BOUNDS,
+            },
+        );
     }
 
     #[test]

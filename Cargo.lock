@@ -156,6 +156,10 @@ name = "iris-core"
 version = "0.0.0"
 
 [[package]]
+name = "iris-hbc"
+version = "0.0.0"
+
+[[package]]
 name = "iris-jsi"
 version = "0.0.0"
 dependencies = [

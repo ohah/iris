@@ -1311,6 +1311,11 @@ pub enum ParseError {
         /// Declared debug data byte length.
         debug_data_size: u32,
     },
+    /// The first debug file region does not cover debug data offset zero.
+    InvalidDebugFileRegionStart {
+        /// Offset where the first debug file region starts.
+        from_address: u32,
+    },
     /// Debug file regions are not sorted by debug data address.
     InvalidDebugFileRegionOrder {
         /// Debug file region entry index.
@@ -1661,6 +1666,10 @@ impl fmt::Display for ParseError {
             } => write!(
                 formatter,
                 "Hermes bytecode debug file region {region_index} at debug data offset {from_address} references filename {filename_id} and source map URL {source_mapping_url_id}; filename count is {filename_count}, debug data size is {debug_data_size}",
+            ),
+            Self::InvalidDebugFileRegionStart { from_address } => write!(
+                formatter,
+                "Hermes bytecode first debug file region starts at {from_address}, expected 0",
             ),
             Self::InvalidDebugFileRegionOrder {
                 region_index,
@@ -2495,6 +2504,9 @@ fn validate_debug_file_regions(
         let from_address = read_u32(region, 0);
         let filename_id = read_u32(region, 4);
         let source_mapping_url_id = read_u32(region, 8);
+        if index == 0 && from_address != 0 {
+            return Err(ParseError::InvalidDebugFileRegionStart { from_address });
+        }
         if let Some(previous) = previous_from_address {
             if from_address <= previous {
                 return Err(ParseError::InvalidDebugFileRegionOrder {
@@ -4985,19 +4997,38 @@ mod tests {
     #[test]
     fn rejects_debug_file_region_outside_debug_data() {
         let mut bytes = fixture_bytecode();
-        set_debug_info(&mut bytes, &[(0, 1, false)], b"a", &[(1, 0, 0)], &[0]);
+        set_debug_info(
+            &mut bytes,
+            &[(0, 1, false)],
+            b"a",
+            &[(0, 0, 0), (2, 0, 0)],
+            &[0, 0],
+        );
 
         let error = HermesBytecode::parse(&bytes).expect_err("invalid file region must fail");
         assert_eq!(
             error,
             ParseError::InvalidDebugFileRegion {
-                region_index: 0,
-                from_address: 1,
+                region_index: 1,
+                from_address: 2,
                 filename_id: 0,
                 source_mapping_url_id: 0,
                 filename_count: 1,
-                debug_data_size: 1,
+                debug_data_size: 2,
             },
+        );
+    }
+
+    #[test]
+    fn rejects_debug_file_region_that_does_not_start_at_zero() {
+        let mut bytes = fixture_bytecode();
+        set_debug_info(&mut bytes, &[(0, 1, false)], b"a", &[(1, 0, 0)], &[0, 0]);
+
+        let error =
+            HermesBytecode::parse(&bytes).expect_err("missing initial file region must fail");
+        assert_eq!(
+            error,
+            ParseError::InvalidDebugFileRegionStart { from_address: 1 },
         );
     }
 
@@ -5008,7 +5039,7 @@ mod tests {
             &mut bytes,
             &[(0, 1, false), (1, 1, false)],
             b"ab",
-            &[(1, 1, 0), (0, 0, 0)],
+            &[(0, 1, 0), (0, 0, 0)],
             &[0, 0],
         );
 
@@ -5017,7 +5048,7 @@ mod tests {
             error,
             ParseError::InvalidDebugFileRegionOrder {
                 region_index: 1,
-                previous_from_address: 1,
+                previous_from_address: 0,
                 from_address: 0,
             },
         );

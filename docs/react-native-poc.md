@@ -30,6 +30,8 @@ bundle exec pod install
 ```sh
 mise run rn-typecheck
 mise run rn-test
+mise run bench-smoke
+mise run bench-js
 mise run check
 ```
 
@@ -37,7 +39,7 @@ mise run check
 
 ## 측정 경계
 
-현재 앱의 측정 버튼은 개발 중 빠르게 기준을 확인하기 위한 smoke benchmark다. 릴리스 성능 주장을 하려면 다음 조건을 별도 산출물에 기록해야 한다.
+현재 앱의 측정 버튼은 개발 중 빠르게 기준을 확인하기 위한 smoke benchmark다. `mise run bench-*` 명령은 같은 JS benchmark case를 로컬 산출물로 기록하지만 아직 CI 필수 체크는 아니다. 릴리스 성능 주장을 하려면 다음 조건을 별도 산출물에 기록해야 한다.
 
 - 기기 모델, OS 버전, 빌드 타입
 - React Native, Hermes, Iris commit

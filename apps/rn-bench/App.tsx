@@ -1,6 +1,7 @@
 import React, { useMemo, useState } from "react";
 import {
   FlatList,
+  Platform,
   Pressable,
   StatusBar,
   StyleSheet,
@@ -9,82 +10,47 @@ import {
   View,
 } from "react-native";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
+import {
+  benchmarkCases,
+  createRenderStressRows,
+  type RenderStressRow,
+} from "./src/benchmarks/cases";
+import { runBenchmarkSuite } from "./src/benchmarks/harness";
+import { createRuntimeMetadata } from "./src/benchmarks/metadata";
+import type { BenchmarkCaseReport, BenchmarkSuiteReport } from "./src/benchmarks/types";
 
-type BenchResult = {
-  detail: string;
-  label: string;
-  value: string;
-};
-
-type RuntimeGlobals = typeof globalThis & {
-  HermesInternal?: unknown;
-  __turboModuleProxy?: unknown;
-  nativeFabricUIManager?: unknown;
-  performance?: {
-    now?: () => number;
+type PlatformConstants = typeof Platform.constants & {
+  Brand?: string;
+  Model?: string;
+  interfaceIdiom?: string;
+  reactNativeVersion?: {
+    major: number;
+    minor: number;
+    patch: number;
+    prerelease?: string | null;
   };
 };
 
-type Row = {
-  id: string;
-  score: string;
-  title: string;
-};
+const platformConstants = Platform.constants as PlatformConstants;
 
-const runtime = globalThis as RuntimeGlobals;
+function formatReactNativeVersion() {
+  const version = platformConstants.reactNativeVersion;
 
-function now() {
-  return runtime.performance?.now?.() ?? Date.now();
-}
-
-function runComputeBench(): BenchResult {
-  const startedAt = now();
-  let checksum = 0;
-
-  for (let index = 0; index < 600_000; index += 1) {
-    checksum += Math.sqrt((index % 1_000) + 1) * Math.sin(index);
+  if (!version) {
+    return "0.85.0";
   }
 
-  return {
-    detail: `600k math ops, checksum ${checksum.toFixed(2)}`,
-    label: "JS compute",
-    value: `${(now() - startedAt).toFixed(1)} ms`,
-  };
+  const prerelease = version.prerelease ? `-${version.prerelease}` : "";
+  return `${version.major}.${version.minor}.${version.patch}${prerelease}`;
 }
 
-function runJsonBench(): BenchResult {
-  const startedAt = now();
-  const payload = Array.from({ length: 8_000 }, (_, index) => ({
-    active: index % 3 === 0,
-    id: index,
-    meta: {
-      lane: index % 7,
-      label: `group-${index % 11}`,
-    },
-    name: `item-${index}`,
-    points: [index, index * 2, index * 3],
-  }));
-
-  const encoded = JSON.stringify(payload);
-  const decoded = JSON.parse(encoded) as Array<{
-    id: number;
-    points: number[];
-  }>;
-  const checksum = decoded.reduce((total, item) => total + item.id + item.points[2], 0);
-
-  return {
-    detail: `${encoded.length.toLocaleString()} bytes, checksum ${checksum}`,
-    label: "JSON round trip",
-    value: `${(now() - startedAt).toFixed(1)} ms`,
-  };
-}
-
-function createRows(count: number): Row[] {
-  return Array.from({ length: count }, (_, index) => ({
-    id: String(index),
-    score: String((index * 37) % 997).padStart(3, "0"),
-    title: `Render row ${index + 1}`,
-  }));
+function readDeviceName() {
+  return (
+    platformConstants.Model ??
+    platformConstants.Brand ??
+    platformConstants.interfaceIdiom ??
+    "unknown"
+  );
 }
 
 function App() {
@@ -100,20 +66,32 @@ function App() {
 
 function BenchmarkScreen() {
   const [itemCount, setItemCount] = useState(1_000);
-  const [results, setResults] = useState<BenchResult[]>([]);
-  const rows = useMemo(() => createRows(itemCount), [itemCount]);
+  const [report, setReport] = useState<BenchmarkSuiteReport | null>(null);
+  const [isRunning, setIsRunning] = useState(false);
+  const rows = useMemo(() => createRenderStressRows(itemCount), [itemCount]);
+  const metadata = useMemo(
+    () =>
+      createRuntimeMetadata({
+        appVersion: "0.0.1",
+        device: readDeviceName(),
+        os: Platform.OS,
+        platformVersion: String(Platform.Version),
+        reactNativeVersion: formatReactNativeVersion(),
+      }),
+    [],
+  );
   const runtimeCards = [
     {
       label: "Hermes",
-      value: runtime.HermesInternal ? "enabled" : "missing",
+      value: metadata.runtime.hermes ? "enabled" : "missing",
     },
     {
-      label: "TurboModule",
-      value: runtime.__turboModuleProxy ? "ready" : "not detected",
+      label: "Build",
+      value: metadata.build.mode,
     },
     {
       label: "Fabric",
-      value: runtime.nativeFabricUIManager ? "ready" : "not detected",
+      value: metadata.runtime.fabric ? "ready" : "not detected",
     },
     {
       label: "Rows",
@@ -121,8 +99,22 @@ function BenchmarkScreen() {
     },
   ];
 
-  function pushResult(result: BenchResult) {
-    setResults((current) => [result, ...current].slice(0, 4));
+  async function runSuite() {
+    if (isRunning) {
+      return;
+    }
+
+    setIsRunning(true);
+
+    try {
+      const nextReport = await runBenchmarkSuite(benchmarkCases, metadata, {
+        yieldBetweenCases: true,
+      });
+      console.log("IRIS_BENCHMARK_ARTIFACT", JSON.stringify(nextReport));
+      setReport(nextReport);
+    } finally {
+      setIsRunning(false);
+    }
   }
 
   function expandList() {
@@ -151,25 +143,16 @@ function BenchmarkScreen() {
       </View>
 
       <View style={styles.actions}>
-        <BenchmarkButton label="Compute" onPress={() => pushResult(runComputeBench())} />
-        <BenchmarkButton label="JSON" onPress={() => pushResult(runJsonBench())} />
+        <BenchmarkButton
+          disabled={isRunning}
+          label={isRunning ? "Running" : "Run suite"}
+          onPress={runSuite}
+        />
         <BenchmarkButton label="List load" onPress={expandList} />
       </View>
 
       <View style={styles.resultPanel}>
-        {results.length === 0 ? (
-          <Text style={styles.emptyText}>Run a benchmark to record the Hermes baseline.</Text>
-        ) : (
-          results.map((result) => (
-            <View key={`${result.label}-${result.value}-${result.detail}`} style={styles.resultRow}>
-              <View>
-                <Text style={styles.resultLabel}>{result.label}</Text>
-                <Text style={styles.resultDetail}>{result.detail}</Text>
-              </View>
-              <Text style={styles.resultValue}>{result.value}</Text>
-            </View>
-          ))
-        )}
+        <BenchmarkSummary isRunning={isRunning} report={report} />
       </View>
 
       <View style={styles.listHeader}>
@@ -190,24 +173,75 @@ function BenchmarkScreen() {
   );
 }
 
+function BenchmarkSummary({
+  isRunning,
+  report,
+}: {
+  isRunning: boolean;
+  report: BenchmarkSuiteReport | null;
+}) {
+  if (isRunning) {
+    return <Text style={styles.emptyText}>Running warmup and measured iterations.</Text>;
+  }
+
+  if (!report) {
+    return <Text style={styles.emptyText}>Run the suite to record a Hermes baseline report.</Text>;
+  }
+
+  return (
+    <View>
+      <View style={styles.reportHeader}>
+        <Text style={styles.reportTitle}>{report.schemaVersion}</Text>
+        <Text style={styles.reportMeta}>{report.summary.totalElapsedMs.toFixed(1)} ms total</Text>
+      </View>
+
+      {report.cases.map((result) => (
+        <BenchmarkResultRow key={result.id} result={result} />
+      ))}
+    </View>
+  );
+}
+
+function BenchmarkResultRow({ result }: { result: BenchmarkCaseReport }) {
+  return (
+    <View style={styles.resultRow}>
+      <View style={styles.resultText}>
+        <Text style={styles.resultLabel}>{result.label}</Text>
+        <Text style={styles.resultDetail}>
+          {result.detail}, p50 {result.stats.p50}
+          {result.unit}, p95 {result.stats.p95}
+          {result.unit}
+        </Text>
+      </View>
+      <Text style={styles.resultValue}>{result.measuredIterations}x</Text>
+    </View>
+  );
+}
+
 type BenchmarkButtonProps = {
+  disabled?: boolean;
   label: string;
   onPress: () => void;
 };
 
-function BenchmarkButton({ label, onPress }: BenchmarkButtonProps) {
+function BenchmarkButton({ disabled = false, label, onPress }: BenchmarkButtonProps) {
   return (
     <Pressable
       accessibilityRole="button"
+      disabled={disabled}
       onPress={onPress}
-      style={({ pressed }) => [styles.button, pressed && styles.buttonPressed]}
+      style={({ pressed }) => [
+        styles.button,
+        pressed && styles.buttonPressed,
+        disabled && styles.buttonDisabled,
+      ]}
     >
       <Text style={styles.buttonText}>{label}</Text>
     </Pressable>
   );
 }
 
-function RenderRow({ row }: { row: Row }) {
+function RenderRow({ row }: { row: RenderStressRow }) {
   return (
     <View style={styles.row}>
       <Text style={styles.rowTitle}>{row.title}</Text>
@@ -229,6 +263,9 @@ const styles = StyleSheet.create({
     flex: 1,
     paddingHorizontal: 12,
     paddingVertical: 12,
+  },
+  buttonDisabled: {
+    backgroundColor: "#6b7280",
   },
   buttonPressed: {
     backgroundColor: "#374151",
@@ -264,6 +301,22 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     marginBottom: 8,
   },
+  reportHeader: {
+    alignItems: "center",
+    flexDirection: "row",
+    justifyContent: "space-between",
+    marginBottom: 6,
+  },
+  reportMeta: {
+    color: "#667073",
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  reportTitle: {
+    color: "#0f766e",
+    fontSize: 13,
+    fontWeight: "800",
+  },
   resultDetail: {
     color: "#667073",
     fontSize: 12,
@@ -291,6 +344,9 @@ const styles = StyleSheet.create({
     gap: 12,
     justifyContent: "space-between",
     paddingVertical: 8,
+  },
+  resultText: {
+    flex: 1,
   },
   resultValue: {
     color: "#b45309",

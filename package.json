@@ -8,6 +8,8 @@
     "packages/*"
   ],
   "scripts": {
+    "bench:extract-hermes": "bun run tools/bench/extract-hermes-report.ts",
+    "bench:extract-hermes:fixture": "bun run tools/bench/extract-hermes-report.ts --input=tools/bench/fixtures/hermes-metro.txt --output=artifacts/bench/hermes-baseline-fixture.json",
     "bench:js": "bun run tools/bench/run-js-baseline.ts",
     "bench:smoke": "bun run tools/bench/run-js-baseline.ts --smoke",
     "format": "oxfmt --write .",

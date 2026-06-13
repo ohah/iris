@@ -20,9 +20,7 @@ mise run rn-android
 iOS 네이티브 빌드 전에는 CocoaPods 설치가 필요하다.
 
 ```sh
-cd apps/rn-bench/ios
-bundle install
-bundle exec pod install
+mise run rn-ios-pods
 ```
 
 ## 검증
@@ -30,13 +28,16 @@ bundle exec pod install
 ```sh
 mise run rn-typecheck
 mise run rn-test
+mise run rn-codegen
+mise run rn-android-build-debug
+mise run rn-ios-build-debug
 mise run bench-smoke
 mise run bench-js
 mise run bench-extract-fixture
 mise run check
 ```
 
-`mise run check`는 루트 Rust 검사와 함께 RN 앱 타입체크/Jest smoke test를 실행한다. 실제 기기 성능 측정은 CI 게이트가 아니라 별도 벤치마크 로그와 산출물로 관리한다.
+`mise run check`는 루트 Rust 검사와 함께 RN 앱 타입체크/Jest smoke test를 실행한다. Debug 네이티브 빌드는 TurboModule 연결 확인용이며 실제 기기 성능 측정은 CI 게이트가 아니라 별도 release 벤치마크 로그와 산출물로 관리한다.
 
 ## 측정 경계
 
@@ -46,3 +47,5 @@ mise run check
 - React Native, Hermes, Iris commit
 - 반복 횟수와 p50/p95
 - cold start, TTI, dropped frames, JS long task, JSI transfer latency, memory
+
+TurboModule 경계 측정은 `docs/turbomodule-baseline.md`의 release 기준을 따른다.

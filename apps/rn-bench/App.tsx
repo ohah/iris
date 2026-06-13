@@ -17,7 +17,12 @@ import {
 } from "./src/benchmarks/cases";
 import { runBenchmarkSuite } from "./src/benchmarks/harness";
 import { createRuntimeMetadata } from "./src/benchmarks/metadata";
+import { createTurboModuleBenchmarkCases } from "./src/benchmarks/turboModuleCases";
 import type { BenchmarkCaseReport, BenchmarkSuiteReport } from "./src/benchmarks/types";
+import {
+  getIrisBenchTurboModule,
+  isIrisBenchTurboModuleAvailable,
+} from "./src/native/IrisBenchTurboModule";
 
 type PlatformConstants = typeof Platform.constants & {
   Brand?: string;
@@ -69,6 +74,11 @@ function BenchmarkScreen() {
   const [report, setReport] = useState<BenchmarkSuiteReport | null>(null);
   const [isRunning, setIsRunning] = useState(false);
   const rows = useMemo(() => createRenderStressRows(itemCount), [itemCount]);
+  const nativeModule = useMemo(() => getIrisBenchTurboModule(), []);
+  const appBenchmarkCases = useMemo(
+    () => [...benchmarkCases, ...createTurboModuleBenchmarkCases(nativeModule)],
+    [nativeModule],
+  );
   const metadata = useMemo(
     () =>
       createRuntimeMetadata({
@@ -94,6 +104,10 @@ function BenchmarkScreen() {
       value: metadata.runtime.fabric ? "ready" : "not detected",
     },
     {
+      label: "Native module",
+      value: isIrisBenchTurboModuleAvailable() ? "ready" : "not detected",
+    },
+    {
       label: "Rows",
       value: itemCount.toLocaleString(),
     },
@@ -107,7 +121,7 @@ function BenchmarkScreen() {
     setIsRunning(true);
 
     try {
-      const nextReport = await runBenchmarkSuite(benchmarkCases, metadata, {
+      const nextReport = await runBenchmarkSuite(appBenchmarkCases, metadata, {
         yieldBetweenCases: true,
       });
       console.log("IRIS_BENCHMARK_ARTIFACT", JSON.stringify(nextReport));

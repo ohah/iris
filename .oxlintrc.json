@@ -1,0 +1,9 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "ignorePatterns": ["node_modules/**", "target/**", "dist/**", "build/**", "coverage/**"],
+  "env": {
+    "browser": true,
+    "node": true,
+    "es2024": true
+  }
+}

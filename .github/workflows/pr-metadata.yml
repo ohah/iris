@@ -1,0 +1,43 @@
+name: PR metadata
+
+# 필수 PR 메타데이터(라벨 1개 이상 + assignee=ohah)를 강제한다.
+# 규칙의 단일 출처는 docs/pr-checklist.md다.
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, labeled, unlabeled, assigned, unassigned]
+
+concurrency:
+  group: pr-metadata-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  pull-requests: read
+
+jobs:
+  require-label-and-assignee:
+    name: require label and assignee=ohah
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check PR has a label and is assigned to ohah
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          labels=$(gh pr view "$PR" --repo "$REPO" --json labels -q '.labels[].name')
+          assignees=$(gh pr view "$PR" --repo "$REPO" --json assignees -q '.assignees[].login')
+          fail=0
+          if [ -z "$labels" ]; then
+            echo "::error::PR must have at least one label (see docs/pr-checklist.md)"
+            fail=1
+          fi
+          if ! printf '%s\n' "$assignees" | grep -qx 'ohah'; then
+            echo "::error::PR must be assigned to ohah (gh pr edit $PR --add-assignee ohah)"
+            fail=1
+          fi
+          if [ "$fail" -eq 0 ]; then
+            echo "ok: labels=[$(echo "$labels" | tr '\n' ' ')] assignees=[$(echo "$assignees" | tr '\n' ' ')]"
+          fi
+          exit "$fail"

@@ -59,6 +59,7 @@ type EngineComparison = {
   }>;
   createdAt: string;
   engines: Array<{
+    appId: string;
     id: EngineConfig["id"];
     label: string;
     metadata: unknown;
@@ -135,7 +136,7 @@ function createEngines(): EngineConfig[] {
         readArg("--hermes-apk") ??
           "apps/rn-bench/android/app/build/outputs/apk/hermes/release/app-hermes-release.apk",
       ),
-      appId: readArg("--hermes-app-id") ?? "com.iris.bench",
+      appId: readArg("--hermes-app-id") ?? "com.iris.bench.hermes",
       id: "hermes",
       label: "Hermes release",
       logPath: resolve(
@@ -243,6 +244,7 @@ function compareSummaries(
     cases,
     createdAt: new Date().toISOString(),
     engines: engines.map((engine, index) => ({
+      appId: engine.appId,
       id: engine.id,
       label: engine.label,
       metadata: summaries[index].metadata,

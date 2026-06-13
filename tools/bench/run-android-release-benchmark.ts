@@ -10,6 +10,7 @@ import type {
 const root = resolve(import.meta.dir, "../..");
 const defaultApkPath =
   "apps/rn-bench/android/app/build/outputs/apk/hermes/release/app-hermes-release.apk";
+const defaultAppId = "com.iris.bench.hermes";
 const defaultLogPath = "artifacts/bench/rn-release-hermes.log";
 const defaultReportPath = "artifacts/bench/hermes-release-baseline.json";
 const defaultSummaryPath = "artifacts/bench/hermes-release-baseline-summary.json";
@@ -38,7 +39,7 @@ function hasArg(name: string) {
 }
 
 const agentDevice = process.env.AGENT_DEVICE_BIN ?? "agent-device";
-const appId = readArg("--app-id") ?? "com.iris.bench";
+const appId = readArg("--app-id") ?? defaultAppId;
 const apkPath = resolve(root, readArg("--apk") ?? defaultApkPath);
 const logPath = resolve(root, readArg("--log-output") ?? defaultLogPath);
 const reportPath = resolve(root, readArg("--report-output") ?? defaultReportPath);

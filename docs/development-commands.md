@@ -25,6 +25,7 @@ mise run bench-smoke
 mise run bench-js
 mise run bench-android-release
 mise run bench-android-release-repeat
+mise run bench-android-engine-compare
 mise run bench-extract-fixture
 mise run bench-extract-hermes
 mise run bench-extract-release-fixture
@@ -37,6 +38,7 @@ mise run rn-ios-build-debug
 mise run rn-ios-build-release
 mise run rn-android-build-debug
 mise run rn-android-build-release
+mise run rn-android-build-iris-release
 mise run rn-codegen
 mise run rn-typecheck
 mise run rn-test
@@ -52,9 +54,11 @@ mise run check
 - Bun은 `package.json`의 `packageManager`와 `.mise.toml`의 `bun = "1.3.14"`로 고정한다.
 - Vite+는 로컬 `vite-plus` 패키지와 `bunx vp`로 실행한다.
 - React Native PoC 앱은 `apps/rn-bench`에 두고 `mise run rn-*` 명령으로 실행한다.
-- `rn-ios-build-debug`와 `rn-android-build-debug`는 네이티브 연결 확인용 로컬 빌드이며 성능 기준선으로 쓰지 않는다.
-- `rn-ios-build-release`와 `rn-android-build-release`는 최적화된 RN/Hermes 기준선 수집 전 release 빌드가 가능한지 확인한다.
+- `rn-ios-build-debug`와 `rn-android-build-debug`는 네이티브 연결 확인용 로컬 빌드이며 성능 기준선으로 쓰지 않는다. Android debug는 Hermes flavor를 기준으로 한다.
+- `rn-ios-build-release`와 `rn-android-build-release`는 최적화된 RN/Hermes 기준선 수집 전 release 빌드가 가능한지 확인한다. Android release는 Hermes flavor를 기준으로 한다.
+- `rn-android-build-iris-release`는 `IRIS_ENGINE_AAR`가 실제 RN 호환 Iris 엔진 artifact를 가리킬 때만 Iris release APK를 빌드한다.
 - `bench-android-release-repeat`는 Android 물리 기기의 release APK에서 3회 반복 측정 summary를 남긴다.
+- `bench-android-engine-compare`는 Hermes/Iris release APK를 같은 물리 기기에서 순서대로 측정한다.
 - `bench-extract-hermes-release`는 release, Hermes, New Architecture, Iris module compute, TurboModule 경계 case를 모두 요구한다.
 - 벤치마크 하네스는 `mise run bench-*` 명령으로 로컬에서만 실행한다. 아직 CI 필수 체크에는 넣지 않는다.
 - `mise run check`가 PR 전 기본 검증 경로이며 RN 타입체크와 smoke test를 포함한다.

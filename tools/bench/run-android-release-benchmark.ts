@@ -8,7 +8,8 @@ import type {
 } from "../../apps/rn-bench/src/benchmarks/types";
 
 const root = resolve(import.meta.dir, "../..");
-const defaultApkPath = "apps/rn-bench/android/app/build/outputs/apk/release/app-release.apk";
+const defaultApkPath =
+  "apps/rn-bench/android/app/build/outputs/apk/hermes/release/app-hermes-release.apk";
 const defaultLogPath = "artifacts/bench/rn-release-hermes.log";
 const defaultReportPath = "artifacts/bench/hermes-release-baseline.json";
 const defaultSummaryPath = "artifacts/bench/hermes-release-baseline-summary.json";

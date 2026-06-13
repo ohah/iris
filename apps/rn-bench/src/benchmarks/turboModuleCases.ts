@@ -2,6 +2,7 @@ import type { BenchmarkCase } from "./types";
 import type { IrisBenchTurboModule } from "../native/IrisBenchTurboModule";
 
 const numberRoundTripsPerSample = 1_000;
+const irisNumericWorkloadIterations = 600_000;
 const stringRoundTripsPerSample = 500;
 
 export function createTurboModuleBenchmarkCases(
@@ -51,6 +52,18 @@ export function createTurboModuleBenchmarkCases(
       },
       unit: "ms",
       warmupIterations: 5,
+    },
+    {
+      description: "Single synchronous call into the Iris native module probe workload.",
+      id: "iris-module-native-compute",
+      label: "Iris module compute",
+      measuredIterations: 15,
+      run: () => ({
+        checksum: module.runIrisNumericWorkload(irisNumericWorkloadIterations),
+        detail: `${irisNumericWorkloadIterations} native math operations`,
+      }),
+      unit: "ms",
+      warmupIterations: 3,
     },
   ];
 }

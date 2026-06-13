@@ -1,12 +1,17 @@
-import { copyFileSync, existsSync, mkdirSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, parse, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
+import type {
+  BenchmarkCaseReport,
+  BenchmarkMetadata,
+  BenchmarkSuiteReport,
+} from "../../apps/rn-bench/src/benchmarks/types";
 
 const root = resolve(import.meta.dir, "../..");
-const appId = "com.iris.bench";
 const defaultApkPath = "apps/rn-bench/android/app/build/outputs/apk/release/app-release.apk";
 const defaultLogPath = "artifacts/bench/rn-release-hermes.log";
 const defaultReportPath = "artifacts/bench/hermes-release-baseline.json";
+const defaultSummaryPath = "artifacts/bench/hermes-release-baseline-summary.json";
 
 function readArg(name: string) {
   const prefix = `${name}=`;
@@ -32,11 +37,15 @@ function hasArg(name: string) {
 }
 
 const agentDevice = process.env.AGENT_DEVICE_BIN ?? "agent-device";
+const appId = readArg("--app-id") ?? "com.iris.bench";
 const apkPath = resolve(root, readArg("--apk") ?? defaultApkPath);
 const logPath = resolve(root, readArg("--log-output") ?? defaultLogPath);
 const reportPath = resolve(root, readArg("--report-output") ?? defaultReportPath);
+const summaryPath = resolve(root, readArg("--summary-output") ?? defaultSummaryPath);
 const session = readArg("--session") ?? "rnbench-android-release";
 const waitMs = readNumberArg("--wait-ms", 45_000);
+const runs = readNumberArg("--runs", 1);
+const allowNonHermes = hasArg("--allow-non-hermes");
 const keepSession = hasArg("--keep-session");
 
 type AgentJson<T> = {
@@ -55,6 +64,32 @@ type DeviceInfo = {
 
 type LogPathInfo = {
   path: string;
+};
+
+type CaseMetricSummary = {
+  max: number;
+  mean: number;
+  min: number;
+  samples: number[];
+};
+
+type RepeatedCaseSummary = {
+  id: string;
+  label: string;
+  p50: CaseMetricSummary;
+  p95: CaseMetricSummary;
+  unit: string;
+};
+
+type RepeatedBenchmarkSummary = {
+  cases: RepeatedCaseSummary[];
+  createdAt: string;
+  generatedBy: string;
+  metadata: BenchmarkMetadata;
+  runCount: number;
+  schemaVersion: "iris.benchmark.repeated.v1";
+  sourceReports: string[];
+  suite: BenchmarkSuiteReport["suite"];
 };
 
 function commandLine(command: string, args: string[]) {
@@ -151,17 +186,100 @@ function requireReleaseApk() {
   }
 }
 
-function extractBenchmarkReport() {
+function relativePath(path: string) {
+  return path.replace(`${root}/`, "");
+}
+
+function pathWithRunIndex(path: string, runIndex: number) {
+  const parsedPath = parse(path);
+  return resolve(parsedPath.dir, `${parsedPath.name}-run-${runIndex}${parsedPath.ext}`);
+}
+
+function summarizeMetric(samples: number[]): CaseMetricSummary {
+  if (samples.length === 0) {
+    throw new Error("Cannot summarize an empty metric sample set.");
+  }
+
+  return {
+    max: Math.max(...samples),
+    mean: Number(
+      (samples.reduce((total, sample) => total + sample, 0) / samples.length).toFixed(3),
+    ),
+    min: Math.min(...samples),
+    samples,
+  };
+}
+
+function extractBenchmarkReport(inputLogPath: string, outputReportPath: string) {
   runPassthrough("bun", [
     "run",
     "tools/bench/extract-hermes-report.ts",
-    `--input=${logPath}`,
-    `--output=${reportPath}`,
+    `--input=${inputLogPath}`,
+    `--output=${outputReportPath}`,
+    ...(allowNonHermes ? ["--allow-non-hermes"] : []),
     "--require-release",
     "--require-new-architecture",
+    "--require-case=iris-module-native-compute",
     "--require-case=turbomodule-number-round-trip",
     "--require-case=turbomodule-string-round-trip",
   ]);
+
+  return JSON.parse(readFileSync(outputReportPath, "utf8")) as BenchmarkSuiteReport;
+}
+
+function summarizeReports(reports: BenchmarkSuiteReport[], sourceReports: string[]) {
+  if (reports.length === 0) {
+    throw new Error("Cannot summarize an empty report set.");
+  }
+
+  const firstReport = reports[0];
+  const caseIds = firstReport.cases.map((benchmarkCase) => benchmarkCase.id);
+
+  const cases = caseIds.map((caseId): RepeatedCaseSummary => {
+    const matchingCases = reports.map((report) => {
+      const benchmarkCase = report.cases.find((candidate) => candidate.id === caseId);
+
+      if (benchmarkCase == null) {
+        throw new Error(`Report is missing case ${caseId}.`);
+      }
+
+      return benchmarkCase;
+    });
+    const [firstCase] = matchingCases as [BenchmarkCaseReport, ...BenchmarkCaseReport[]];
+
+    return {
+      id: caseId,
+      label: firstCase.label,
+      p50: summarizeMetric(matchingCases.map((benchmarkCase) => benchmarkCase.stats.p50)),
+      p95: summarizeMetric(matchingCases.map((benchmarkCase) => benchmarkCase.stats.p95)),
+      unit: firstCase.unit,
+    };
+  });
+
+  return {
+    cases,
+    createdAt: new Date().toISOString(),
+    generatedBy: "tools/bench/run-android-release-benchmark.ts",
+    metadata: firstReport.metadata,
+    runCount: reports.length,
+    schemaVersion: "iris.benchmark.repeated.v1",
+    sourceReports: sourceReports.map((sourceReport) => relativePath(sourceReport)),
+    suite: firstReport.suite,
+  } satisfies RepeatedBenchmarkSummary;
+}
+
+function writeRepeatedSummary(reports: BenchmarkSuiteReport[], sourceReports: string[]) {
+  const summary = summarizeReports(reports, sourceReports);
+
+  mkdirSync(dirname(summaryPath), { recursive: true });
+  writeFileSync(summaryPath, `${JSON.stringify(summary, null, 2)}\n`);
+
+  console.log(`Repeated Android release benchmark summary: ${summaryPath}`);
+  for (const result of summary.cases) {
+    console.log(
+      `${result.id}: p50(mean=${result.p50.mean}${result.unit}, min=${result.p50.min}${result.unit}, max=${result.p50.max}${result.unit}) p95(mean=${result.p95.mean}${result.unit}, min=${result.p95.min}${result.unit}, max=${result.p95.max}${result.unit})`,
+    );
+  }
 }
 
 function closeSession(sessionName: string) {
@@ -196,16 +314,17 @@ function openApp() {
   }
 }
 
-function runBenchmark() {
-  runAgent(["install", appId, apkPath, "--platform", "android"]);
-  closeSession(session);
-  openApp();
+function runBenchmarkIteration(runIndex: number) {
+  const nextLogPath = runs === 1 ? logPath : pathWithRunIndex(logPath, runIndex);
+  const nextReportPath = runs === 1 ? reportPath : pathWithRunIndex(reportPath, runIndex);
+
+  console.log(`Android release benchmark run ${runIndex}/${runs}`);
   runAgent(["wait", 'label="Run suite"', "10000", "--session", session, "--platform", "android"]);
   runAgent(["logs", "clear", "--restart", "--session", session, "--platform", "android"]);
   runAgent([
     "logs",
     "mark",
-    "before Android release benchmark",
+    `before Android release benchmark run ${runIndex}`,
     "--session",
     session,
     "--platform",
@@ -213,6 +332,7 @@ function runBenchmark() {
   ]);
   runAgent(["press", 'label="Run suite"', "--session", session, "--platform", "android"]);
   sleep(waitMs);
+  runAgent(["wait", 'label="Run suite"', "10000", "--session", session, "--platform", "android"]);
 
   const logPathOutput = runAgent([
     "logs",
@@ -224,9 +344,31 @@ function runBenchmark() {
     "--json",
   ]);
   const logPathResult = parseJsonOutput<AgentJson<LogPathInfo>>(logPathOutput);
-  copyFileSync(logPathResult.data.path, logPath);
+  copyFileSync(logPathResult.data.path, nextLogPath);
 
-  extractBenchmarkReport();
+  return {
+    report: extractBenchmarkReport(nextLogPath, nextReportPath),
+    reportPath: nextReportPath,
+  };
+}
+
+function runBenchmark() {
+  runAgent(["install", appId, apkPath, "--platform", "android"]);
+  closeSession(session);
+  openApp();
+
+  const reports: BenchmarkSuiteReport[] = [];
+  const sourceReports: string[] = [];
+
+  for (let runIndex = 1; runIndex <= runs; runIndex += 1) {
+    const result = runBenchmarkIteration(runIndex);
+    reports.push(result.report);
+    sourceReports.push(result.reportPath);
+  }
+
+  if (runs > 1 || readArg("--summary-output") != null) {
+    writeRepeatedSummary(reports, sourceReports);
+  }
 }
 
 function main() {
@@ -236,6 +378,7 @@ function main() {
 
   mkdirSync(dirname(logPath), { recursive: true });
   mkdirSync(dirname(reportPath), { recursive: true });
+  mkdirSync(dirname(summaryPath), { recursive: true });
 
   try {
     runBenchmark();

@@ -23,6 +23,8 @@ mise run sync-labels
 mise run perf
 mise run bench-smoke
 mise run bench-js
+mise run bench-android-release
+mise run bench-android-release-repeat
 mise run bench-extract-fixture
 mise run bench-extract-hermes
 mise run bench-extract-release-fixture
@@ -52,6 +54,7 @@ mise run check
 - React Native PoC 앱은 `apps/rn-bench`에 두고 `mise run rn-*` 명령으로 실행한다.
 - `rn-ios-build-debug`와 `rn-android-build-debug`는 네이티브 연결 확인용 로컬 빌드이며 성능 기준선으로 쓰지 않는다.
 - `rn-ios-build-release`와 `rn-android-build-release`는 최적화된 RN/Hermes 기준선 수집 전 release 빌드가 가능한지 확인한다.
-- `bench-extract-hermes-release`는 release, Hermes, New Architecture, TurboModule 경계 case를 모두 요구한다.
+- `bench-android-release-repeat`는 Android 물리 기기의 release APK에서 3회 반복 측정 summary를 남긴다.
+- `bench-extract-hermes-release`는 release, Hermes, New Architecture, Iris module compute, TurboModule 경계 case를 모두 요구한다.
 - 벤치마크 하네스는 `mise run bench-*` 명령으로 로컬에서만 실행한다. 아직 CI 필수 체크에는 넣지 않는다.
 - `mise run check`가 PR 전 기본 검증 경로이며 RN 타입체크와 smoke test를 포함한다.

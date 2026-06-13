@@ -115,6 +115,11 @@ description = "Build, install, run, and extract the Android physical release Her
 depends = ["rn-android-build-release"]
 run = "bun run bench:android-release"
 
+[tasks.bench-android-release-repeat]
+description = "Run three Android physical release Hermes benchmark iterations and write a summary"
+depends = ["rn-android-build-release"]
+run = "bun run bench:android-release:repeat"
+
 [tasks.bench-extract-hermes]
 description = "Extract a Hermes app benchmark report from artifacts/bench/metro-hermes.log"
 run = "bun run bench:extract-hermes --input=artifacts/bench/metro-hermes.log --output=artifacts/bench/hermes-baseline.json"

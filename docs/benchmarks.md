@@ -15,7 +15,9 @@ mise run bench-extract-release-fixture
 mise run bench-extract-android-release-fixture
 mise run rn-codegen
 mise run rn-android-build-debug
+mise run rn-android-build-iris-engine
 mise run rn-android-build-iris-release
+mise run rn-android-build-iris-release-local
 mise run rn-ios-build-debug
 mise run rn-android-build-release
 mise run rn-ios-build-release
@@ -32,7 +34,9 @@ mise run rn-ios-build-release
 - `rn-codegen`은 TurboModule spec이 RN codegen에서 생성되는지 로컬에서 확인한다.
 - `rn-android-build-debug`와 `rn-ios-build-debug`는 네이티브 연결 확인용이며 성능 기준선으로 쓰지 않는다. Android debug는 Hermes flavor를 기준으로 빌드한다.
 - `rn-android-build-release`와 `rn-ios-build-release`는 최적화된 RN/Hermes 기준선 수집 전 release 빌드를 확인한다. Android release는 Hermes flavor를 기준으로 빌드한다. iOS task는 simulator build 확인용이며 최종 성능 기준선은 물리 기기에서 남긴다.
+- `rn-android-build-iris-engine`은 로컬 Iris Android 엔진 AAR skeleton을 빌드한다.
 - `rn-android-build-iris-release`는 `IRIS_ENGINE_AAR`가 실제 RN 호환 Iris 엔진 artifact를 가리킬 때만 `irisRelease` APK를 빌드한다.
+- `rn-android-build-iris-release-local`은 로컬 skeleton AAR로 `irisRelease` APK 빌드 계약을 검증한다. 이 APK는 runtime 생성 시 의도적으로 실패하므로 성능 비교값으로 쓰지 않는다.
 - 이 명령들은 CI 필수 체크에 포함하지 않는다.
 
 ## 산출물
@@ -87,6 +91,14 @@ IRIS_ENGINE_AAR=/absolute/path/to/iris-engine.aar mise run rn-android-build-iris
 ```
 
 Iris AAR은 `docs/iris-android-engine-contract.md`의 `IrisJSRuntimeFactoryProvider.create(): JSRuntimeFactory` 계약을 제공해야 한다. 이 계약이 없으면 `irisRelease`는 컴파일 단계에서 실패한다.
+
+로컬 skeleton AAR로 계약만 확인할 때는 다음 명령을 사용한다.
+
+```sh
+mise run rn-android-build-iris-release-local
+```
+
+이 APK는 `libirisengine.so`와 hermesc bytecode bundle이 같이 패키징되는지 확인하기 위한 것이다. 아직 Iris runtime이 구현되지 않았으므로 벤치마크 비교값으로 쓰지 않는다.
 
 자동화 스크립트는 다른 엔진 APK가 생겼을 때 다음처럼 같은 하네스에 연결한다.
 

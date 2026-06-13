@@ -38,7 +38,9 @@ mise run rn-ios-build-debug
 mise run rn-ios-build-release
 mise run rn-android-build-debug
 mise run rn-android-build-release
+mise run rn-android-build-iris-engine
 mise run rn-android-build-iris-release
+mise run rn-android-build-iris-release-local
 mise run rn-codegen
 mise run rn-typecheck
 mise run rn-test
@@ -56,7 +58,9 @@ mise run check
 - React Native PoC 앱은 `apps/rn-bench`에 두고 `mise run rn-*` 명령으로 실행한다.
 - `rn-ios-build-debug`와 `rn-android-build-debug`는 네이티브 연결 확인용 로컬 빌드이며 성능 기준선으로 쓰지 않는다. Android debug는 Hermes flavor를 기준으로 한다.
 - `rn-ios-build-release`와 `rn-android-build-release`는 최적화된 RN/Hermes 기준선 수집 전 release 빌드가 가능한지 확인한다. Android release는 Hermes flavor를 기준으로 한다.
+- `rn-android-build-iris-engine`은 로컬 Iris Android 엔진 AAR skeleton을 빌드한다.
 - `rn-android-build-iris-release`는 `IRIS_ENGINE_AAR`가 실제 RN 호환 Iris 엔진 artifact를 가리킬 때만 Iris release APK를 빌드한다. AAR 계약은 `docs/iris-android-engine-contract.md`를 따른다.
+- `rn-android-build-iris-release-local`은 로컬 skeleton AAR을 `irisRelease`에 주입해 앱과 엔진 AAR 계약을 확인한다.
 - `bench-android-release-repeat`는 Android 물리 기기의 release APK에서 3회 반복 측정 summary를 남긴다.
 - `bench-android-engine-compare`는 Hermes/Iris release APK를 같은 물리 기기에서 순서대로 측정한다.
 - `bench-extract-hermes-release`는 release, Hermes, New Architecture, Iris module compute, TurboModule 경계 case를 모두 요구한다.

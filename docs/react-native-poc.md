@@ -32,7 +32,9 @@ mise run rn-typecheck
 mise run rn-test
 mise run rn-codegen
 mise run rn-android-build-debug
+mise run rn-android-build-iris-engine
 mise run rn-android-build-iris-release
+mise run rn-android-build-iris-release-local
 mise run rn-ios-build-debug
 mise run rn-android-build-release
 mise run rn-ios-build-release

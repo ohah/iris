@@ -156,6 +156,7 @@ class IrisRuntime final : public jsi::Runtime {
     uint32_t globalFunctionName;
     uint32_t globalFunctionParamCount;
     uint32_t globalFunctionFrameSize;
+    uint32_t globalInstructionCount;
   };
 
   struct IrisPreparedJavaScript final : public jsi::PreparedJavaScript {

@@ -33,6 +33,7 @@ mod ffi {
         pub global_function_name: u32,
         pub global_function_param_count: u32,
         pub global_function_frame_size: u32,
+        pub global_instruction_count: u32,
         pub debug_info_offset: u32,
         pub options: u8,
     }
@@ -54,6 +55,9 @@ pub const HERMES_BYTECODE_FOOTER_SIZE: usize = 20;
 /// Byte alignment used by Hermes bytecode file sections.
 pub const HERMES_BYTECODE_ALIGNMENT: usize = 4;
 
+/// Number of opcodes in the Hermes bytecode table mirrored by Iris.
+pub const HERMES_OPCODE_COUNT: usize = 220;
+
 const HERMES_SOURCE_HASH_SIZE: usize = 20;
 const SMALL_FUNC_HEADER_SIZE: usize = 12;
 const LARGE_FUNC_HEADER_SIZE: usize = 36;
@@ -65,6 +69,15 @@ const SHAPE_TABLE_ENTRY_SIZE: usize = 8;
 const BIG_INT_TABLE_ENTRY_SIZE: usize = 8;
 const REG_EXP_TABLE_ENTRY_SIZE: usize = 8;
 const U32_PAIR_ENTRY_SIZE: usize = 8;
+const HERMES_OPCODE_WIDTHS: [u8; HERMES_OPCODE_COUNT] = [
+    1, 6, 10, 11, 12, 2, 3, 8, 10, 4, 5, 3, 4, 4, 3, 3, 3, 9, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 3, 3, 4, 4, 5, 5, 3, 4, 3, 4, 5, 4, 5, 4, 5, 2,
+    2, 3, 3, 6, 7, 5, 5, 6, 8, 9, 6, 8, 6, 6, 8, 8, 6, 6, 8, 8, 4, 7, 4, 7, 6, 8, 4, 7, 4, 5, 5, 4,
+    4, 5, 4, 4, 6, 5, 4, 5, 5, 6, 5, 6, 4, 4, 4, 5, 5, 6, 7, 5, 7, 4, 7, 3, 2, 2, 4, 2, 3, 3, 2, 1,
+    1, 3, 6, 8, 7, 9, 5, 7, 4, 5, 4, 3, 6, 3, 6, 10, 4, 6, 4, 6, 2, 2, 2, 2, 2, 2, 3, 2, 3, 3, 3,
+    3, 3, 6, 4, 4, 3, 2, 2, 3, 14, 18, 18, 5, 7, 3, 4, 3, 3, 2, 5, 3, 6, 3, 6, 3, 6, 8, 4, 7, 4, 7,
+    4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7,
+];
 
 const MAGIC_OFFSET: usize = 0;
 const VERSION_OFFSET: usize = 8;
@@ -157,6 +170,59 @@ impl<'a> HermesBytecode<'a> {
     /// header points outside the bytecode file.
     pub fn global_function_header(self) -> Result<HermesFunctionHeader, ParseError> {
         self.function_header(self.header.global_code_index)
+    }
+
+    /// Returns the bytecode body for one function.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParseError`] if `function_id` is invalid or the function
+    /// header points outside the bytecode file.
+    pub fn function_body(self, function_id: u32) -> Result<SectionView<'a>, ParseError> {
+        let function_header = self.function_header(function_id)?;
+        function_body(self.bytes, function_id, function_header)
+    }
+
+    /// Returns the global function bytecode body.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParseError`] if the global function header cannot be read.
+    pub fn global_function_body(self) -> Result<SectionView<'a>, ParseError> {
+        self.function_body(self.header.global_code_index)
+    }
+
+    /// Returns an iterator over one function's Hermes instructions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParseError`] if `function_id` is invalid or the function
+    /// body is not a valid instruction stream.
+    pub fn function_instructions(
+        self,
+        function_id: u32,
+    ) -> Result<HermesInstructionStream<'a>, ParseError> {
+        let body = self.function_body(function_id)?;
+        Ok(HermesInstructionStream::new(function_id, body))
+    }
+
+    /// Counts decoded Hermes instructions in one function.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParseError`] if `function_id` is invalid or the function
+    /// body is not a valid instruction stream.
+    pub fn function_instruction_count(self, function_id: u32) -> Result<u32, ParseError> {
+        count_function_instructions(function_id, self.function_body(function_id)?)
+    }
+
+    /// Counts decoded Hermes instructions in the global function.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParseError`] if the global function body cannot be decoded.
+    pub fn global_instruction_count(self) -> Result<u32, ParseError> {
+        self.function_instruction_count(self.header.global_code_index)
     }
 }
 
@@ -523,6 +589,82 @@ impl HermesFunctionHeader {
     }
 }
 
+/// One decoded Hermes bytecode instruction boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HermesInstruction {
+    /// File offset of the instruction opcode byte.
+    pub offset: u32,
+    /// Raw Hermes opcode value.
+    pub opcode: u8,
+    /// Instruction size including the opcode byte and all operands.
+    pub width: u8,
+}
+
+/// Iterator over a Hermes function bytecode body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HermesInstructionStream<'a> {
+    function_id: u32,
+    body: SectionView<'a>,
+    cursor: usize,
+    finished: bool,
+}
+
+impl<'a> HermesInstructionStream<'a> {
+    fn new(function_id: u32, body: SectionView<'a>) -> Self {
+        Self {
+            function_id,
+            body,
+            cursor: 0,
+            finished: false,
+        }
+    }
+}
+
+impl Iterator for HermesInstructionStream<'_> {
+    type Item = Result<HermesInstruction, ParseError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished || self.cursor >= self.body.bytes.len() {
+            return None;
+        }
+
+        let offset = self.body.offset
+            + u32::try_from(self.cursor).expect(
+                "validated Hermes instruction cursor fits in u32 because file length is u32",
+            );
+        let opcode = self.body.bytes[self.cursor];
+        let width = match hermes_opcode_width(opcode) {
+            Some(width) => width,
+            None => {
+                self.finished = true;
+                return Some(Err(ParseError::InvalidOpcode {
+                    function_id: self.function_id,
+                    offset,
+                    opcode,
+                }));
+            }
+        };
+        let next_cursor = self.cursor + usize::from(width);
+        if next_cursor > self.body.bytes.len() {
+            self.finished = true;
+            return Some(Err(ParseError::InstructionOutOfBounds {
+                function_id: self.function_id,
+                offset,
+                opcode,
+                width,
+                body_end: self.body.offset + self.body.len(),
+            }));
+        }
+
+        self.cursor = next_cursor;
+        Some(Ok(HermesInstruction {
+            offset,
+            opcode,
+            width,
+        }))
+    }
+}
+
 /// Parsed Hermes bytecode file header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HermesBytecodeHeader {
@@ -789,8 +931,30 @@ pub enum ParseError {
         size: u32,
         /// First valid function body offset.
         function_bodies_offset: u32,
-        /// Last accepted function body byte offset.
+        /// Exclusive function body region end offset.
         limit: u32,
+    },
+    /// A function bytecode body contains an opcode not known to this Hermes table.
+    InvalidOpcode {
+        /// Function id whose instruction stream is invalid.
+        function_id: u32,
+        /// File offset of the invalid opcode.
+        offset: u32,
+        /// Raw opcode byte.
+        opcode: u8,
+    },
+    /// An instruction's declared operand width exceeds the function body.
+    InstructionOutOfBounds {
+        /// Function id whose instruction stream is invalid.
+        function_id: u32,
+        /// File offset of the opcode.
+        offset: u32,
+        /// Raw opcode byte.
+        opcode: u8,
+        /// Instruction width in bytes.
+        width: u8,
+        /// Exclusive end offset of the function body.
+        body_end: u32,
     },
     /// A CommonJS module table entry references an invalid function or string id.
     InvalidCjsModuleEntry {
@@ -918,6 +1082,24 @@ impl fmt::Display for ParseError {
                 formatter,
                 "Hermes bytecode function {function_id} body at {offset} with size {size} is outside function body region {function_bodies_offset}..{limit}",
             ),
+            Self::InvalidOpcode {
+                function_id,
+                offset,
+                opcode,
+            } => write!(
+                formatter,
+                "Hermes bytecode function {function_id} has invalid opcode {opcode} at {offset}",
+            ),
+            Self::InstructionOutOfBounds {
+                function_id,
+                offset,
+                opcode,
+                width,
+                body_end,
+            } => write!(
+                formatter,
+                "Hermes bytecode function {function_id} instruction opcode {opcode} at {offset} has width {width}, exceeding function body end {body_end}",
+            ),
             Self::InvalidCjsModuleEntry {
                 entry_index,
                 first,
@@ -946,6 +1128,7 @@ fn parse_hbc_metadata(bytes: &[u8]) -> Result<ffi::HbcMetadata, ParseError> {
     let header = bytecode.header();
     let sections = bytecode.sections();
     let global_function = bytecode.global_function_header()?;
+    let global_instruction_count = bytecode.global_instruction_count()?;
     Ok(ffi::HbcMetadata {
         version: header.version,
         file_length: header.file_length,
@@ -971,6 +1154,7 @@ fn parse_hbc_metadata(bytes: &[u8]) -> Result<ffi::HbcMetadata, ParseError> {
         global_function_name: global_function.function_name,
         global_function_param_count: global_function.param_count,
         global_function_frame_size: global_function.frame_size,
+        global_instruction_count,
         debug_info_offset: header.debug_info_offset,
         options: header.options.flags(),
     })
@@ -1133,12 +1317,28 @@ struct DecodedSmallFunctionHeader {
     overflowed: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DecodedFunctionHeader {
+    header: HermesFunctionHeader,
+    large_header_offset: Option<u32>,
+}
+
 fn function_header_at(
     bytes: &[u8],
     header: HermesBytecodeHeader,
     function_headers: SectionView<'_>,
     function_id: u32,
 ) -> Result<HermesFunctionHeader, ParseError> {
+    decoded_function_header_at(bytes, header, function_headers, function_id)
+        .map(|decoded| decoded.header)
+}
+
+fn decoded_function_header_at(
+    bytes: &[u8],
+    header: HermesBytecodeHeader,
+    function_headers: SectionView<'_>,
+    function_id: u32,
+) -> Result<DecodedFunctionHeader, ParseError> {
     if function_id >= header.function_count {
         return Err(ParseError::InvalidFunctionIndex {
             function_id,
@@ -1152,7 +1352,10 @@ fn function_header_at(
     let small_header = &function_headers.bytes[offset..offset + SMALL_FUNC_HEADER_SIZE];
     let decoded = parse_small_function_header(small_header);
     if !decoded.overflowed {
-        return Ok(decoded.header);
+        return Ok(DecodedFunctionHeader {
+            header: decoded.header,
+            large_header_offset: None,
+        });
     }
 
     let large_header_offset = large_header_offset_from_small(decoded.header);
@@ -1175,9 +1378,10 @@ fn function_header_at(
         });
     }
 
-    Ok(parse_large_function_header(
-        &bytes[large_header_start..large_header_end],
-    ))
+    Ok(DecodedFunctionHeader {
+        header: parse_large_function_header(&bytes[large_header_start..large_header_end]),
+        large_header_offset: Some(large_header_offset),
+    })
 }
 
 fn parse_small_function_header(bytes: &[u8]) -> DecodedSmallFunctionHeader {
@@ -1234,20 +1438,27 @@ fn validate_function_headers(
     function_headers: SectionView<'_>,
     function_bodies_offset: u32,
 ) -> Result<(), ParseError> {
+    let body_limit = function_body_limit(bytes, header, function_headers)?;
     for function_id in 0..header.function_count {
         let function_header = function_header_at(bytes, header, function_headers, function_id)?;
-        validate_function_body(function_id, function_header, header, function_bodies_offset)?;
+        validate_function_body(
+            bytes,
+            function_id,
+            function_header,
+            function_bodies_offset,
+            body_limit,
+        )?;
     }
     Ok(())
 }
 
 fn validate_function_body(
+    bytes: &[u8],
     function_id: u32,
     function_header: HermesFunctionHeader,
-    header: HermesBytecodeHeader,
     function_bodies_offset: u32,
+    limit: u32,
 ) -> Result<(), ParseError> {
-    let limit = function_body_limit(header);
     let body_end = function_header
         .offset
         .checked_add(function_header.bytecode_size_in_bytes);
@@ -1260,17 +1471,85 @@ fn validate_function_body(
             limit,
         });
     }
-    Ok(())
+    validate_instruction_stream(
+        function_id,
+        function_body(bytes, function_id, function_header)?,
+    )
 }
 
-fn function_body_limit(header: HermesBytecodeHeader) -> u32 {
-    if header.debug_info_offset == 0 {
+fn function_body_limit(
+    bytes: &[u8],
+    header: HermesBytecodeHeader,
+    function_headers: SectionView<'_>,
+) -> Result<u32, ParseError> {
+    let fallback = if header.debug_info_offset == 0 {
         header
             .file_length
             .saturating_sub(HERMES_BYTECODE_FOOTER_SIZE as u32)
     } else {
         header.debug_info_offset
+    };
+
+    let mut limit = fallback;
+    for function_id in 0..header.function_count {
+        let decoded = decoded_function_header_at(bytes, header, function_headers, function_id)?;
+        if let Some(large_header_offset) = decoded.large_header_offset {
+            limit = limit.min(large_header_offset);
+        }
     }
+    Ok(limit)
+}
+
+fn function_body<'a>(
+    bytes: &'a [u8],
+    function_id: u32,
+    function_header: HermesFunctionHeader,
+) -> Result<SectionView<'a>, ParseError> {
+    let start = usize::try_from(function_header.offset)
+        .expect("u32 always fits in usize on supported targets");
+    let size = usize::try_from(function_header.bytecode_size_in_bytes)
+        .expect("u32 always fits in usize on supported targets");
+    let end = start
+        .checked_add(size)
+        .ok_or(ParseError::FunctionBodyOutOfBounds {
+            function_id,
+            offset: function_header.offset,
+            size: function_header.bytecode_size_in_bytes,
+            function_bodies_offset: function_header.offset,
+            limit: u32::MAX,
+        })?;
+    let body = bytes
+        .get(start..end)
+        .ok_or(ParseError::FunctionBodyOutOfBounds {
+            function_id,
+            offset: function_header.offset,
+            size: function_header.bytecode_size_in_bytes,
+            function_bodies_offset: 0,
+            limit: u32::try_from(bytes.len()).unwrap_or(u32::MAX),
+        })?;
+    Ok(SectionView {
+        offset: function_header.offset,
+        bytes: body,
+    })
+}
+
+fn validate_instruction_stream(function_id: u32, body: SectionView<'_>) -> Result<(), ParseError> {
+    count_function_instructions(function_id, body).map(|_| ())
+}
+
+fn count_function_instructions(function_id: u32, body: SectionView<'_>) -> Result<u32, ParseError> {
+    let mut count = 0_u32;
+    for instruction in HermesInstructionStream::new(function_id, body) {
+        instruction?;
+        count = count
+            .checked_add(1)
+            .expect("instruction count cannot exceed u32 because HBC file length is u32");
+    }
+    Ok(count)
+}
+
+fn hermes_opcode_width(opcode: u8) -> Option<u8> {
+    HERMES_OPCODE_WIDTHS.get(usize::from(opcode)).copied()
 }
 
 fn validate_cjs_module_table(bytes: &[u8], header: HermesBytecodeHeader) -> Result<(), ParseError> {
@@ -1330,6 +1609,9 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const RET_OPCODE: u8 = 118;
+    const LOAD_CONST_DOUBLE_OPCODE: u8 = 141;
 
     fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
         bytes[offset..offset + size_of::<u32>()].copy_from_slice(&value.to_le_bytes());
@@ -1409,11 +1691,30 @@ mod tests {
         })
     }
 
+    fn encode_large_function_header(
+        header: SmallFunctionHeaderFixture,
+    ) -> [u8; LARGE_FUNC_HEADER_SIZE] {
+        let mut bytes = [0; LARGE_FUNC_HEADER_SIZE];
+        bytes[0..4].copy_from_slice(&header.offset.to_le_bytes());
+        bytes[4..8].copy_from_slice(&header.param_count.to_le_bytes());
+        bytes[8..12].copy_from_slice(&header.loop_depth.to_le_bytes());
+        bytes[12..16].copy_from_slice(&header.bytecode_size_in_bytes.to_le_bytes());
+        bytes[16..20].copy_from_slice(&header.function_name.to_le_bytes());
+        bytes[20..24].copy_from_slice(&header.number_reg_count.to_le_bytes());
+        bytes[24..28].copy_from_slice(&header.non_ptr_reg_count.to_le_bytes());
+        bytes[28..32].copy_from_slice(&u32::from(header.frame_size).to_le_bytes());
+        bytes[32] = header.read_cache_size;
+        bytes[33] = header.write_cache_size;
+        bytes[34] = header.private_name_cache_size;
+        bytes[35] = header.flags;
+        bytes
+    }
+
     fn fixture_header() -> Vec<u8> {
         let mut bytes = vec![0; HERMES_BYTECODE_HEADER_SIZE];
         bytes[MAGIC_OFFSET..MAGIC_OFFSET + size_of::<u64>()]
             .copy_from_slice(&HERMES_BYTECODE_MAGIC.to_le_bytes());
-        write_u32(&mut bytes, VERSION_OFFSET, 98);
+        write_u32(&mut bytes, VERSION_OFFSET, 99);
         bytes[SOURCE_HASH_OFFSET..SOURCE_HASH_OFFSET + HERMES_SOURCE_HASH_SIZE]
             .copy_from_slice(&[7; HERMES_SOURCE_HASH_SIZE]);
         write_u32(
@@ -1448,7 +1749,7 @@ mod tests {
         let mut bytes = vec![0; HERMES_BYTECODE_HEADER_SIZE];
         bytes[MAGIC_OFFSET..MAGIC_OFFSET + size_of::<u64>()]
             .copy_from_slice(&HERMES_BYTECODE_MAGIC.to_le_bytes());
-        write_u32(&mut bytes, VERSION_OFFSET, 98);
+        write_u32(&mut bytes, VERSION_OFFSET, 99);
         bytes[SOURCE_HASH_OFFSET..SOURCE_HASH_OFFSET + HERMES_SOURCE_HASH_SIZE]
             .copy_from_slice(&[7; HERMES_SOURCE_HASH_SIZE]);
         write_u32(&mut bytes, GLOBAL_CODE_INDEX_OFFSET, 1);
@@ -1512,7 +1813,7 @@ mod tests {
         );
 
         let function_bodies_offset = bytes.len();
-        bytes.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        bytes.extend_from_slice(&[RET_OPCODE, 0, RET_OPCODE, 0]);
         bytes[function_headers_offset..function_headers_offset + SMALL_FUNC_HEADER_SIZE]
             .copy_from_slice(&encode_small_function_header(SmallFunctionHeaderFixture {
                 offset: u32::try_from(function_bodies_offset)
@@ -1568,7 +1869,7 @@ mod tests {
         let header = bytecode.header();
 
         assert!(std::ptr::eq(bytecode.bytes().as_ptr(), bytes.as_ptr()));
-        assert_eq!(header.version, 98);
+        assert_eq!(header.version, 99);
         assert_eq!(header.source_hash, [7; HERMES_SOURCE_HASH_SIZE]);
         assert_eq!(header.file_length, bytes.len() as u32);
         assert_eq!(header.global_code_index, 1);
@@ -1595,7 +1896,7 @@ mod tests {
         let bytes = fixture_bytecode();
         let metadata = parse_hbc_metadata(&bytes).expect("valid Hermes bytecode metadata");
 
-        assert_eq!(metadata.version, 98);
+        assert_eq!(metadata.version, 99);
         assert_eq!(metadata.file_length, bytes.len() as u32);
         assert_eq!(metadata.global_code_index, 1);
         assert_eq!(metadata.function_count, 2);
@@ -1615,6 +1916,7 @@ mod tests {
         assert_eq!(metadata.global_function_name, 1);
         assert_eq!(metadata.global_function_param_count, 2);
         assert_eq!(metadata.global_function_frame_size, 5);
+        assert_eq!(metadata.global_instruction_count, 1);
         assert_eq!(metadata.options, 0);
     }
 
@@ -1655,6 +1957,35 @@ mod tests {
         assert_eq!(second.write_cache_size, 4);
         assert_eq!(second.private_name_cache_size, 0);
         assert!(second.strict_mode());
+    }
+
+    #[test]
+    fn iterates_function_instructions() {
+        let bytes = fixture_bytecode();
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid Hermes bytecode");
+        let global_body = bytecode
+            .global_function_body()
+            .expect("valid global function body");
+
+        assert_eq!(global_body.bytes(), &[RET_OPCODE, 0]);
+        assert_eq!(bytecode.global_instruction_count(), Ok(1));
+
+        let instructions = bytecode
+            .function_instructions(1)
+            .expect("valid instruction stream")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("valid instructions");
+        assert_eq!(
+            instructions,
+            vec![HermesInstruction {
+                offset: bytecode
+                    .global_function_header()
+                    .expect("global header")
+                    .offset,
+                opcode: RET_OPCODE,
+                width: 2,
+            }],
+        );
     }
 
     #[test]
@@ -1812,6 +2143,120 @@ mod tests {
                 size: 2,
                 function_bodies_offset,
                 limit: debug_info_offset,
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_function_body_that_overlaps_function_info() {
+        let mut bytes = fixture_bytecode();
+        let (function_headers_offset, function_bodies_offset, debug_info_offset) = {
+            let bytecode = HermesBytecode::parse(&bytes).expect("valid fixture");
+            (
+                bytecode.sections().function_headers().offset() as usize,
+                bytecode.sections().function_bodies_offset(),
+                bytecode.header().debug_info_offset,
+            )
+        };
+        let large_header_offset = debug_info_offset;
+        let insert_offset =
+            usize::try_from(large_header_offset).expect("test fixture offset fits in usize");
+        bytes.splice(insert_offset..insert_offset, [0; LARGE_FUNC_HEADER_SIZE]);
+        let new_debug_info_offset = debug_info_offset + LARGE_FUNC_HEADER_SIZE as u32;
+        let new_file_length = u32::try_from(bytes.len()).expect("test fixture length fits in u32");
+        write_u32(&mut bytes, DEBUG_INFO_OFFSET_OFFSET, new_debug_info_offset);
+        write_u32(&mut bytes, FILE_LENGTH_OFFSET, new_file_length);
+        bytes[insert_offset..insert_offset + LARGE_FUNC_HEADER_SIZE].copy_from_slice(
+            &encode_large_function_header(SmallFunctionHeaderFixture {
+                offset: function_bodies_offset,
+                bytecode_size_in_bytes: 2,
+                param_count: 1,
+                loop_depth: 0,
+                function_name: 0,
+                number_reg_count: 2,
+                non_ptr_reg_count: 1,
+                frame_size: 4,
+                read_cache_size: 1,
+                write_cache_size: 2,
+                private_name_cache_size: 1,
+                flags: 0b0001_0100,
+            }),
+        );
+        bytes[function_headers_offset..function_headers_offset + SMALL_FUNC_HEADER_SIZE]
+            .copy_from_slice(&encode_overflow_function_header(large_header_offset));
+        bytes[function_headers_offset + SMALL_FUNC_HEADER_SIZE
+            ..function_headers_offset + SMALL_FUNC_HEADER_SIZE * 2]
+            .copy_from_slice(&encode_small_function_header(SmallFunctionHeaderFixture {
+                offset: function_bodies_offset + 2,
+                bytecode_size_in_bytes: LARGE_FUNC_HEADER_SIZE as u32,
+                param_count: 2,
+                loop_depth: 1,
+                function_name: 1,
+                number_reg_count: 3,
+                non_ptr_reg_count: 2,
+                frame_size: 5,
+                read_cache_size: 3,
+                write_cache_size: 4,
+                private_name_cache_size: 0,
+                flags: 0b0000_0100,
+            }));
+
+        let error = HermesBytecode::parse(&bytes)
+            .expect_err("function body overlapping function info must fail");
+        assert_eq!(
+            error,
+            ParseError::FunctionBodyOutOfBounds {
+                function_id: 1,
+                offset: function_bodies_offset + 2,
+                size: LARGE_FUNC_HEADER_SIZE as u32,
+                function_bodies_offset,
+                limit: large_header_offset,
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_opcode_in_function_body() {
+        let mut bytes = fixture_bytecode();
+        let function_body_offset = HermesBytecode::parse(&bytes)
+            .expect("valid fixture")
+            .function_body(0)
+            .expect("valid function body")
+            .offset() as usize;
+        bytes[function_body_offset] = 0xff;
+
+        let error = HermesBytecode::parse(&bytes).expect_err("invalid opcode must fail");
+        assert_eq!(
+            error,
+            ParseError::InvalidOpcode {
+                function_id: 0,
+                offset: function_body_offset as u32,
+                opcode: 0xff,
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_instruction_that_exceeds_function_body() {
+        let mut bytes = fixture_bytecode();
+        let (function_body_offset, function_body_end) = {
+            let body = HermesBytecode::parse(&bytes)
+                .expect("valid fixture")
+                .function_body(0)
+                .expect("valid function body");
+            (body.offset() as usize, body.offset() + body.len())
+        };
+        bytes[function_body_offset] = LOAD_CONST_DOUBLE_OPCODE;
+
+        let error = HermesBytecode::parse(&bytes).expect_err("wide instruction must fail");
+        assert_eq!(
+            error,
+            ParseError::InstructionOutOfBounds {
+                function_id: 0,
+                offset: function_body_offset as u32,
+                opcode: LOAD_CONST_DOUBLE_OPCODE,
+                width: 10,
+                body_end: function_body_end,
             },
         );
     }

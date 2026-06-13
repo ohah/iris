@@ -82,6 +82,7 @@ android {
     namespace "com.iris.bench"
     defaultConfig {
         applicationId "com.iris.bench"
+        manifestPlaceholders["appLabel"] = "IrisBench"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1
@@ -91,11 +92,14 @@ android {
     productFlavors {
         hermes {
             dimension "engine"
+            applicationId "com.iris.bench.hermes"
+            manifestPlaceholders["appLabel"] = "IrisBench Hermes"
             buildConfigField "String", "IRIS_ENGINE_FLAVOR", "\"hermes\""
         }
         iris {
             dimension "engine"
-            applicationIdSuffix ".iris"
+            applicationId "com.iris.bench.iris"
+            manifestPlaceholders["appLabel"] = "IrisBench Iris"
             buildConfigField "String", "IRIS_ENGINE_FLAVOR", "\"iris\""
         }
     }

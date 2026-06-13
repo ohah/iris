@@ -2,13 +2,19 @@
 
 #include <jsi/jsi.h>
 
+#include <memory>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
 namespace iris::runtime {
 
 namespace jsi = facebook::jsi;
 
 class IrisRuntime final : public jsi::Runtime {
  public:
-  IrisRuntime() = default;
+  IrisRuntime();
   ~IrisRuntime() override = default;
 
   jsi::Value evaluateJavaScript(
@@ -120,6 +126,53 @@ class IrisRuntime final : public jsi::Runtime {
   bool instanceOf(const jsi::Object&, const jsi::Function&) override;
 
   void setExternalMemoryPressure(const jsi::Object&, size_t) override;
+
+ private:
+  struct ObjectState {
+    std::unordered_map<std::string, std::shared_ptr<jsi::Value>> properties;
+    std::shared_ptr<jsi::HostObject> hostObject;
+    std::optional<jsi::HostFunctionType> hostFunction;
+    std::shared_ptr<jsi::NativeState> nativeState;
+    std::vector<std::shared_ptr<jsi::Value>> elements;
+    bool isArray{false};
+  };
+
+  struct PointerState final : public PointerValue {
+    enum class Kind {
+      PropNameID,
+      String,
+      Object,
+    };
+
+    explicit PointerState(std::string text, Kind kind);
+    explicit PointerState(std::shared_ptr<ObjectState> object);
+
+    void invalidate() noexcept override;
+
+    Kind kind;
+    std::string text;
+    std::shared_ptr<ObjectState> object;
+  };
+
+  PointerState& pointerState(const PointerValue*) const;
+  PointerState& pointerState(const jsi::Object&) const;
+  PointerState& pointerState(const jsi::String&) const;
+  PointerState& pointerState(const jsi::PropNameID&) const;
+  std::shared_ptr<ObjectState> objectState(const jsi::Object&) const;
+  std::string propertyKey(const jsi::PropNameID&) const;
+  std::string propertyKey(const jsi::String&) const;
+  std::shared_ptr<jsi::Value> copyValue(const jsi::Value&);
+
+  jsi::Object makeObject(std::shared_ptr<ObjectState>);
+  jsi::Value makeObjectValue(std::shared_ptr<ObjectState>);
+  jsi::Value makeFunctionValue(
+      std::string name,
+      unsigned int paramCount,
+      jsi::HostFunctionType);
+
+  void installBootstrapGlobals();
+
+  std::shared_ptr<ObjectState> globalObject_;
 };
 
 } // namespace iris::runtime

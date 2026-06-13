@@ -151,6 +151,11 @@ class IrisRuntime final : public jsi::Runtime {
     uint32_t cjsModuleTableOffset;
     uint32_t cjsModuleTableSize;
     uint32_t functionBodiesOffset;
+    uint32_t globalFunctionOffset;
+    uint32_t globalFunctionSize;
+    uint32_t globalFunctionName;
+    uint32_t globalFunctionParamCount;
+    uint32_t globalFunctionFrameSize;
   };
 
   struct IrisPreparedJavaScript final : public jsi::PreparedJavaScript {

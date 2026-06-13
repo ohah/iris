@@ -28,6 +28,11 @@ mod ffi {
         pub function_source_table_offset: u32,
         pub function_source_table_size: u32,
         pub function_bodies_offset: u32,
+        pub global_function_offset: u32,
+        pub global_function_size: u32,
+        pub global_function_name: u32,
+        pub global_function_param_count: u32,
+        pub global_function_frame_size: u32,
         pub debug_info_offset: u32,
         pub options: u8,
     }
@@ -51,6 +56,7 @@ pub const HERMES_BYTECODE_ALIGNMENT: usize = 4;
 
 const HERMES_SOURCE_HASH_SIZE: usize = 20;
 const SMALL_FUNC_HEADER_SIZE: usize = 12;
+const LARGE_FUNC_HEADER_SIZE: usize = 36;
 const STRING_KIND_ENTRY_SIZE: usize = 4;
 const IDENTIFIER_HASH_SIZE: usize = 4;
 const SMALL_STRING_TABLE_ENTRY_SIZE: usize = 4;
@@ -126,6 +132,31 @@ impl<'a> HermesBytecode<'a> {
     #[must_use]
     pub const fn sections(self) -> HermesBytecodeSections<'a> {
         self.sections
+    }
+
+    /// Returns one parsed function header by function id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParseError`] if `function_id` is out of range or an overflow
+    /// header points outside the bytecode file.
+    pub fn function_header(self, function_id: u32) -> Result<HermesFunctionHeader, ParseError> {
+        function_header_at(
+            self.bytes,
+            self.header,
+            self.sections.function_headers,
+            function_id,
+        )
+    }
+
+    /// Returns the parsed global function header.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParseError`] if the global function id is invalid or its
+    /// header points outside the bytecode file.
+    pub fn global_function_header(self) -> Result<HermesFunctionHeader, ParseError> {
+        self.function_header(self.header.global_code_index)
     }
 }
 
@@ -278,6 +309,9 @@ impl<'a> HermesBytecodeSections<'a> {
             header.overflow_string_count,
             header.string_storage_size,
         )?;
+        validate_function_headers(bytes, header, function_headers, function_bodies_offset)?;
+        validate_cjs_module_table(cjs_module_table.bytes, header)?;
+        validate_function_source_table(function_source_table.bytes, header)?;
 
         if cursor
             .checked_add(HERMES_BYTECODE_FOOTER_SIZE)
@@ -437,6 +471,55 @@ impl<'a> SectionView<'a> {
     #[must_use]
     pub const fn bytes(self) -> &'a [u8] {
         self.bytes
+    }
+}
+
+/// Parsed Hermes runtime function header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HermesFunctionHeader {
+    /// Offset of this function's bytecode body from the start of the file.
+    pub offset: u32,
+    /// Bytecode body size in bytes.
+    pub bytecode_size_in_bytes: u32,
+    /// Number of declared parameters.
+    pub param_count: u32,
+    /// Function loop nesting depth.
+    pub loop_depth: u32,
+    /// String table id of the function name.
+    pub function_name: u32,
+    /// Count of number registers.
+    pub number_reg_count: u32,
+    /// Count of non-pointer registers.
+    pub non_ptr_reg_count: u32,
+    /// Stack frame size.
+    pub frame_size: u32,
+    /// Read cache size.
+    pub read_cache_size: u8,
+    /// Write cache size.
+    pub write_cache_size: u8,
+    /// Private name cache size.
+    pub private_name_cache_size: u8,
+    /// Raw Hermes function header flag byte.
+    pub flags: u8,
+}
+
+impl HermesFunctionHeader {
+    /// Returns whether this function is strict mode.
+    #[must_use]
+    pub const fn strict_mode(self) -> bool {
+        self.flags & 0b0000_0100 != 0
+    }
+
+    /// Returns whether this function has an exception handler table.
+    #[must_use]
+    pub const fn has_exception_handler(self) -> bool {
+        self.flags & 0b0000_1000 != 0
+    }
+
+    /// Returns whether this function has debug info.
+    #[must_use]
+    pub const fn has_debug_info(self) -> bool {
+        self.flags & 0b0001_0000 != 0
     }
 }
 
@@ -680,6 +763,55 @@ pub enum ParseError {
         /// Declared string storage byte length.
         storage_size: u32,
     },
+    /// A requested function id is outside the function table.
+    InvalidFunctionIndex {
+        /// Function id being read.
+        function_id: u32,
+        /// Declared function count.
+        function_count: u32,
+    },
+    /// A small function header's overflow pointer is outside the bytecode.
+    LargeFunctionHeaderOutOfBounds {
+        /// Function id whose header overflowed.
+        function_id: u32,
+        /// File offset of the large function header.
+        offset: u32,
+        /// Declared bytecode file length.
+        file_length: u32,
+    },
+    /// A function header points to bytecode outside the executable function region.
+    FunctionBodyOutOfBounds {
+        /// Function id whose body is invalid.
+        function_id: u32,
+        /// Function bytecode body offset.
+        offset: u32,
+        /// Function bytecode body size.
+        size: u32,
+        /// First valid function body offset.
+        function_bodies_offset: u32,
+        /// Last accepted function body byte offset.
+        limit: u32,
+    },
+    /// A CommonJS module table entry references an invalid function or string id.
+    InvalidCjsModuleEntry {
+        /// Table entry index.
+        entry_index: u32,
+        /// First raw value in the pair.
+        first: u32,
+        /// Second raw value in the pair.
+        second: u32,
+        /// Whether this is the statically resolved CJS module table.
+        statically_resolved: bool,
+    },
+    /// A function-source table entry references an invalid function or string id.
+    InvalidFunctionSourceEntry {
+        /// Table entry index.
+        entry_index: u32,
+        /// Referenced function id.
+        function_id: u32,
+        /// Referenced string id.
+        string_id: u32,
+    },
 }
 
 impl fmt::Display for ParseError {
@@ -761,6 +893,48 @@ impl fmt::Display for ParseError {
                 formatter,
                 "Hermes bytecode string entry {string_index} at offset {offset} with length {length} exceeds string storage size {storage_size}",
             ),
+            Self::InvalidFunctionIndex {
+                function_id,
+                function_count,
+            } => write!(
+                formatter,
+                "Hermes bytecode function id {function_id} exceeds function count {function_count}",
+            ),
+            Self::LargeFunctionHeaderOutOfBounds {
+                function_id,
+                offset,
+                file_length,
+            } => write!(
+                formatter,
+                "Hermes bytecode function {function_id} large header at {offset} exceeds fileLength {file_length}",
+            ),
+            Self::FunctionBodyOutOfBounds {
+                function_id,
+                offset,
+                size,
+                function_bodies_offset,
+                limit,
+            } => write!(
+                formatter,
+                "Hermes bytecode function {function_id} body at {offset} with size {size} is outside function body region {function_bodies_offset}..{limit}",
+            ),
+            Self::InvalidCjsModuleEntry {
+                entry_index,
+                first,
+                second,
+                statically_resolved,
+            } => write!(
+                formatter,
+                "Hermes bytecode CJS module entry {entry_index} ({first}, {second}) is invalid; staticallyResolved={statically_resolved}",
+            ),
+            Self::InvalidFunctionSourceEntry {
+                entry_index,
+                function_id,
+                string_id,
+            } => write!(
+                formatter,
+                "Hermes bytecode function source entry {entry_index} references function {function_id} and string {string_id}",
+            ),
         }
     }
 }
@@ -771,6 +945,7 @@ fn parse_hbc_metadata(bytes: &[u8]) -> Result<ffi::HbcMetadata, ParseError> {
     let bytecode = HermesBytecode::parse(bytes)?;
     let header = bytecode.header();
     let sections = bytecode.sections();
+    let global_function = bytecode.global_function_header()?;
     Ok(ffi::HbcMetadata {
         version: header.version,
         file_length: header.file_length,
@@ -791,6 +966,11 @@ fn parse_hbc_metadata(bytes: &[u8]) -> Result<ffi::HbcMetadata, ParseError> {
         function_source_table_offset: sections.function_source_table().offset(),
         function_source_table_size: sections.function_source_table().len(),
         function_bodies_offset: sections.function_bodies_offset(),
+        global_function_offset: global_function.offset,
+        global_function_size: global_function.bytecode_size_in_bytes,
+        global_function_name: global_function.function_name,
+        global_function_param_count: global_function.param_count,
+        global_function_frame_size: global_function.frame_size,
         debug_info_offset: header.debug_info_offset,
         options: header.options.flags(),
     })
@@ -947,6 +1127,194 @@ fn validate_string_table(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DecodedSmallFunctionHeader {
+    header: HermesFunctionHeader,
+    overflowed: bool,
+}
+
+fn function_header_at(
+    bytes: &[u8],
+    header: HermesBytecodeHeader,
+    function_headers: SectionView<'_>,
+    function_id: u32,
+) -> Result<HermesFunctionHeader, ParseError> {
+    if function_id >= header.function_count {
+        return Err(ParseError::InvalidFunctionIndex {
+            function_id,
+            function_count: header.function_count,
+        });
+    }
+
+    let function_index =
+        usize::try_from(function_id).expect("u32 always fits in usize on supported targets");
+    let offset = function_index * SMALL_FUNC_HEADER_SIZE;
+    let small_header = &function_headers.bytes[offset..offset + SMALL_FUNC_HEADER_SIZE];
+    let decoded = parse_small_function_header(small_header);
+    if !decoded.overflowed {
+        return Ok(decoded.header);
+    }
+
+    let large_header_offset = large_header_offset_from_small(decoded.header);
+    let large_header_start = usize::try_from(large_header_offset)
+        .expect("u32 always fits in usize on supported targets");
+    let file_length =
+        usize::try_from(header.file_length).expect("u32 always fits in usize on supported targets");
+    let large_header_end = large_header_start
+        .checked_add(LARGE_FUNC_HEADER_SIZE)
+        .ok_or(ParseError::LargeFunctionHeaderOutOfBounds {
+            function_id,
+            offset: large_header_offset,
+            file_length: header.file_length,
+        })?;
+    if large_header_end > file_length {
+        return Err(ParseError::LargeFunctionHeaderOutOfBounds {
+            function_id,
+            offset: large_header_offset,
+            file_length: header.file_length,
+        });
+    }
+
+    Ok(parse_large_function_header(
+        &bytes[large_header_start..large_header_end],
+    ))
+}
+
+fn parse_small_function_header(bytes: &[u8]) -> DecodedSmallFunctionHeader {
+    let first_word = read_u32(bytes, 0);
+    let second_word = read_u32(bytes, 4);
+    let frame_size = bytes[8];
+    let read_cache_size = bytes[9];
+    let cache_sizes = bytes[10];
+    let flags = bytes[11];
+
+    DecodedSmallFunctionHeader {
+        header: HermesFunctionHeader {
+            offset: first_word & 0x01ff_ffff,
+            param_count: (first_word >> 25) & 0x1f,
+            loop_depth: (first_word >> 30) & 0x03,
+            bytecode_size_in_bytes: second_word & 0x3fff,
+            function_name: (second_word >> 14) & 0xff,
+            number_reg_count: (second_word >> 22) & 0x1f,
+            non_ptr_reg_count: (second_word >> 27) & 0x1f,
+            frame_size: u32::from(frame_size),
+            read_cache_size,
+            write_cache_size: cache_sizes & 0x7f,
+            private_name_cache_size: cache_sizes >> 7,
+            flags,
+        },
+        overflowed: flags & 0b0010_0000 != 0,
+    }
+}
+
+fn parse_large_function_header(bytes: &[u8]) -> HermesFunctionHeader {
+    HermesFunctionHeader {
+        offset: read_u32(bytes, 0),
+        param_count: read_u32(bytes, 4),
+        loop_depth: read_u32(bytes, 8),
+        bytecode_size_in_bytes: read_u32(bytes, 12),
+        function_name: read_u32(bytes, 16),
+        number_reg_count: read_u32(bytes, 20),
+        non_ptr_reg_count: read_u32(bytes, 24),
+        frame_size: read_u32(bytes, 28),
+        read_cache_size: bytes[32],
+        write_cache_size: bytes[33],
+        private_name_cache_size: bytes[34],
+        flags: bytes[35],
+    }
+}
+
+fn large_header_offset_from_small(header: HermesFunctionHeader) -> u32 {
+    ((header.function_name & 0xff) << 24) | (header.offset & 0x00ff_ffff)
+}
+
+fn validate_function_headers(
+    bytes: &[u8],
+    header: HermesBytecodeHeader,
+    function_headers: SectionView<'_>,
+    function_bodies_offset: u32,
+) -> Result<(), ParseError> {
+    for function_id in 0..header.function_count {
+        let function_header = function_header_at(bytes, header, function_headers, function_id)?;
+        validate_function_body(function_id, function_header, header, function_bodies_offset)?;
+    }
+    Ok(())
+}
+
+fn validate_function_body(
+    function_id: u32,
+    function_header: HermesFunctionHeader,
+    header: HermesBytecodeHeader,
+    function_bodies_offset: u32,
+) -> Result<(), ParseError> {
+    let limit = function_body_limit(header);
+    let body_end = function_header
+        .offset
+        .checked_add(function_header.bytecode_size_in_bytes);
+    if function_header.offset < function_bodies_offset || body_end.is_none_or(|end| end > limit) {
+        return Err(ParseError::FunctionBodyOutOfBounds {
+            function_id,
+            offset: function_header.offset,
+            size: function_header.bytecode_size_in_bytes,
+            function_bodies_offset,
+            limit,
+        });
+    }
+    Ok(())
+}
+
+fn function_body_limit(header: HermesBytecodeHeader) -> u32 {
+    if header.debug_info_offset == 0 {
+        header
+            .file_length
+            .saturating_sub(HERMES_BYTECODE_FOOTER_SIZE as u32)
+    } else {
+        header.debug_info_offset
+    }
+}
+
+fn validate_cjs_module_table(bytes: &[u8], header: HermesBytecodeHeader) -> Result<(), ParseError> {
+    for (index, entry) in bytes.chunks_exact(U32_PAIR_ENTRY_SIZE).enumerate() {
+        let first = read_u32(entry, 0);
+        let second = read_u32(entry, 4);
+        let statically_resolved = header.options.cjs_modules_statically_resolved();
+        let invalid = if statically_resolved {
+            second >= header.function_count
+        } else {
+            first >= header.string_count || second >= header.function_count
+        };
+        if invalid {
+            return Err(ParseError::InvalidCjsModuleEntry {
+                entry_index: u32::try_from(index)
+                    .expect("validated CJS module table index fits in u32"),
+                first,
+                second,
+                statically_resolved,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_function_source_table(
+    bytes: &[u8],
+    header: HermesBytecodeHeader,
+) -> Result<(), ParseError> {
+    for (index, entry) in bytes.chunks_exact(U32_PAIR_ENTRY_SIZE).enumerate() {
+        let function_id = read_u32(entry, 0);
+        let string_id = read_u32(entry, 4);
+        if function_id >= header.function_count || string_id >= header.string_count {
+            return Err(ParseError::InvalidFunctionSourceEntry {
+                entry_index: u32::try_from(index)
+                    .expect("validated function source table index fits in u32"),
+                function_id,
+                string_id,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn read_u32(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(bytes[offset..offset + size_of::<u32>()].try_into().expect(
         "HermesBytecodeHeader::parse validates the full header length before reading fields",
@@ -985,6 +1353,60 @@ mod tests {
 
     fn small_string_entry(offset: u32, length: u32, is_utf16: bool) -> u32 {
         u32::from(is_utf16) | (offset << 1) | (length << 24)
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct SmallFunctionHeaderFixture {
+        offset: u32,
+        bytecode_size_in_bytes: u32,
+        param_count: u32,
+        loop_depth: u32,
+        function_name: u32,
+        number_reg_count: u32,
+        non_ptr_reg_count: u32,
+        frame_size: u8,
+        read_cache_size: u8,
+        write_cache_size: u8,
+        private_name_cache_size: u8,
+        flags: u8,
+    }
+
+    fn encode_small_function_header(
+        header: SmallFunctionHeaderFixture,
+    ) -> [u8; SMALL_FUNC_HEADER_SIZE] {
+        let mut bytes = [0; SMALL_FUNC_HEADER_SIZE];
+        let first_word = (header.offset & 0x01ff_ffff)
+            | ((header.param_count & 0x1f) << 25)
+            | ((header.loop_depth & 0x03) << 30);
+        let second_word = (header.bytecode_size_in_bytes & 0x3fff)
+            | ((header.function_name & 0xff) << 14)
+            | ((header.number_reg_count & 0x1f) << 22)
+            | ((header.non_ptr_reg_count & 0x1f) << 27);
+        bytes[0..4].copy_from_slice(&first_word.to_le_bytes());
+        bytes[4..8].copy_from_slice(&second_word.to_le_bytes());
+        bytes[8] = header.frame_size;
+        bytes[9] = header.read_cache_size;
+        bytes[10] =
+            (header.write_cache_size & 0x7f) | ((header.private_name_cache_size & 0x01) << 7);
+        bytes[11] = header.flags;
+        bytes
+    }
+
+    fn encode_overflow_function_header(large_header_offset: u32) -> [u8; SMALL_FUNC_HEADER_SIZE] {
+        encode_small_function_header(SmallFunctionHeaderFixture {
+            offset: large_header_offset & 0x00ff_ffff,
+            bytecode_size_in_bytes: 0,
+            param_count: 0,
+            loop_depth: 0,
+            function_name: (large_header_offset >> 24) & 0xff,
+            number_reg_count: 0,
+            non_ptr_reg_count: 0,
+            frame_size: 0,
+            read_cache_size: 0,
+            write_cache_size: 0,
+            private_name_cache_size: 0,
+            flags: 0b0010_0000,
+        })
     }
 
     fn fixture_header() -> Vec<u8> {
@@ -1046,7 +1468,9 @@ mod tests {
         write_u32(&mut bytes, CJS_MODULE_COUNT_OFFSET, 2);
         write_u32(&mut bytes, FUNCTION_SOURCE_COUNT_OFFSET, 1);
 
-        append_repeated(&mut bytes, SMALL_FUNC_HEADER_SIZE * 2, 0x11);
+        append_aligned(&mut bytes);
+        let function_headers_offset = bytes.len();
+        bytes.resize(bytes.len() + SMALL_FUNC_HEADER_SIZE * 2, 0);
         append_bytes(
             &mut bytes,
             &[1_u32.to_le_bytes(), 0x8000_0001_u32.to_le_bytes()].concat(),
@@ -1072,11 +1496,56 @@ mod tests {
         append_bytes(&mut bytes, &[9, 10, 11, 12]);
         append_repeated(&mut bytes, REG_EXP_TABLE_ENTRY_SIZE, 0x44);
         append_bytes(&mut bytes, &[13, 14]);
-        append_repeated(&mut bytes, U32_PAIR_ENTRY_SIZE * 2, 0x55);
-        append_repeated(&mut bytes, U32_PAIR_ENTRY_SIZE, 0x66);
+        append_bytes(
+            &mut bytes,
+            &[
+                0_u32.to_le_bytes(),
+                0_u32.to_le_bytes(),
+                1_u32.to_le_bytes(),
+                1_u32.to_le_bytes(),
+            ]
+            .concat(),
+        );
+        append_bytes(
+            &mut bytes,
+            &[1_u32.to_le_bytes(), 1_u32.to_le_bytes()].concat(),
+        );
 
         let function_bodies_offset = bytes.len();
         bytes.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        bytes[function_headers_offset..function_headers_offset + SMALL_FUNC_HEADER_SIZE]
+            .copy_from_slice(&encode_small_function_header(SmallFunctionHeaderFixture {
+                offset: u32::try_from(function_bodies_offset)
+                    .expect("test fixture offset fits in u32"),
+                bytecode_size_in_bytes: 2,
+                param_count: 1,
+                loop_depth: 0,
+                function_name: 0,
+                number_reg_count: 2,
+                non_ptr_reg_count: 1,
+                frame_size: 4,
+                read_cache_size: 1,
+                write_cache_size: 2,
+                private_name_cache_size: 1,
+                flags: 0b0000_0100,
+            }));
+        bytes[function_headers_offset + SMALL_FUNC_HEADER_SIZE
+            ..function_headers_offset + SMALL_FUNC_HEADER_SIZE * 2]
+            .copy_from_slice(&encode_small_function_header(SmallFunctionHeaderFixture {
+                offset: u32::try_from(function_bodies_offset + 2)
+                    .expect("test fixture offset fits in u32"),
+                bytecode_size_in_bytes: 2,
+                param_count: 2,
+                loop_depth: 1,
+                function_name: 1,
+                number_reg_count: 3,
+                non_ptr_reg_count: 2,
+                frame_size: 5,
+                read_cache_size: 3,
+                write_cache_size: 4,
+                private_name_cache_size: 0,
+                flags: 0b0000_0100,
+            }));
 
         append_aligned(&mut bytes);
         let debug_info_offset =
@@ -1138,7 +1607,54 @@ mod tests {
         assert_eq!(metadata.cjs_module_table_size, 16);
         assert_eq!(metadata.function_source_table_size, 8);
         assert!(metadata.function_bodies_offset > metadata.function_source_table_offset);
+        assert_eq!(
+            metadata.global_function_offset,
+            metadata.function_bodies_offset + 2
+        );
+        assert_eq!(metadata.global_function_size, 2);
+        assert_eq!(metadata.global_function_name, 1);
+        assert_eq!(metadata.global_function_param_count, 2);
+        assert_eq!(metadata.global_function_frame_size, 5);
         assert_eq!(metadata.options, 0);
+    }
+
+    #[test]
+    fn parses_small_function_headers() {
+        let bytes = fixture_bytecode();
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid Hermes bytecode");
+        let sections = bytecode.sections();
+
+        let first = bytecode
+            .function_header(0)
+            .expect("valid first function header");
+        assert_eq!(first.offset, sections.function_bodies_offset());
+        assert_eq!(first.bytecode_size_in_bytes, 2);
+        assert_eq!(first.param_count, 1);
+        assert_eq!(first.loop_depth, 0);
+        assert_eq!(first.function_name, 0);
+        assert_eq!(first.number_reg_count, 2);
+        assert_eq!(first.non_ptr_reg_count, 1);
+        assert_eq!(first.frame_size, 4);
+        assert_eq!(first.read_cache_size, 1);
+        assert_eq!(first.write_cache_size, 2);
+        assert_eq!(first.private_name_cache_size, 1);
+        assert!(first.strict_mode());
+
+        let second = bytecode
+            .global_function_header()
+            .expect("valid global function header");
+        assert_eq!(second.offset, sections.function_bodies_offset() + 2);
+        assert_eq!(second.bytecode_size_in_bytes, 2);
+        assert_eq!(second.param_count, 2);
+        assert_eq!(second.loop_depth, 1);
+        assert_eq!(second.function_name, 1);
+        assert_eq!(second.number_reg_count, 3);
+        assert_eq!(second.non_ptr_reg_count, 2);
+        assert_eq!(second.frame_size, 5);
+        assert_eq!(second.read_cache_size, 3);
+        assert_eq!(second.write_cache_size, 4);
+        assert_eq!(second.private_name_cache_size, 0);
+        assert!(second.strict_mode());
     }
 
     #[test]
@@ -1256,6 +1772,121 @@ mod tests {
                 offset: 5,
                 length: 2,
                 storage_size: 6,
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_function_body_outside_function_region() {
+        let mut bytes = fixture_bytecode();
+        let (function_headers_offset, function_bodies_offset, debug_info_offset) = {
+            let bytecode = HermesBytecode::parse(&bytes).expect("valid fixture");
+            (
+                bytecode.sections().function_headers().offset() as usize,
+                bytecode.sections().function_bodies_offset(),
+                bytecode.header().debug_info_offset,
+            )
+        };
+        bytes[function_headers_offset..function_headers_offset + SMALL_FUNC_HEADER_SIZE]
+            .copy_from_slice(&encode_small_function_header(SmallFunctionHeaderFixture {
+                offset: function_bodies_offset - 1,
+                bytecode_size_in_bytes: 2,
+                param_count: 1,
+                loop_depth: 0,
+                function_name: 0,
+                number_reg_count: 2,
+                non_ptr_reg_count: 1,
+                frame_size: 4,
+                read_cache_size: 1,
+                write_cache_size: 2,
+                private_name_cache_size: 1,
+                flags: 0b0000_0100,
+            }));
+
+        let error = HermesBytecode::parse(&bytes).expect_err("invalid function body must fail");
+        assert_eq!(
+            error,
+            ParseError::FunctionBodyOutOfBounds {
+                function_id: 0,
+                offset: function_bodies_offset - 1,
+                size: 2,
+                function_bodies_offset,
+                limit: debug_info_offset,
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_large_function_header_outside_file() {
+        let mut bytes = fixture_bytecode();
+        let (function_headers_offset, invalid_large_header_offset, file_length) = {
+            let bytecode = HermesBytecode::parse(&bytes).expect("valid fixture");
+            (
+                bytecode.sections().function_headers().offset() as usize,
+                bytecode.header().file_length - 1,
+                bytecode.header().file_length,
+            )
+        };
+        bytes[function_headers_offset..function_headers_offset + SMALL_FUNC_HEADER_SIZE]
+            .copy_from_slice(&encode_overflow_function_header(
+                invalid_large_header_offset,
+            ));
+
+        let error =
+            HermesBytecode::parse(&bytes).expect_err("invalid large function header must fail");
+        assert_eq!(
+            error,
+            ParseError::LargeFunctionHeaderOutOfBounds {
+                function_id: 0,
+                offset: invalid_large_header_offset,
+                file_length,
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_cjs_module_entry() {
+        let mut bytes = fixture_bytecode();
+        let cjs_module_table_offset = HermesBytecode::parse(&bytes)
+            .expect("valid fixture")
+            .sections()
+            .cjs_module_table()
+            .offset() as usize;
+        write_u32(&mut bytes, cjs_module_table_offset + size_of::<u32>(), 99);
+
+        let error = HermesBytecode::parse(&bytes).expect_err("invalid CJS entry must fail");
+        assert_eq!(
+            error,
+            ParseError::InvalidCjsModuleEntry {
+                entry_index: 0,
+                first: 0,
+                second: 99,
+                statically_resolved: false,
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_function_source_entry() {
+        let mut bytes = fixture_bytecode();
+        let function_source_table_offset = HermesBytecode::parse(&bytes)
+            .expect("valid fixture")
+            .sections()
+            .function_source_table()
+            .offset() as usize;
+        write_u32(
+            &mut bytes,
+            function_source_table_offset + size_of::<u32>(),
+            99,
+        );
+
+        let error = HermesBytecode::parse(&bytes).expect_err("invalid source entry must fail");
+        assert_eq!(
+            error,
+            ParseError::InvalidFunctionSourceEntry {
+                entry_index: 0,
+                function_id: 1,
+                string_id: 99,
             },
         );
     }

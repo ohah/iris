@@ -173,7 +173,12 @@ IrisRuntime::HermesBytecodeMetadata IrisRuntime::validateHermesBytecodeBuffer(
         metadata.cjs_module_count,
         metadata.cjs_module_table_offset,
         metadata.cjs_module_table_size,
-        metadata.function_bodies_offset};
+        metadata.function_bodies_offset,
+        metadata.global_function_offset,
+        metadata.global_function_size,
+        metadata.global_function_name,
+        metadata.global_function_param_count,
+        metadata.global_function_frame_size};
   } catch (const rust::Error& error) {
     abortBundleContractViolation(
         "Iris expected Hermes bytecode for " + sourceURL +
@@ -189,7 +194,7 @@ void IrisRuntime::abortBytecodeExecutionUnavailable(
   __android_log_assert(
       "IrisBytecodeExecutionUnavailable",
       "IrisEngine",
-      "Iris %s prepared Hermes bytecode v%u (%u bytes, %u functions, %u strings, functionHeaders=%u+%u, stringStorage=%u+%u, cjsModules=%u, cjsTable=%u+%u, functionBodies=%u, source=%s), but bytecode execution is not implemented yet. This is an Iris-owned Runtime scaffold, not a Hermes/JSC fallback.",
+      "Iris %s prepared Hermes bytecode v%u (%u bytes, %u functions, %u strings, functionHeaders=%u+%u, stringStorage=%u+%u, cjsModules=%u, cjsTable=%u+%u, functionBodies=%u, globalFunction=%u+%u name=%u params=%u frame=%u, source=%s), but bytecode execution is not implemented yet. This is an Iris-owned Runtime scaffold, not a Hermes/JSC fallback.",
       operation,
       metadata.version,
       metadata.fileLength,
@@ -203,6 +208,11 @@ void IrisRuntime::abortBytecodeExecutionUnavailable(
       metadata.cjsModuleTableOffset,
       metadata.cjsModuleTableSize,
       metadata.functionBodiesOffset,
+      metadata.globalFunctionOffset,
+      metadata.globalFunctionSize,
+      metadata.globalFunctionName,
+      metadata.globalFunctionParamCount,
+      metadata.globalFunctionFrameSize,
       sourceURL.c_str());
   std::abort();
 }

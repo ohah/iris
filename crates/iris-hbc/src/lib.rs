@@ -498,7 +498,11 @@ impl<'a> HermesBytecodeSections<'a> {
                 offset: cursor,
             })?;
 
-        validate_string_kind_runs(string_kinds.bytes, header.string_count)?;
+        validate_string_kind_runs(
+            string_kinds.bytes,
+            header.string_count,
+            header.identifier_count,
+        )?;
         validate_string_table(
             small_string_table.bytes,
             overflow_string_table.bytes,
@@ -1167,6 +1171,13 @@ pub enum ParseError {
         /// Count produced by summing the string-kind runs.
         run_length: u32,
     },
+    /// String-kind identifier run-length encoding does not cover exactly all identifiers.
+    InvalidStringKindIdentifierCount {
+        /// Declared identifier count.
+        identifier_count: u32,
+        /// Identifier count produced by summing identifier string-kind runs.
+        run_length: u32,
+    },
     /// A small string table entry points past the overflow string table.
     InvalidOverflowStringIndex {
         /// Index of the string table entry.
@@ -1548,6 +1559,13 @@ impl fmt::Display for ParseError {
                 formatter,
                 "Hermes bytecode string-kind runs cover {run_length} strings, expected {string_count}",
             ),
+            Self::InvalidStringKindIdentifierCount {
+                identifier_count,
+                run_length,
+            } => write!(
+                formatter,
+                "Hermes bytecode string-kind runs cover {run_length} identifiers, expected {identifier_count}",
+            ),
             Self::InvalidOverflowStringIndex {
                 string_index,
                 overflow_index,
@@ -1928,8 +1946,13 @@ fn section_size(section: &'static str, count: u32, entry_size: usize) -> Result<
         })
 }
 
-fn validate_string_kind_runs(bytes: &[u8], string_count: u32) -> Result<(), ParseError> {
+fn validate_string_kind_runs(
+    bytes: &[u8],
+    string_count: u32,
+    identifier_count: u32,
+) -> Result<(), ParseError> {
     let mut run_length = 0_u32;
+    let mut identifier_run_length = 0_u32;
     for entry in bytes.chunks_exact(STRING_KIND_ENTRY_SIZE) {
         let datum = read_u32(entry, 0);
         let count = datum & 0x7fff_ffff;
@@ -1940,11 +1963,25 @@ fn validate_string_kind_runs(bytes: &[u8], string_count: u32) -> Result<(), Pars
                     string_count,
                     run_length: u32::MAX,
                 })?;
+        if datum & 0x8000_0000 != 0 {
+            identifier_run_length = identifier_run_length.checked_add(count).ok_or(
+                ParseError::InvalidStringKindIdentifierCount {
+                    identifier_count,
+                    run_length: u32::MAX,
+                },
+            )?;
+        }
     }
     if run_length != string_count {
         return Err(ParseError::InvalidStringKindRunLength {
             string_count,
             run_length,
+        });
+    }
+    if identifier_run_length != identifier_count {
+        return Err(ParseError::InvalidStringKindIdentifierCount {
+            identifier_count,
+            run_length: identifier_run_length,
         });
     }
     Ok(())
@@ -4514,6 +4551,26 @@ mod tests {
             ParseError::InvalidStringKindRunLength {
                 string_count: 2,
                 run_length: 3,
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_string_kind_identifier_count_mismatch() {
+        let mut bytes = fixture_bytecode();
+        let string_kinds_offset = HermesBytecode::parse(&bytes)
+            .expect("valid fixture")
+            .sections()
+            .string_kinds()
+            .offset() as usize;
+        write_u32(&mut bytes, string_kinds_offset + STRING_KIND_ENTRY_SIZE, 1);
+
+        let error = HermesBytecode::parse(&bytes).expect_err("identifier run mismatch must fail");
+        assert_eq!(
+            error,
+            ParseError::InvalidStringKindIdentifierCount {
+                identifier_count: 1,
+                run_length: 0,
             },
         );
     }

@@ -74,6 +74,10 @@ run = "bun run --cwd apps/rn-bench android"
 description = "Build the React Native benchmark Android debug APK locally"
 run = "cd apps/rn-bench/android && ./gradlew :app:assembleDebug -x lint -x test"
 
+[tasks.rn-android-build-release]
+description = "Build the React Native benchmark Android release APK locally"
+run = "cd apps/rn-bench/android && ./gradlew :app:assembleRelease -x lint -x test"
+
 [tasks.rn-ios-pods]
 description = "Install CocoaPods dependencies for the React Native benchmark app"
 run = "cd apps/rn-bench/ios && bundle install && bundle exec pod install"
@@ -81,6 +85,10 @@ run = "cd apps/rn-bench/ios && bundle install && bundle exec pod install"
 [tasks.rn-ios-build-debug]
 description = "Build the React Native benchmark iOS debug app locally"
 run = "cd apps/rn-bench/ios && RCT_NO_LAUNCH_PACKAGER=1 xcodebuild -workspace IrisBench.xcworkspace -scheme IrisBench -configuration Debug -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build"
+
+[tasks.rn-ios-build-release]
+description = "Build the React Native benchmark iOS release app locally"
+run = "cd apps/rn-bench/ios && RCT_NO_LAUNCH_PACKAGER=1 xcodebuild -workspace IrisBench.xcworkspace -scheme IrisBench -configuration Release -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build"
 
 [tasks.rn-typecheck]
 description = "Type-check the React Native benchmark app"
@@ -109,6 +117,14 @@ run = "bun run bench:extract-hermes --input=artifacts/bench/metro-hermes.log --o
 [tasks.bench-extract-fixture]
 description = "Validate Hermes benchmark log extraction with a local fixture"
 run = "bun run bench:extract-hermes:fixture"
+
+[tasks.bench-extract-hermes-release]
+description = "Extract a release Hermes app benchmark report from artifacts/bench/rn-release-hermes.log"
+run = "bun run bench:extract-hermes:release --input=artifacts/bench/rn-release-hermes.log --output=artifacts/bench/hermes-release-baseline.json"
+
+[tasks.bench-extract-release-fixture]
+description = "Validate release Hermes benchmark log extraction with a local fixture"
+run = "bun run bench:extract-hermes:release-fixture"
 
 [tasks.perf]
 description = "Run the core performance budget gate"

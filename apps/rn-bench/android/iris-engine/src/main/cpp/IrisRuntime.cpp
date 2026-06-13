@@ -1,7 +1,10 @@
 #include "IrisRuntime.h"
 
 #include <android/log.h>
+
 #include <cstdlib>
+#include <stdexcept>
+#include <utility>
 
 namespace iris::runtime {
 
@@ -17,6 +20,116 @@ namespace {
 }
 
 } // namespace
+
+IrisRuntime::PointerState::PointerState(std::string text, Kind kind)
+    : kind(kind), text(std::move(text)) {}
+
+IrisRuntime::PointerState::PointerState(std::shared_ptr<ObjectState> object)
+    : kind(Kind::Object), object(std::move(object)) {}
+
+void IrisRuntime::PointerState::invalidate() noexcept {
+  delete this;
+}
+
+IrisRuntime::IrisRuntime() : globalObject_(std::make_shared<ObjectState>()) {
+  installBootstrapGlobals();
+}
+
+IrisRuntime::PointerState& IrisRuntime::pointerState(
+    const PointerValue* pointer) const {
+  if (pointer == nullptr) {
+    throw jsi::JSINativeException("IrisRuntime received a null JSI pointer");
+  }
+  return *const_cast<PointerState*>(static_cast<const PointerState*>(pointer));
+}
+
+IrisRuntime::PointerState& IrisRuntime::pointerState(
+    const jsi::Object& object) const {
+  return pointerState(getPointerValue(object));
+}
+
+IrisRuntime::PointerState& IrisRuntime::pointerState(
+    const jsi::String& string) const {
+  return pointerState(getPointerValue(string));
+}
+
+IrisRuntime::PointerState& IrisRuntime::pointerState(
+    const jsi::PropNameID& name) const {
+  return pointerState(getPointerValue(name));
+}
+
+std::shared_ptr<IrisRuntime::ObjectState> IrisRuntime::objectState(
+    const jsi::Object& object) const {
+  auto& pointer = pointerState(object);
+  if (pointer.kind != PointerState::Kind::Object || pointer.object == nullptr) {
+    throw jsi::JSINativeException("IrisRuntime expected a JS object pointer");
+  }
+  return pointer.object;
+}
+
+std::string IrisRuntime::propertyKey(const jsi::PropNameID& name) const {
+  auto& pointer = pointerState(name);
+  if (pointer.kind != PointerState::Kind::PropNameID) {
+    throw jsi::JSINativeException("IrisRuntime expected a property name id");
+  }
+  return pointer.text;
+}
+
+std::string IrisRuntime::propertyKey(const jsi::String& string) const {
+  auto& pointer = pointerState(string);
+  if (pointer.kind != PointerState::Kind::String) {
+    throw jsi::JSINativeException("IrisRuntime expected a string");
+  }
+  return pointer.text;
+}
+
+std::shared_ptr<jsi::Value> IrisRuntime::copyValue(const jsi::Value& value) {
+  return std::make_shared<jsi::Value>(*this, value);
+}
+
+jsi::Object IrisRuntime::makeObject(std::shared_ptr<ObjectState> object) {
+  return make<jsi::Object>(new PointerState(std::move(object)));
+}
+
+jsi::Value IrisRuntime::makeObjectValue(std::shared_ptr<ObjectState> object) {
+  return jsi::Value(makeObject(std::move(object)));
+}
+
+jsi::Value IrisRuntime::makeFunctionValue(
+    std::string,
+    unsigned int,
+    jsi::HostFunctionType function) {
+  auto object = std::make_shared<ObjectState>();
+  object->hostFunction = std::move(function);
+  return makeObjectValue(std::move(object));
+}
+
+void IrisRuntime::installBootstrapGlobals() {
+  auto objectConstructor = std::make_shared<ObjectState>();
+  objectConstructor->properties["defineProperty"] = copyValue(
+      makeFunctionValue(
+          "defineProperty",
+          3,
+          [](jsi::Runtime& runtime,
+             const jsi::Value&,
+             const jsi::Value* args,
+             size_t count) -> jsi::Value {
+            if (count < 3) {
+              throw jsi::JSINativeException(
+                  "Iris Object.defineProperty requires target, key, and descriptor");
+            }
+
+            auto target = args[0].asObject(runtime);
+            std::string key = args[1].asString(runtime).utf8(runtime);
+            auto descriptor = args[2].asObject(runtime);
+            auto value = descriptor.getProperty(runtime, "value");
+            target.setProperty(runtime, key.c_str(), value);
+            return jsi::Value(runtime, target);
+          }));
+
+  globalObject_->properties["Object"] = copyValue(
+      makeObjectValue(std::move(objectConstructor)));
+}
 
 jsi::Value IrisRuntime::evaluateJavaScript(
     const std::shared_ptr<const jsi::Buffer>&,
@@ -40,11 +153,11 @@ void IrisRuntime::queueMicrotask(const jsi::Function&) {
 }
 
 bool IrisRuntime::drainMicrotasks(int) {
-  abortUnimplemented("drainMicrotasks");
+  return true;
 }
 
 jsi::Object IrisRuntime::global() {
-  abortUnimplemented("global");
+  return makeObject(globalObject_);
 }
 
 std::string IrisRuntime::description() {
@@ -63,40 +176,57 @@ jsi::Runtime::PointerValue* IrisRuntime::cloneBigInt(const PointerValue*) {
   abortUnimplemented("cloneBigInt");
 }
 
-jsi::Runtime::PointerValue* IrisRuntime::cloneString(const PointerValue*) {
-  abortUnimplemented("cloneString");
+jsi::Runtime::PointerValue* IrisRuntime::cloneString(
+    const PointerValue* pointer) {
+  auto& state = pointerState(pointer);
+  return new PointerState(state.text, PointerState::Kind::String);
 }
 
-jsi::Runtime::PointerValue* IrisRuntime::cloneObject(const PointerValue*) {
-  abortUnimplemented("cloneObject");
+jsi::Runtime::PointerValue* IrisRuntime::cloneObject(
+    const PointerValue* pointer) {
+  auto& state = pointerState(pointer);
+  return new PointerState(state.object);
 }
 
-jsi::Runtime::PointerValue* IrisRuntime::clonePropNameID(const PointerValue*) {
-  abortUnimplemented("clonePropNameID");
+jsi::Runtime::PointerValue* IrisRuntime::clonePropNameID(
+    const PointerValue* pointer) {
+  auto& state = pointerState(pointer);
+  return new PointerState(state.text, PointerState::Kind::PropNameID);
 }
 
-jsi::PropNameID IrisRuntime::createPropNameIDFromAscii(const char*, size_t) {
-  abortUnimplemented("createPropNameIDFromAscii");
+jsi::PropNameID IrisRuntime::createPropNameIDFromAscii(
+    const char* str,
+    size_t length) {
+  return make<jsi::PropNameID>(
+      new PointerState(std::string(str, length), PointerState::Kind::PropNameID));
 }
 
-jsi::PropNameID IrisRuntime::createPropNameIDFromUtf8(const uint8_t*, size_t) {
-  abortUnimplemented("createPropNameIDFromUtf8");
+jsi::PropNameID IrisRuntime::createPropNameIDFromUtf8(
+    const uint8_t* utf8,
+    size_t length) {
+  return make<jsi::PropNameID>(new PointerState(
+      std::string(reinterpret_cast<const char*>(utf8), length),
+      PointerState::Kind::PropNameID));
 }
 
-jsi::PropNameID IrisRuntime::createPropNameIDFromString(const jsi::String&) {
-  abortUnimplemented("createPropNameIDFromString");
+jsi::PropNameID IrisRuntime::createPropNameIDFromString(
+    const jsi::String& string) {
+  return make<jsi::PropNameID>(
+      new PointerState(propertyKey(string), PointerState::Kind::PropNameID));
 }
 
 jsi::PropNameID IrisRuntime::createPropNameIDFromSymbol(const jsi::Symbol&) {
   abortUnimplemented("createPropNameIDFromSymbol");
 }
 
-std::string IrisRuntime::utf8(const jsi::PropNameID&) {
-  abortUnimplemented("utf8(PropNameID)");
+std::string IrisRuntime::utf8(const jsi::PropNameID& name) {
+  return propertyKey(name);
 }
 
-bool IrisRuntime::compare(const jsi::PropNameID&, const jsi::PropNameID&) {
-  abortUnimplemented("compare(PropNameID)");
+bool IrisRuntime::compare(
+    const jsi::PropNameID& left,
+    const jsi::PropNameID& right) {
+  return propertyKey(left) == propertyKey(right);
 }
 
 std::string IrisRuntime::symbolToString(const jsi::Symbol&) {
@@ -127,102 +257,153 @@ jsi::String IrisRuntime::bigintToString(const jsi::BigInt&, int) {
   abortUnimplemented("bigintToString");
 }
 
-jsi::String IrisRuntime::createStringFromAscii(const char*, size_t) {
-  abortUnimplemented("createStringFromAscii");
+jsi::String IrisRuntime::createStringFromAscii(
+    const char* str,
+    size_t length) {
+  return make<jsi::String>(
+      new PointerState(std::string(str, length), PointerState::Kind::String));
 }
 
-jsi::String IrisRuntime::createStringFromUtf8(const uint8_t*, size_t) {
-  abortUnimplemented("createStringFromUtf8");
+jsi::String IrisRuntime::createStringFromUtf8(
+    const uint8_t* utf8,
+    size_t length) {
+  return make<jsi::String>(new PointerState(
+      std::string(reinterpret_cast<const char*>(utf8), length),
+      PointerState::Kind::String));
 }
 
-std::string IrisRuntime::utf8(const jsi::String&) {
-  abortUnimplemented("utf8(String)");
+std::string IrisRuntime::utf8(const jsi::String& string) {
+  return propertyKey(string);
 }
 
 jsi::Object IrisRuntime::createObject() {
-  abortUnimplemented("createObject");
+  return makeObject(std::make_shared<ObjectState>());
 }
 
-jsi::Object IrisRuntime::createObject(std::shared_ptr<jsi::HostObject>) {
-  abortUnimplemented("createObject(HostObject)");
+jsi::Object IrisRuntime::createObject(std::shared_ptr<jsi::HostObject> hostObject) {
+  auto object = std::make_shared<ObjectState>();
+  object->hostObject = std::move(hostObject);
+  return makeObject(std::move(object));
 }
 
 std::shared_ptr<jsi::HostObject> IrisRuntime::getHostObject(
-    const jsi::Object&) {
-  abortUnimplemented("getHostObject");
+    const jsi::Object& object) {
+  auto state = objectState(object);
+  if (!state->hostObject) {
+    throw jsi::JSINativeException("IrisRuntime object is not a HostObject");
+  }
+  return state->hostObject;
 }
 
-jsi::HostFunctionType& IrisRuntime::getHostFunction(const jsi::Function&) {
-  abortUnimplemented("getHostFunction");
+jsi::HostFunctionType& IrisRuntime::getHostFunction(
+    const jsi::Function& function) {
+  auto state = objectState(function);
+  if (!state->hostFunction) {
+    throw jsi::JSINativeException("IrisRuntime object is not a HostFunction");
+  }
+  return *state->hostFunction;
 }
 
-bool IrisRuntime::hasNativeState(const jsi::Object&) {
-  abortUnimplemented("hasNativeState");
+bool IrisRuntime::hasNativeState(const jsi::Object& object) {
+  return objectState(object)->nativeState != nullptr;
 }
 
 std::shared_ptr<jsi::NativeState> IrisRuntime::getNativeState(
-    const jsi::Object&) {
-  abortUnimplemented("getNativeState");
+    const jsi::Object& object) {
+  return objectState(object)->nativeState;
 }
 
 void IrisRuntime::setNativeState(
-    const jsi::Object&,
-    std::shared_ptr<jsi::NativeState>) {
-  abortUnimplemented("setNativeState");
+    const jsi::Object& object,
+    std::shared_ptr<jsi::NativeState> state) {
+  objectState(object)->nativeState = std::move(state);
 }
 
 jsi::Value IrisRuntime::getProperty(
-    const jsi::Object&,
-    const jsi::PropNameID&) {
-  abortUnimplemented("getProperty(PropNameID)");
+    const jsi::Object& object,
+    const jsi::PropNameID& name) {
+  auto state = objectState(object);
+  auto key = propertyKey(name);
+  auto property = state->properties.find(key);
+  if (property != state->properties.end()) {
+    return jsi::Value(*this, *property->second);
+  }
+  if (state->hostObject) {
+    return state->hostObject->get(*this, name);
+  }
+  return jsi::Value::undefined();
 }
 
-jsi::Value IrisRuntime::getProperty(const jsi::Object&, const jsi::String&) {
-  abortUnimplemented("getProperty(String)");
+jsi::Value IrisRuntime::getProperty(
+    const jsi::Object& object,
+    const jsi::String& name) {
+  auto key = propertyKey(name);
+  auto propName = createPropNameIDFromUtf8(
+      reinterpret_cast<const uint8_t*>(key.data()), key.size());
+  return getProperty(object, propName);
 }
 
 bool IrisRuntime::hasProperty(
-    const jsi::Object&,
-    const jsi::PropNameID&) {
-  abortUnimplemented("hasProperty(PropNameID)");
+    const jsi::Object& object,
+    const jsi::PropNameID& name) {
+  auto state = objectState(object);
+  auto key = propertyKey(name);
+  if (state->properties.find(key) != state->properties.end()) {
+    return true;
+  }
+  if (!state->hostObject) {
+    return false;
+  }
+  return !state->hostObject->get(*this, name).isUndefined();
 }
 
-bool IrisRuntime::hasProperty(const jsi::Object&, const jsi::String&) {
-  abortUnimplemented("hasProperty(String)");
+bool IrisRuntime::hasProperty(const jsi::Object& object, const jsi::String& name) {
+  auto key = propertyKey(name);
+  auto propName = createPropNameIDFromUtf8(
+      reinterpret_cast<const uint8_t*>(key.data()), key.size());
+  return hasProperty(object, propName);
 }
 
 void IrisRuntime::setPropertyValue(
-    const jsi::Object&,
-    const jsi::PropNameID&,
-    const jsi::Value&) {
-  abortUnimplemented("setPropertyValue(PropNameID)");
+    const jsi::Object& object,
+    const jsi::PropNameID& name,
+    const jsi::Value& value) {
+  auto state = objectState(object);
+  if (state->hostObject) {
+    state->hostObject->set(*this, name, value);
+    return;
+  }
+  state->properties[propertyKey(name)] = copyValue(value);
 }
 
 void IrisRuntime::setPropertyValue(
-    const jsi::Object&,
-    const jsi::String&,
-    const jsi::Value&) {
-  abortUnimplemented("setPropertyValue(String)");
+    const jsi::Object& object,
+    const jsi::String& name,
+    const jsi::Value& value) {
+  auto key = propertyKey(name);
+  auto propName = createPropNameIDFromUtf8(
+      reinterpret_cast<const uint8_t*>(key.data()), key.size());
+  setPropertyValue(object, propName, value);
 }
 
-bool IrisRuntime::isArray(const jsi::Object&) const {
-  abortUnimplemented("isArray");
+bool IrisRuntime::isArray(const jsi::Object& object) const {
+  return objectState(object)->isArray;
 }
 
 bool IrisRuntime::isArrayBuffer(const jsi::Object&) const {
-  abortUnimplemented("isArrayBuffer");
+  return false;
 }
 
-bool IrisRuntime::isFunction(const jsi::Object&) const {
-  abortUnimplemented("isFunction");
+bool IrisRuntime::isFunction(const jsi::Object& object) const {
+  return objectState(object)->hostFunction.has_value();
 }
 
-bool IrisRuntime::isHostObject(const jsi::Object&) const {
-  abortUnimplemented("isHostObject");
+bool IrisRuntime::isHostObject(const jsi::Object& object) const {
+  return objectState(object)->hostObject != nullptr;
 }
 
-bool IrisRuntime::isHostFunction(const jsi::Function&) const {
-  abortUnimplemented("isHostFunction");
+bool IrisRuntime::isHostFunction(const jsi::Function& function) const {
+  return objectState(function)->hostFunction.has_value();
 }
 
 jsi::Array IrisRuntime::getPropertyNames(const jsi::Object&) {
@@ -237,8 +418,11 @@ jsi::Value IrisRuntime::lockWeakObject(const jsi::WeakObject&) {
   abortUnimplemented("lockWeakObject");
 }
 
-jsi::Array IrisRuntime::createArray(size_t) {
-  abortUnimplemented("createArray");
+jsi::Array IrisRuntime::createArray(size_t length) {
+  auto object = std::make_shared<ObjectState>();
+  object->isArray = true;
+  object->elements.resize(length);
+  return make<jsi::Array>(new PointerState(std::move(object)));
 }
 
 jsi::ArrayBuffer IrisRuntime::createArrayBuffer(
@@ -246,8 +430,8 @@ jsi::ArrayBuffer IrisRuntime::createArrayBuffer(
   abortUnimplemented("createArrayBuffer");
 }
 
-size_t IrisRuntime::size(const jsi::Array&) {
-  abortUnimplemented("size(Array)");
+size_t IrisRuntime::size(const jsi::Array& array) {
+  return objectState(array)->elements.size();
 }
 
 size_t IrisRuntime::size(const jsi::ArrayBuffer&) {
@@ -258,30 +442,43 @@ uint8_t* IrisRuntime::data(const jsi::ArrayBuffer&) {
   abortUnimplemented("data(ArrayBuffer)");
 }
 
-jsi::Value IrisRuntime::getValueAtIndex(const jsi::Array&, size_t) {
-  abortUnimplemented("getValueAtIndex");
+jsi::Value IrisRuntime::getValueAtIndex(const jsi::Array& array, size_t index) {
+  auto state = objectState(array);
+  if (index >= state->elements.size() || !state->elements[index]) {
+    return jsi::Value::undefined();
+  }
+  return jsi::Value(*this, *state->elements[index]);
 }
 
 void IrisRuntime::setValueAtIndexImpl(
-    const jsi::Array&,
-    size_t,
-    const jsi::Value&) {
-  abortUnimplemented("setValueAtIndexImpl");
+    const jsi::Array& array,
+    size_t index,
+    const jsi::Value& value) {
+  auto state = objectState(array);
+  if (index >= state->elements.size()) {
+    state->elements.resize(index + 1);
+  }
+  state->elements[index] = copyValue(value);
 }
 
 jsi::Function IrisRuntime::createFunctionFromHostFunction(
     const jsi::PropNameID&,
-    unsigned int,
-    jsi::HostFunctionType) {
-  abortUnimplemented("createFunctionFromHostFunction");
+    unsigned int paramCount,
+    jsi::HostFunctionType function) {
+  auto value = makeFunctionValue("", paramCount, std::move(function));
+  return std::move(value).getObject(*this).getFunction(*this);
 }
 
 jsi::Value IrisRuntime::call(
-    const jsi::Function&,
-    const jsi::Value&,
-    const jsi::Value*,
-    size_t) {
-  abortUnimplemented("call");
+    const jsi::Function& function,
+    const jsi::Value& jsThis,
+    const jsi::Value* args,
+    size_t count) {
+  auto state = objectState(function);
+  if (!state->hostFunction) {
+    abortUnimplemented("call(non-host-function)");
+  }
+  return (*state->hostFunction)(*this, jsThis, args, count);
 }
 
 jsi::Value IrisRuntime::callAsConstructor(
@@ -299,12 +496,16 @@ bool IrisRuntime::strictEquals(const jsi::BigInt&, const jsi::BigInt&) const {
   abortUnimplemented("strictEquals(BigInt)");
 }
 
-bool IrisRuntime::strictEquals(const jsi::String&, const jsi::String&) const {
-  abortUnimplemented("strictEquals(String)");
+bool IrisRuntime::strictEquals(
+    const jsi::String& left,
+    const jsi::String& right) const {
+  return propertyKey(left) == propertyKey(right);
 }
 
-bool IrisRuntime::strictEquals(const jsi::Object&, const jsi::Object&) const {
-  abortUnimplemented("strictEquals(Object)");
+bool IrisRuntime::strictEquals(
+    const jsi::Object& left,
+    const jsi::Object& right) const {
+  return objectState(left) == objectState(right);
 }
 
 bool IrisRuntime::instanceOf(const jsi::Object&, const jsi::Function&) {
@@ -312,7 +513,8 @@ bool IrisRuntime::instanceOf(const jsi::Object&, const jsi::Function&) {
 }
 
 void IrisRuntime::setExternalMemoryPressure(const jsi::Object&, size_t) {
-  abortUnimplemented("setExternalMemoryPressure");
+  // Iris does not have a GC heap yet. Keep this as a no-op until object memory
+  // accounting exists, so RN HostObjects can still be registered.
 }
 
 } // namespace iris::runtime

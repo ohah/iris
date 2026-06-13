@@ -27,10 +27,10 @@ namespace {
 IrisRuntime::IrisPreparedJavaScript::IrisPreparedJavaScript(
     std::shared_ptr<const jsi::Buffer> buffer,
     std::string sourceURL,
-    HermesBytecodeHeader header)
+    HermesBytecodeMetadata metadata)
     : buffer(std::move(buffer)),
       sourceURL(std::move(sourceURL)),
-      header(header) {}
+      metadata(metadata) {}
 
 IrisRuntime::PointerState::PointerState(std::string text, Kind kind)
     : kind(kind), text(std::move(text)) {}
@@ -142,7 +142,7 @@ void IrisRuntime::installBootstrapGlobals() {
       makeObjectValue(std::move(objectConstructor)));
 }
 
-IrisRuntime::HermesBytecodeHeader IrisRuntime::validateHermesBytecodeBuffer(
+IrisRuntime::HermesBytecodeMetadata IrisRuntime::validateHermesBytecodeBuffer(
     const std::shared_ptr<const jsi::Buffer>& buffer,
     const std::string& sourceURL) const {
   if (!buffer) {
@@ -161,7 +161,19 @@ IrisRuntime::HermesBytecodeHeader IrisRuntime::validateHermesBytecodeBuffer(
   try {
     const auto metadata = iris::hbc::parse_hbc_metadata(
         rust::Slice<const uint8_t>(data, size));
-    return HermesBytecodeHeader{metadata.version, metadata.file_length};
+    return HermesBytecodeMetadata{
+        metadata.version,
+        metadata.file_length,
+        metadata.function_count,
+        metadata.function_headers_offset,
+        metadata.function_headers_size,
+        metadata.string_count,
+        metadata.string_storage_offset,
+        metadata.string_storage_size,
+        metadata.cjs_module_count,
+        metadata.cjs_module_table_offset,
+        metadata.cjs_module_table_size,
+        metadata.function_bodies_offset};
   } catch (const rust::Error& error) {
     abortBundleContractViolation(
         "Iris expected Hermes bytecode for " + sourceURL +
@@ -172,15 +184,25 @@ IrisRuntime::HermesBytecodeHeader IrisRuntime::validateHermesBytecodeBuffer(
 
 void IrisRuntime::abortBytecodeExecutionUnavailable(
     const char* operation,
-    const HermesBytecodeHeader& header,
+    const HermesBytecodeMetadata& metadata,
     const std::string& sourceURL) const {
   __android_log_assert(
       "IrisBytecodeExecutionUnavailable",
       "IrisEngine",
-      "Iris %s accepted Hermes bytecode v%u (%u bytes, source=%s), but bytecode execution is not implemented yet. This is an Iris-owned Runtime scaffold, not a Hermes/JSC fallback.",
+      "Iris %s prepared Hermes bytecode v%u (%u bytes, %u functions, %u strings, functionHeaders=%u+%u, stringStorage=%u+%u, cjsModules=%u, cjsTable=%u+%u, functionBodies=%u, source=%s), but bytecode execution is not implemented yet. This is an Iris-owned Runtime scaffold, not a Hermes/JSC fallback.",
       operation,
-      header.version,
-      header.fileLength,
+      metadata.version,
+      metadata.fileLength,
+      metadata.functionCount,
+      metadata.stringCount,
+      metadata.functionHeadersOffset,
+      metadata.functionHeadersSize,
+      metadata.stringStorageOffset,
+      metadata.stringStorageSize,
+      metadata.cjsModuleCount,
+      metadata.cjsModuleTableOffset,
+      metadata.cjsModuleTableSize,
+      metadata.functionBodiesOffset,
       sourceURL.c_str());
   std::abort();
 }
@@ -198,16 +220,17 @@ void IrisRuntime::abortBundleContractViolation(const std::string& message)
 jsi::Value IrisRuntime::evaluateJavaScript(
     const std::shared_ptr<const jsi::Buffer>& buffer,
     const std::string& sourceURL) {
-  auto header = validateHermesBytecodeBuffer(buffer, sourceURL);
-  abortBytecodeExecutionUnavailable("evaluateJavaScript", header, sourceURL);
+  auto metadata = validateHermesBytecodeBuffer(buffer, sourceURL);
+  abortBytecodeExecutionUnavailable(
+      "evaluateJavaScript", metadata, sourceURL);
 }
 
 std::shared_ptr<const jsi::PreparedJavaScript> IrisRuntime::prepareJavaScript(
     const std::shared_ptr<const jsi::Buffer>& buffer,
     std::string sourceURL) {
-  auto header = validateHermesBytecodeBuffer(buffer, sourceURL);
+  auto metadata = validateHermesBytecodeBuffer(buffer, sourceURL);
   return std::make_shared<IrisPreparedJavaScript>(
-      buffer, std::move(sourceURL), header);
+      buffer, std::move(sourceURL), metadata);
 }
 
 jsi::Value IrisRuntime::evaluatePreparedJavaScript(
@@ -219,7 +242,7 @@ jsi::Value IrisRuntime::evaluatePreparedJavaScript(
         " different runtime.");
   }
   abortBytecodeExecutionUnavailable(
-      "evaluatePreparedJavaScript", prepared->header, prepared->sourceURL);
+      "evaluatePreparedJavaScript", prepared->metadata, prepared->sourceURL);
 }
 
 void IrisRuntime::queueMicrotask(const jsi::Function&) {

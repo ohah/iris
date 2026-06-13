@@ -138,20 +138,30 @@ class IrisRuntime final : public jsi::Runtime {
     bool isArray{false};
   };
 
-  struct HermesBytecodeHeader {
+  struct HermesBytecodeMetadata {
     uint32_t version;
     uint32_t fileLength;
+    uint32_t functionCount;
+    uint32_t functionHeadersOffset;
+    uint32_t functionHeadersSize;
+    uint32_t stringCount;
+    uint32_t stringStorageOffset;
+    uint32_t stringStorageSize;
+    uint32_t cjsModuleCount;
+    uint32_t cjsModuleTableOffset;
+    uint32_t cjsModuleTableSize;
+    uint32_t functionBodiesOffset;
   };
 
   struct IrisPreparedJavaScript final : public jsi::PreparedJavaScript {
     IrisPreparedJavaScript(
         std::shared_ptr<const jsi::Buffer> buffer,
         std::string sourceURL,
-        HermesBytecodeHeader header);
+        HermesBytecodeMetadata metadata);
 
     std::shared_ptr<const jsi::Buffer> buffer;
     std::string sourceURL;
-    HermesBytecodeHeader header;
+    HermesBytecodeMetadata metadata;
   };
 
   struct PointerState final : public PointerValue {
@@ -188,12 +198,12 @@ class IrisRuntime final : public jsi::Runtime {
       jsi::HostFunctionType);
 
   void installBootstrapGlobals();
-  HermesBytecodeHeader validateHermesBytecodeBuffer(
+  HermesBytecodeMetadata validateHermesBytecodeBuffer(
       const std::shared_ptr<const jsi::Buffer>&,
       const std::string&) const;
   [[noreturn]] void abortBytecodeExecutionUnavailable(
       const char*,
-      const HermesBytecodeHeader&,
+      const HermesBytecodeMetadata&,
       const std::string&) const;
   [[noreturn]] void abortBundleContractViolation(const std::string&) const;
 

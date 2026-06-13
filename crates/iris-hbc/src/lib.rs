@@ -69,6 +69,8 @@ const SHAPE_TABLE_ENTRY_SIZE: usize = 8;
 const BIG_INT_TABLE_ENTRY_SIZE: usize = 8;
 const REG_EXP_TABLE_ENTRY_SIZE: usize = 8;
 const U32_PAIR_ENTRY_SIZE: usize = 8;
+const SWITCH_TABLE_CASE_SIZE: usize = 8;
+const SWITCH_TABLE_ALIGNMENT: u32 = 4;
 const HERMES_OPCODE_WIDTHS: [u8; HERMES_OPCODE_COUNT] = [
     1, 6, 10, 11, 12, 2, 3, 8, 10, 4, 5, 3, 4, 4, 3, 3, 3, 9, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4,
     4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 3, 3, 4, 4, 5, 5, 3, 4, 3, 4, 5, 4, 5, 4, 5, 2,
@@ -78,6 +80,90 @@ const HERMES_OPCODE_WIDTHS: [u8; HERMES_OPCODE_COUNT] = [
     3, 3, 6, 4, 4, 3, 2, 2, 3, 14, 18, 18, 5, 7, 3, 4, 3, 3, 2, 5, 3, 6, 3, 6, 3, 6, 8, 4, 7, 4, 7,
     4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7,
 ];
+
+const BYTECODE_TABLE_OPERANDS: [BytecodeTableOperand; 31] = [
+    BytecodeTableOperand::new(67, 1, 4, BytecodeTable::String),
+    BytecodeTableOperand::new(68, 4, 1, BytecodeTable::String),
+    BytecodeTableOperand::new(69, 4, 2, BytecodeTable::String),
+    BytecodeTableOperand::new(70, 4, 4, BytecodeTable::String),
+    BytecodeTableOperand::new(71, 5, 4, BytecodeTable::String),
+    BytecodeTableOperand::new(72, 4, 2, BytecodeTable::String),
+    BytecodeTableOperand::new(73, 4, 4, BytecodeTable::String),
+    BytecodeTableOperand::new(74, 4, 2, BytecodeTable::String),
+    BytecodeTableOperand::new(75, 4, 2, BytecodeTable::String),
+    BytecodeTableOperand::new(76, 4, 4, BytecodeTable::String),
+    BytecodeTableOperand::new(77, 4, 4, BytecodeTable::String),
+    BytecodeTableOperand::new(78, 4, 2, BytecodeTable::String),
+    BytecodeTableOperand::new(79, 4, 2, BytecodeTable::String),
+    BytecodeTableOperand::new(80, 4, 4, BytecodeTable::String),
+    BytecodeTableOperand::new(81, 4, 4, BytecodeTable::String),
+    BytecodeTableOperand::new(87, 4, 4, BytecodeTable::String),
+    BytecodeTableOperand::new(128, 4, 2, BytecodeTable::Function),
+    BytecodeTableOperand::new(129, 4, 4, BytecodeTable::Function),
+    BytecodeTableOperand::new(130, 5, 2, BytecodeTable::Function),
+    BytecodeTableOperand::new(131, 5, 4, BytecodeTable::Function),
+    BytecodeTableOperand::new(132, 3, 2, BytecodeTable::Function),
+    BytecodeTableOperand::new(133, 3, 4, BytecodeTable::Function),
+    BytecodeTableOperand::new(142, 2, 2, BytecodeTable::BigInt),
+    BytecodeTableOperand::new(143, 2, 4, BytecodeTable::BigInt),
+    BytecodeTableOperand::new(144, 2, 2, BytecodeTable::String),
+    BytecodeTableOperand::new(145, 2, 4, BytecodeTable::String),
+    BytecodeTableOperand::new(159, 2, 4, BytecodeTable::String),
+    BytecodeTableOperand::new(166, 2, 4, BytecodeTable::String),
+    BytecodeTableOperand::new(166, 6, 4, BytecodeTable::String),
+    BytecodeTableOperand::new(169, 3, 2, BytecodeTable::Function),
+    BytecodeTableOperand::new(170, 3, 4, BytecodeTable::Function),
+];
+const JUMP_OPERANDS: [JumpOperand; 45] = [
+    JumpOperand::new(175, 1, 1),
+    JumpOperand::new(176, 1, 4),
+    JumpOperand::new(177, 1, 1),
+    JumpOperand::new(178, 1, 4),
+    JumpOperand::new(179, 1, 1),
+    JumpOperand::new(180, 1, 4),
+    JumpOperand::new(181, 1, 1),
+    JumpOperand::new(182, 1, 4),
+    JumpOperand::new(183, 1, 4),
+    JumpOperand::new(184, 1, 1),
+    JumpOperand::new(185, 1, 4),
+    JumpOperand::new(186, 1, 1),
+    JumpOperand::new(187, 1, 4),
+    JumpOperand::new(188, 1, 1),
+    JumpOperand::new(189, 1, 4),
+    JumpOperand::new(190, 1, 1),
+    JumpOperand::new(191, 1, 4),
+    JumpOperand::new(192, 1, 1),
+    JumpOperand::new(193, 1, 4),
+    JumpOperand::new(194, 1, 1),
+    JumpOperand::new(195, 1, 4),
+    JumpOperand::new(196, 1, 1),
+    JumpOperand::new(197, 1, 4),
+    JumpOperand::new(198, 1, 1),
+    JumpOperand::new(199, 1, 4),
+    JumpOperand::new(200, 1, 1),
+    JumpOperand::new(201, 1, 4),
+    JumpOperand::new(202, 1, 1),
+    JumpOperand::new(203, 1, 4),
+    JumpOperand::new(204, 1, 1),
+    JumpOperand::new(205, 1, 4),
+    JumpOperand::new(206, 1, 1),
+    JumpOperand::new(207, 1, 4),
+    JumpOperand::new(208, 1, 1),
+    JumpOperand::new(209, 1, 4),
+    JumpOperand::new(210, 1, 1),
+    JumpOperand::new(211, 1, 4),
+    JumpOperand::new(212, 1, 1),
+    JumpOperand::new(213, 1, 4),
+    JumpOperand::new(214, 1, 1),
+    JumpOperand::new(215, 1, 4),
+    JumpOperand::new(216, 1, 1),
+    JumpOperand::new(217, 1, 4),
+    JumpOperand::new(218, 1, 1),
+    JumpOperand::new(219, 1, 4),
+];
+
+const UINT_SWITCH_IMM_OPCODE: u8 = 167;
+const STRING_SWITCH_IMM_OPCODE: u8 = 168;
 
 const MAGIC_OFFSET: usize = 0;
 const VERSION_OFFSET: usize = 8;
@@ -600,6 +686,73 @@ pub struct HermesInstruction {
     pub width: u8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BytecodeTable {
+    String,
+    Function,
+    BigInt,
+}
+
+impl BytecodeTable {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::String => "string",
+            Self::Function => "function",
+            Self::BigInt => "bigint",
+        }
+    }
+
+    const fn limit(self, header: HermesBytecodeHeader) -> u32 {
+        match self {
+            Self::String => header.string_count,
+            Self::Function => header.function_count,
+            Self::BigInt => header.big_int_count,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BytecodeTableOperand {
+    opcode: u8,
+    offset: u8,
+    width: u8,
+    table: BytecodeTable,
+}
+
+impl BytecodeTableOperand {
+    const fn new(opcode: u8, offset: u8, width: u8, table: BytecodeTable) -> Self {
+        Self {
+            opcode,
+            offset,
+            width,
+            table,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct JumpOperand {
+    opcode: u8,
+    offset: u8,
+    width: u8,
+}
+
+impl JumpOperand {
+    const fn new(opcode: u8, offset: u8, width: u8) -> Self {
+        Self {
+            opcode,
+            offset,
+            width,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InstructionValidationContext {
+    header: HermesBytecodeHeader,
+    function_region_limit: u32,
+}
+
 /// Iterator over a Hermes function bytecode body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HermesInstructionStream<'a> {
@@ -956,6 +1109,81 @@ pub enum ParseError {
         /// Exclusive end offset of the function body.
         body_end: u32,
     },
+    /// An instruction references an invalid bytecode table entry.
+    InvalidInstructionTableReference {
+        /// Function id whose instruction stream is invalid.
+        function_id: u32,
+        /// File offset of the opcode.
+        offset: u32,
+        /// Raw opcode byte.
+        opcode: u8,
+        /// Referenced table name.
+        table: &'static str,
+        /// Referenced table index.
+        index: u32,
+        /// Declared table entry count.
+        limit: u32,
+    },
+    /// A branch target is outside the function body or not on an instruction boundary.
+    InvalidJumpTarget {
+        /// Function id whose instruction stream is invalid.
+        function_id: u32,
+        /// File offset of the opcode.
+        offset: u32,
+        /// Raw opcode byte.
+        opcode: u8,
+        /// Computed absolute target offset.
+        target: i64,
+        /// Function body start offset.
+        body_start: u32,
+        /// Exclusive function body end offset.
+        body_end: u32,
+    },
+    /// A switch instruction has an invalid table range.
+    InvalidSwitchTableRange {
+        /// Function id whose instruction stream is invalid.
+        function_id: u32,
+        /// File offset of the opcode.
+        offset: u32,
+        /// Raw opcode byte.
+        opcode: u8,
+        /// Switch minimum value.
+        minimum: u32,
+        /// Switch maximum value.
+        maximum: u32,
+    },
+    /// A switch instruction references a table outside the function payload.
+    SwitchTableOutOfBounds {
+        /// Function id whose instruction stream is invalid.
+        function_id: u32,
+        /// File offset of the opcode.
+        offset: u32,
+        /// Raw opcode byte.
+        opcode: u8,
+        /// Absolute switch table start offset.
+        table_start: u32,
+        /// Switch table size in bytes.
+        table_size: u32,
+        /// Exclusive function payload end offset.
+        region_limit: u32,
+    },
+    /// A switch table entry references an invalid branch target.
+    InvalidSwitchTableTarget {
+        /// Function id whose instruction stream is invalid.
+        function_id: u32,
+        /// File offset of the opcode.
+        offset: u32,
+        /// Raw opcode byte.
+        opcode: u8,
+        /// Switch table entry index.
+        entry_index: u32,
+        /// Computed absolute target offset.
+        target: i64,
+        /// Function body start offset.
+        body_start: u32,
+        /// Exclusive function body end offset.
+        body_end: u32,
+    },
     /// A CommonJS module table entry references an invalid function or string id.
     InvalidCjsModuleEntry {
         /// Table entry index.
@@ -1099,6 +1327,61 @@ impl fmt::Display for ParseError {
             } => write!(
                 formatter,
                 "Hermes bytecode function {function_id} instruction opcode {opcode} at {offset} has width {width}, exceeding function body end {body_end}",
+            ),
+            Self::InvalidInstructionTableReference {
+                function_id,
+                offset,
+                opcode,
+                table,
+                index,
+                limit,
+            } => write!(
+                formatter,
+                "Hermes bytecode function {function_id} instruction opcode {opcode} at {offset} references {table} table index {index}, but the table count is {limit}",
+            ),
+            Self::InvalidJumpTarget {
+                function_id,
+                offset,
+                opcode,
+                target,
+                body_start,
+                body_end,
+            } => write!(
+                formatter,
+                "Hermes bytecode function {function_id} instruction opcode {opcode} at {offset} jumps to {target}, outside instruction boundaries {body_start}..{body_end}",
+            ),
+            Self::InvalidSwitchTableRange {
+                function_id,
+                offset,
+                opcode,
+                minimum,
+                maximum,
+            } => write!(
+                formatter,
+                "Hermes bytecode function {function_id} switch opcode {opcode} at {offset} has invalid range {minimum}..={maximum}",
+            ),
+            Self::SwitchTableOutOfBounds {
+                function_id,
+                offset,
+                opcode,
+                table_start,
+                table_size,
+                region_limit,
+            } => write!(
+                formatter,
+                "Hermes bytecode function {function_id} switch opcode {opcode} at {offset} has table {table_start}+{table_size}, exceeding function payload end {region_limit}",
+            ),
+            Self::InvalidSwitchTableTarget {
+                function_id,
+                offset,
+                opcode,
+                entry_index,
+                target,
+                body_start,
+                body_end,
+            } => write!(
+                formatter,
+                "Hermes bytecode function {function_id} switch opcode {opcode} at {offset} table entry {entry_index} jumps to {target}, outside instruction boundaries {body_start}..{body_end}",
             ),
             Self::InvalidCjsModuleEntry {
                 entry_index,
@@ -1439,14 +1722,35 @@ fn validate_function_headers(
     function_bodies_offset: u32,
 ) -> Result<(), ParseError> {
     let body_limit = function_body_limit(bytes, header, function_headers)?;
+    let mut decoded_headers = Vec::with_capacity(
+        usize::try_from(header.function_count)
+            .expect("u32 always fits in usize on supported targets"),
+    );
     for function_id in 0..header.function_count {
-        let function_header = function_header_at(bytes, header, function_headers, function_id)?;
+        decoded_headers.push(function_header_at(
+            bytes,
+            header,
+            function_headers,
+            function_id,
+        )?);
+    }
+
+    for function_id in 0..header.function_count {
+        let function_header = decoded_headers
+            [usize::try_from(function_id).expect("u32 always fits in usize on supported targets")];
+        let function_region_limit = function_region_limit(function_header, &decoded_headers)
+            .unwrap_or(body_limit)
+            .min(body_limit);
         validate_function_body(
             bytes,
             function_id,
             function_header,
             function_bodies_offset,
-            body_limit,
+            function_region_limit,
+            InstructionValidationContext {
+                header,
+                function_region_limit,
+            },
         )?;
     }
     Ok(())
@@ -1458,6 +1762,7 @@ fn validate_function_body(
     function_header: HermesFunctionHeader,
     function_bodies_offset: u32,
     limit: u32,
+    context: InstructionValidationContext,
 ) -> Result<(), ParseError> {
     let body_end = function_header
         .offset
@@ -1472,9 +1777,22 @@ fn validate_function_body(
         });
     }
     validate_instruction_stream(
+        bytes,
         function_id,
         function_body(bytes, function_id, function_header)?,
+        context,
     )
+}
+
+fn function_region_limit(
+    function_header: HermesFunctionHeader,
+    function_headers: &[HermesFunctionHeader],
+) -> Option<u32> {
+    function_headers
+        .iter()
+        .map(|header| header.offset)
+        .filter(|offset| *offset > function_header.offset)
+        .min()
 }
 
 fn function_body_limit(
@@ -1533,8 +1851,391 @@ fn function_body<'a>(
     })
 }
 
-fn validate_instruction_stream(function_id: u32, body: SectionView<'_>) -> Result<(), ParseError> {
-    count_function_instructions(function_id, body).map(|_| ())
+fn validate_instruction_stream(
+    bytes: &[u8],
+    function_id: u32,
+    body: SectionView<'_>,
+    context: InstructionValidationContext,
+) -> Result<(), ParseError> {
+    let mut boundaries = Vec::new();
+    let mut instructions = Vec::new();
+    for instruction in HermesInstructionStream::new(function_id, body) {
+        let instruction = instruction?;
+        boundaries.push(instruction.offset);
+        instructions.push(instruction);
+    }
+
+    for instruction in instructions {
+        validate_instruction_table_operands(function_id, body, instruction, context.header)?;
+        validate_instruction_jump_operands(function_id, body, instruction, &boundaries)?;
+        validate_switch_instruction(bytes, function_id, body, instruction, context, &boundaries)?;
+    }
+    Ok(())
+}
+
+fn validate_instruction_table_operands(
+    function_id: u32,
+    body: SectionView<'_>,
+    instruction: HermesInstruction,
+    header: HermesBytecodeHeader,
+) -> Result<(), ParseError> {
+    let instruction_bytes = instruction_bytes(body, instruction);
+    for operand in BYTECODE_TABLE_OPERANDS
+        .iter()
+        .filter(|operand| operand.opcode == instruction.opcode)
+    {
+        let index = read_unsigned_operand(
+            instruction_bytes,
+            usize::from(operand.offset),
+            usize::from(operand.width),
+        );
+        let limit = operand.table.limit(header);
+        if index >= limit {
+            return Err(ParseError::InvalidInstructionTableReference {
+                function_id,
+                offset: instruction.offset,
+                opcode: instruction.opcode,
+                table: operand.table.name(),
+                index,
+                limit,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_instruction_jump_operands(
+    function_id: u32,
+    body: SectionView<'_>,
+    instruction: HermesInstruction,
+    boundaries: &[u32],
+) -> Result<(), ParseError> {
+    let instruction_bytes = instruction_bytes(body, instruction);
+    for operand in JUMP_OPERANDS
+        .iter()
+        .filter(|operand| operand.opcode == instruction.opcode)
+    {
+        let delta = read_signed_operand(
+            instruction_bytes,
+            usize::from(operand.offset),
+            usize::from(operand.width),
+        );
+        validate_jump_target(function_id, body, instruction, delta, boundaries)?;
+    }
+    Ok(())
+}
+
+fn validate_switch_instruction(
+    bytes: &[u8],
+    function_id: u32,
+    body: SectionView<'_>,
+    instruction: HermesInstruction,
+    context: InstructionValidationContext,
+    boundaries: &[u32],
+) -> Result<(), ParseError> {
+    match instruction.opcode {
+        UINT_SWITCH_IMM_OPCODE => validate_uint_switch_instruction(
+            bytes,
+            function_id,
+            body,
+            instruction,
+            context,
+            boundaries,
+        ),
+        STRING_SWITCH_IMM_OPCODE => validate_string_switch_instruction(
+            bytes,
+            function_id,
+            body,
+            instruction,
+            context,
+            boundaries,
+        ),
+        _ => Ok(()),
+    }
+}
+
+fn validate_uint_switch_instruction(
+    bytes: &[u8],
+    function_id: u32,
+    body: SectionView<'_>,
+    instruction: HermesInstruction,
+    context: InstructionValidationContext,
+    boundaries: &[u32],
+) -> Result<(), ParseError> {
+    let instruction_bytes = instruction_bytes(body, instruction);
+    let table_offset = read_unsigned_operand(instruction_bytes, 2, 4);
+    let default_delta = read_signed_operand(instruction_bytes, 6, 4);
+    let minimum = read_unsigned_operand(instruction_bytes, 10, 4);
+    let maximum = read_unsigned_operand(instruction_bytes, 14, 4);
+
+    validate_jump_target(function_id, body, instruction, default_delta, boundaries)?;
+    if maximum < minimum {
+        return Err(ParseError::InvalidSwitchTableRange {
+            function_id,
+            offset: instruction.offset,
+            opcode: instruction.opcode,
+            minimum,
+            maximum,
+        });
+    }
+
+    let entry_count = maximum
+        .checked_sub(minimum)
+        .and_then(|span| span.checked_add(1))
+        .ok_or(ParseError::InvalidSwitchTableRange {
+            function_id,
+            offset: instruction.offset,
+            opcode: instruction.opcode,
+            minimum,
+            maximum,
+        })?;
+    let table_bytes = checked_table_size(entry_count, size_of::<u32>() as u32);
+    let table = switch_table_bytes(
+        bytes,
+        function_id,
+        body,
+        instruction,
+        table_offset,
+        table_bytes,
+        context.function_region_limit,
+    )?;
+
+    for (entry_index, entry) in table.chunks_exact(size_of::<u32>()).enumerate() {
+        let delta = i64::from(i32::from_le_bytes(
+            entry
+                .try_into()
+                .expect("switch table entry is exactly u32 sized"),
+        ));
+        validate_switch_table_target(
+            function_id,
+            body,
+            instruction,
+            u32::try_from(entry_index).expect("switch table entry index fits in u32"),
+            delta,
+            boundaries,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_string_switch_instruction(
+    bytes: &[u8],
+    function_id: u32,
+    body: SectionView<'_>,
+    instruction: HermesInstruction,
+    context: InstructionValidationContext,
+    boundaries: &[u32],
+) -> Result<(), ParseError> {
+    let instruction_bytes = instruction_bytes(body, instruction);
+    let switch_index = read_unsigned_operand(instruction_bytes, 2, 4);
+    let table_offset = read_unsigned_operand(instruction_bytes, 6, 4);
+    let default_delta = read_signed_operand(instruction_bytes, 10, 4);
+    let entry_count = read_unsigned_operand(instruction_bytes, 14, 4);
+
+    if switch_index >= context.header.num_string_switch_imms {
+        return Err(ParseError::InvalidInstructionTableReference {
+            function_id,
+            offset: instruction.offset,
+            opcode: instruction.opcode,
+            table: "string_switch",
+            index: switch_index,
+            limit: context.header.num_string_switch_imms,
+        });
+    }
+
+    validate_jump_target(function_id, body, instruction, default_delta, boundaries)?;
+    let table_bytes = checked_table_size(entry_count, SWITCH_TABLE_CASE_SIZE as u32);
+    let table = switch_table_bytes(
+        bytes,
+        function_id,
+        body,
+        instruction,
+        table_offset,
+        table_bytes,
+        context.function_region_limit,
+    )?;
+
+    for (entry_index, entry) in table.chunks_exact(SWITCH_TABLE_CASE_SIZE).enumerate() {
+        let string_id = read_u32(entry, 0);
+        if string_id >= context.header.string_count {
+            return Err(ParseError::InvalidInstructionTableReference {
+                function_id,
+                offset: instruction.offset,
+                opcode: instruction.opcode,
+                table: "string",
+                index: string_id,
+                limit: context.header.string_count,
+            });
+        }
+        let delta = i64::from(i32::from_le_bytes(
+            entry[4..8]
+                .try_into()
+                .expect("string switch target entry is exactly i32 sized"),
+        ));
+        validate_switch_table_target(
+            function_id,
+            body,
+            instruction,
+            u32::try_from(entry_index).expect("switch table entry index fits in u32"),
+            delta,
+            boundaries,
+        )?;
+    }
+    Ok(())
+}
+
+fn switch_table_bytes<'a>(
+    bytes: &'a [u8],
+    function_id: u32,
+    body: SectionView<'_>,
+    instruction: HermesInstruction,
+    table_offset: u32,
+    table_size: u32,
+    region_limit: u32,
+) -> Result<&'a [u8], ParseError> {
+    let table_start = instruction
+        .offset
+        .checked_add(table_offset)
+        .and_then(|offset| align_u32(offset, SWITCH_TABLE_ALIGNMENT))
+        .ok_or(ParseError::SwitchTableOutOfBounds {
+            function_id,
+            offset: instruction.offset,
+            opcode: instruction.opcode,
+            table_start: u32::MAX,
+            table_size,
+            region_limit,
+        })?;
+    let table_end =
+        table_start
+            .checked_add(table_size)
+            .ok_or(ParseError::SwitchTableOutOfBounds {
+                function_id,
+                offset: instruction.offset,
+                opcode: instruction.opcode,
+                table_start,
+                table_size,
+                region_limit,
+            })?;
+
+    if table_start < body.offset + body.len() || table_end > region_limit {
+        return Err(ParseError::SwitchTableOutOfBounds {
+            function_id,
+            offset: instruction.offset,
+            opcode: instruction.opcode,
+            table_start,
+            table_size,
+            region_limit,
+        });
+    }
+
+    let start =
+        usize::try_from(table_start).expect("u32 always fits in usize on supported targets");
+    let end = usize::try_from(table_end).expect("u32 always fits in usize on supported targets");
+    bytes
+        .get(start..end)
+        .ok_or(ParseError::SwitchTableOutOfBounds {
+            function_id,
+            offset: instruction.offset,
+            opcode: instruction.opcode,
+            table_start,
+            table_size,
+            region_limit,
+        })
+}
+
+fn validate_jump_target(
+    function_id: u32,
+    body: SectionView<'_>,
+    instruction: HermesInstruction,
+    delta: i64,
+    boundaries: &[u32],
+) -> Result<(), ParseError> {
+    let target = i64::from(instruction.offset) + delta;
+    if !is_instruction_boundary(body, target, boundaries) {
+        return Err(ParseError::InvalidJumpTarget {
+            function_id,
+            offset: instruction.offset,
+            opcode: instruction.opcode,
+            target,
+            body_start: body.offset,
+            body_end: body.offset + body.len(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_switch_table_target(
+    function_id: u32,
+    body: SectionView<'_>,
+    instruction: HermesInstruction,
+    entry_index: u32,
+    delta: i64,
+    boundaries: &[u32],
+) -> Result<(), ParseError> {
+    let target = i64::from(instruction.offset) + delta;
+    if !is_instruction_boundary(body, target, boundaries) {
+        return Err(ParseError::InvalidSwitchTableTarget {
+            function_id,
+            offset: instruction.offset,
+            opcode: instruction.opcode,
+            entry_index,
+            target,
+            body_start: body.offset,
+            body_end: body.offset + body.len(),
+        });
+    }
+    Ok(())
+}
+
+fn is_instruction_boundary(body: SectionView<'_>, target: i64, boundaries: &[u32]) -> bool {
+    if target < i64::from(body.offset) || target >= i64::from(body.offset + body.len()) {
+        return false;
+    }
+    u32::try_from(target)
+        .ok()
+        .is_some_and(|target| boundaries.binary_search(&target).is_ok())
+}
+
+fn instruction_bytes(body: SectionView<'_>, instruction: HermesInstruction) -> &[u8] {
+    let start = usize::try_from(instruction.offset - body.offset)
+        .expect("instruction offset was validated inside the function body");
+    let end = start + usize::from(instruction.width);
+    &body.bytes[start..end]
+}
+
+fn read_unsigned_operand(bytes: &[u8], offset: usize, width: usize) -> u32 {
+    match width {
+        1 => u32::from(bytes[offset]),
+        2 => u32::from(u16::from_le_bytes(
+            bytes[offset..offset + 2]
+                .try_into()
+                .expect("validated instruction operand has u16 width"),
+        )),
+        4 => read_u32(bytes, offset),
+        _ => unreachable!("Hermes integer operand width is 1, 2, or 4 bytes"),
+    }
+}
+
+fn read_signed_operand(bytes: &[u8], offset: usize, width: usize) -> i64 {
+    match width {
+        1 => i64::from(i8::from_le_bytes([bytes[offset]])),
+        4 => i64::from(i32::from_le_bytes(
+            bytes[offset..offset + 4]
+                .try_into()
+                .expect("validated instruction operand has i32 width"),
+        )),
+        _ => unreachable!("Hermes jump operand width is 1 or 4 bytes"),
+    }
+}
+
+fn checked_table_size(entry_count: u32, entry_size: u32) -> u32 {
+    entry_count.checked_mul(entry_size).unwrap_or(u32::MAX)
+}
+
+fn align_u32(offset: u32, alignment: u32) -> Option<u32> {
+    offset
+        .checked_add(alignment - 1)
+        .map(|adjusted| adjusted / alignment * alignment)
 }
 
 fn count_function_instructions(function_id: u32, body: SectionView<'_>) -> Result<u32, ParseError> {
@@ -1612,6 +2313,10 @@ mod tests {
 
     const RET_OPCODE: u8 = 118;
     const LOAD_CONST_DOUBLE_OPCODE: u8 = 141;
+    const LOAD_CONST_BIGINT_OPCODE: u8 = 142;
+    const LOAD_CONST_STRING_OPCODE: u8 = 144;
+    const CREATE_CLOSURE_OPCODE: u8 = 132;
+    const JMP_OPCODE: u8 = 175;
 
     fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
         bytes[offset..offset + size_of::<u32>()].copy_from_slice(&value.to_le_bytes());
@@ -1862,6 +2567,70 @@ mod tests {
         bytes
     }
 
+    fn replace_global_body(bytes: &mut Vec<u8>, body: &[u8]) -> u32 {
+        replace_global_body_with_payload(bytes, body, &[]).0
+    }
+
+    fn replace_global_body_with_payload(
+        bytes: &mut Vec<u8>,
+        body: &[u8],
+        payload: &[u8],
+    ) -> (u32, u32) {
+        let bytecode = HermesBytecode::parse(bytes).expect("valid fixture");
+        let header = bytecode.header();
+        let sections = bytecode.sections();
+        let global = bytecode
+            .global_function_header()
+            .expect("valid global function");
+        let body_offset =
+            usize::try_from(global.offset).expect("test fixture offset fits in usize");
+        let old_debug_offset =
+            usize::try_from(header.debug_info_offset).expect("test fixture offset fits in usize");
+        let function_header_offset = sections.function_headers().offset() as usize
+            + usize::try_from(header.global_code_index)
+                .expect("test fixture global index fits in usize")
+                * SMALL_FUNC_HEADER_SIZE;
+
+        let mut replacement = Vec::with_capacity(body.len() + payload.len() + 4);
+        replacement.extend_from_slice(body);
+        replacement.extend_from_slice(payload);
+        while !(body_offset + replacement.len()).is_multiple_of(HERMES_BYTECODE_ALIGNMENT) {
+            replacement.push(0);
+        }
+
+        bytes.splice(body_offset..old_debug_offset, replacement);
+        let new_debug_offset = u32::try_from(body_offset + body.len() + payload.len())
+            .expect("test fixture offset fits in u32");
+        let new_debug_offset_aligned =
+            align_u32(new_debug_offset, HERMES_BYTECODE_ALIGNMENT as u32)
+                .expect("test fixture aligned offset fits in u32");
+        let new_file_length = u32::try_from(bytes.len()).expect("test fixture length fits in u32");
+        write_u32(bytes, DEBUG_INFO_OFFSET_OFFSET, new_debug_offset_aligned);
+        write_u32(bytes, FILE_LENGTH_OFFSET, new_file_length);
+        bytes[function_header_offset..function_header_offset + SMALL_FUNC_HEADER_SIZE]
+            .copy_from_slice(&encode_small_function_header(SmallFunctionHeaderFixture {
+                offset: global.offset,
+                bytecode_size_in_bytes: u32::try_from(body.len())
+                    .expect("test fixture body length fits in u32"),
+                param_count: global.param_count,
+                loop_depth: global.loop_depth,
+                function_name: global.function_name,
+                number_reg_count: global.number_reg_count,
+                non_ptr_reg_count: global.non_ptr_reg_count,
+                frame_size: u8::try_from(global.frame_size)
+                    .expect("test fixture frame size fits in u8"),
+                read_cache_size: global.read_cache_size,
+                write_cache_size: global.write_cache_size,
+                private_name_cache_size: global.private_name_cache_size,
+                flags: global.flags,
+            }));
+
+        (
+            u32::try_from(body_offset).expect("test fixture offset fits in u32"),
+            new_debug_offset_aligned,
+        )
+    }
+
     #[test]
     fn parses_header_without_copying_payload() {
         let bytes = fixture_bytecode();
@@ -2110,12 +2879,11 @@ mod tests {
     #[test]
     fn rejects_function_body_outside_function_region() {
         let mut bytes = fixture_bytecode();
-        let (function_headers_offset, function_bodies_offset, debug_info_offset) = {
+        let (function_headers_offset, function_bodies_offset) = {
             let bytecode = HermesBytecode::parse(&bytes).expect("valid fixture");
             (
                 bytecode.sections().function_headers().offset() as usize,
                 bytecode.sections().function_bodies_offset(),
-                bytecode.header().debug_info_offset,
             )
         };
         bytes[function_headers_offset..function_headers_offset + SMALL_FUNC_HEADER_SIZE]
@@ -2142,7 +2910,7 @@ mod tests {
                 offset: function_bodies_offset - 1,
                 size: 2,
                 function_bodies_offset,
-                limit: debug_info_offset,
+                limit: function_bodies_offset + 2,
             },
         );
     }
@@ -2232,6 +3000,156 @@ mod tests {
                 function_id: 0,
                 offset: function_body_offset as u32,
                 opcode: 0xff,
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_string_operand_reference() {
+        let mut bytes = fixture_bytecode();
+        let function_body_offset =
+            replace_global_body(&mut bytes, &[LOAD_CONST_STRING_OPCODE, 0, 99, 0]);
+
+        let error = HermesBytecode::parse(&bytes).expect_err("invalid string operand must fail");
+        assert_eq!(
+            error,
+            ParseError::InvalidInstructionTableReference {
+                function_id: 1,
+                offset: function_body_offset,
+                opcode: LOAD_CONST_STRING_OPCODE,
+                table: "string",
+                index: 99,
+                limit: 2,
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_function_operand_reference() {
+        let mut bytes = fixture_bytecode();
+        let function_body_offset =
+            replace_global_body(&mut bytes, &[CREATE_CLOSURE_OPCODE, 0, 0, 99, 0]);
+
+        let error = HermesBytecode::parse(&bytes).expect_err("invalid function operand must fail");
+        assert_eq!(
+            error,
+            ParseError::InvalidInstructionTableReference {
+                function_id: 1,
+                offset: function_body_offset,
+                opcode: CREATE_CLOSURE_OPCODE,
+                table: "function",
+                index: 99,
+                limit: 2,
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_bigint_operand_reference() {
+        let mut bytes = fixture_bytecode();
+        let function_body_offset =
+            replace_global_body(&mut bytes, &[LOAD_CONST_BIGINT_OPCODE, 0, 99, 0]);
+
+        let error = HermesBytecode::parse(&bytes).expect_err("invalid bigint operand must fail");
+        assert_eq!(
+            error,
+            ParseError::InvalidInstructionTableReference {
+                function_id: 1,
+                offset: function_body_offset,
+                opcode: LOAD_CONST_BIGINT_OPCODE,
+                table: "bigint",
+                index: 99,
+                limit: 1,
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_jump_target_between_instructions() {
+        let mut bytes = fixture_bytecode();
+        let function_body_offset = replace_global_body(&mut bytes, &[JMP_OPCODE, 1]);
+
+        let error = HermesBytecode::parse(&bytes).expect_err("invalid jump target must fail");
+        assert_eq!(
+            error,
+            ParseError::InvalidJumpTarget {
+                function_id: 1,
+                offset: function_body_offset,
+                opcode: JMP_OPCODE,
+                target: i64::from(function_body_offset + 1),
+                body_start: function_body_offset,
+                body_end: function_body_offset + 2,
+            },
+        );
+    }
+
+    #[test]
+    fn accepts_valid_uint_switch_table_target() {
+        let mut bytes = fixture_bytecode();
+        let mut body = [0; 18];
+        body[0] = UINT_SWITCH_IMM_OPCODE;
+        body[2..6].copy_from_slice(&18_u32.to_le_bytes());
+        body[6..10].copy_from_slice(&0_i32.to_le_bytes());
+        body[10..14].copy_from_slice(&0_u32.to_le_bytes());
+        body[14..18].copy_from_slice(&0_u32.to_le_bytes());
+
+        replace_global_body_with_payload(&mut bytes, &body, &0_i32.to_le_bytes());
+
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid switch table target");
+        assert_eq!(bytecode.global_instruction_count(), Ok(1));
+    }
+
+    #[test]
+    fn rejects_switch_table_target_between_instructions() {
+        let mut bytes = fixture_bytecode();
+        let mut body = [0; 18];
+        body[0] = UINT_SWITCH_IMM_OPCODE;
+        body[2..6].copy_from_slice(&18_u32.to_le_bytes());
+        body[6..10].copy_from_slice(&0_i32.to_le_bytes());
+        body[10..14].copy_from_slice(&0_u32.to_le_bytes());
+        body[14..18].copy_from_slice(&0_u32.to_le_bytes());
+        let function_body_offset =
+            replace_global_body_with_payload(&mut bytes, &body, &1_i32.to_le_bytes()).0;
+
+        let error = HermesBytecode::parse(&bytes).expect_err("invalid switch target must fail");
+        assert_eq!(
+            error,
+            ParseError::InvalidSwitchTableTarget {
+                function_id: 1,
+                offset: function_body_offset,
+                opcode: UINT_SWITCH_IMM_OPCODE,
+                entry_index: 0,
+                target: i64::from(function_body_offset + 1),
+                body_start: function_body_offset,
+                body_end: function_body_offset + 18,
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_string_switch_table_string_reference() {
+        let mut bytes = fixture_bytecode();
+        write_u32(&mut bytes, NUM_STRING_SWITCH_IMMS_OFFSET, 1);
+        let mut body = [0; 18];
+        body[0] = STRING_SWITCH_IMM_OPCODE;
+        body[2..6].copy_from_slice(&0_u32.to_le_bytes());
+        body[6..10].copy_from_slice(&18_u32.to_le_bytes());
+        body[10..14].copy_from_slice(&0_i32.to_le_bytes());
+        body[14..18].copy_from_slice(&1_u32.to_le_bytes());
+        let function_body_offset =
+            replace_global_body_with_payload(&mut bytes, &body, &[99, 0, 0, 0, 0, 0, 0, 0]).0;
+
+        let error =
+            HermesBytecode::parse(&bytes).expect_err("invalid string switch label must fail");
+        assert_eq!(
+            error,
+            ParseError::InvalidInstructionTableReference {
+                function_id: 1,
+                offset: function_body_offset,
+                opcode: STRING_SWITCH_IMM_OPCODE,
+                table: "string",
+                index: 99,
+                limit: 2,
             },
         );
     }

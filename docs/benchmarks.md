@@ -36,7 +36,7 @@ mise run rn-ios-build-release
 - `rn-android-build-release`와 `rn-ios-build-release`는 최적화된 RN/Hermes 기준선 수집 전 release 빌드를 확인한다. Android release는 Hermes flavor를 기준으로 빌드한다. iOS task는 simulator build 확인용이며 최종 성능 기준선은 물리 기기에서 남긴다.
 - `rn-android-build-iris-engine`은 로컬 Iris Android 엔진 AAR skeleton을 빌드한다.
 - `rn-android-build-iris-release`는 `IRIS_ENGINE_AAR`가 실제 RN 호환 Iris 엔진 artifact를 가리킬 때만 `irisRelease` APK를 빌드한다.
-- `rn-android-build-iris-release-local`은 로컬 skeleton AAR로 `irisRelease` APK 빌드 계약을 검증한다. 이 APK는 runtime 생성 시 의도적으로 실패하므로 성능 비교값으로 쓰지 않는다.
+- `rn-android-build-iris-release-local`은 로컬 skeleton AAR로 `irisRelease` APK 빌드 계약을 검증한다. 이 APK는 Iris-owned JSI runtime을 만들지만 JS 실행 연산에서 의도적으로 실패하므로 성능 비교값으로 쓰지 않는다.
 - 이 명령들은 CI 필수 체크에 포함하지 않는다.
 
 ## 산출물
@@ -98,7 +98,7 @@ Iris AAR은 `docs/iris-android-engine-contract.md`의 `IrisJSRuntimeFactoryProvi
 mise run rn-android-build-iris-release-local
 ```
 
-이 APK는 `libirisengine.so`와 hermesc bytecode bundle이 같이 패키징되는지 확인하기 위한 것이다. 아직 Iris runtime이 구현되지 않았으므로 벤치마크 비교값으로 쓰지 않는다.
+이 APK는 `libirisengine.so`와 hermesc bytecode bundle이 같이 패키징되고 RN이 Iris-owned JSI runtime 객체를 받는지 확인하기 위한 것이다. 아직 Iris runtime의 JS 실행 기능이 구현되지 않았으므로 벤치마크 비교값으로 쓰지 않는다.
 
 자동화 스크립트는 다른 엔진 APK가 생겼을 때 다음처럼 같은 하네스에 연결한다.
 

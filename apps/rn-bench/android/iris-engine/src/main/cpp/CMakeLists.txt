@@ -8,6 +8,7 @@ find_package(fbjni REQUIRED CONFIG)
 add_library(
   irisengine
   SHARED
+  IrisRuntime.cpp
   JIrisJSRuntimeFactory.cpp
   OnLoad.cpp
 )

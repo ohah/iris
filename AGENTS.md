@@ -6,6 +6,7 @@
 
 - [개발 명령](docs/development-commands.md)
 - [필수 프로젝트 규칙](docs/project-rules.md)
+- [엔진 전략](docs/engine-strategy.md)
 - [PR 체크리스트](docs/pr-checklist.md)
 - [파일/폴더 구조](docs/project-structure.md)
 - [레퍼런스](docs/references.md)
@@ -14,7 +15,7 @@
 
 ## 핵심 원칙
 
-- Iris v1은 React Native 최신 안정 버전과 Hermes V1의 관측 가능한 동작 호환성을 최우선으로 둔다.
+- Iris v1은 Hermes bytecode 형식이 아니라 React Native 최신 안정 버전과 Hermes V1의 관측 가능한 동작 호환성을 최우선으로 둔다.
 - 기존 React Native 앱 코드 수정을 요구하는 최적화는 기본 경로에 넣지 않는다.
 - 성능 주장은 기준선, 기기, OS, 빌드 타입, 반복 횟수, 측정 도구가 있는 벤치마크로만 주장한다.
 - JSI/C++/Rust 경계는 소유권, lifetime, thread affinity를 명시한다.

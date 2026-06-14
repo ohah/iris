@@ -34,6 +34,8 @@ flowchart TD
 
 - [ ] React Native/Hermes 관측 가능 동작을 유지합니다.
 - [ ] 기존 React Native 앱 코드 수정을 요구하지 않습니다.
+- [ ] Hermes HBC 형식 호환을 제품 목표처럼 가정하지 않았습니다.
+- [ ] Iris 전용 bundle pipeline/backend 변경이 있으면 compiler/source hash/transform/runtime backend를 기록했습니다.
 - [ ] JSI/C++/Rust lifetime과 thread affinity를 문서화했습니다.
 - [ ] 호환성을 바꾸는 실험이면 opt-in 경로로 격리했습니다.
 - 근거:
@@ -42,11 +44,12 @@ flowchart TD
 
 - [ ] 기존 Iris 전략을 유지합니다.
 - [ ] 필요한 라벨이 없으면 `mise run sync-labels`로 생성하거나 갱신했습니다.
-- [ ] Hermes V1 호환성 목표를 해치지 않습니다.
+- [ ] Hermes V1 관측 가능 동작 호환성 목표를 해치지 않습니다.
 - [ ] 테스트/E2E/벤치마크 전략에 빈틈이 생기지 않았습니다.
 - [ ] 새 의존성이 있다면 왜 지금 필요한지 설명했습니다.
 - [ ] 메모리/zero-copy 전략을 성급하게 복잡하게 만들지 않았습니다.
 - [ ] RN, TurboModule, Fabric, Metro, debugger, source map 경계를 나중에 막지 않습니다.
+- [ ] 성능 측정이 RN strict engine comparison, HBC strict microbenchmark, bootstrap/frontier, native mirror 중 무엇인지 명시했습니다.
 
 ## 테스트
 

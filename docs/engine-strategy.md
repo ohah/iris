@@ -1,0 +1,72 @@
+# Iris 엔진 전략
+
+Iris의 제품 목표는 Hermes bytecode 호환 엔진이 아니라 React Native Hermes 관측 가능 동작 호환 엔진이다.
+
+## 최우선 호환성 정의
+
+Iris v1은 사용자가 기존 React Native 앱 코드를 수정하지 않고 엔진만 Iris로 바꿨다고 느끼는 것을 목표로 한다. 호환성 기준은 내부 bytecode 형식이 아니라 앱과 React Native가 관측하는 동작이다.
+
+필수 기준은 다음이다.
+
+- 같은 React Native 앱 코드가 Hermes와 Iris에서 수정 없이 실행된다.
+- JavaScript 실행 결과가 Hermes와 같다.
+- JSI `Runtime`, `Value`, `Object`, `Function`, `HostObject`, `HostFunction`, `ArrayBuffer` 경계가 Hermes와 같은 방식으로 보인다.
+- Promise, microtask, timer, unhandled rejection, exception propagation 순서가 Hermes와 호환된다.
+- `Error` 객체, stack trace, source map, symbolication, crash diagnostic이 Hermes 기준선과 호환된다.
+- React Native core가 참조하는 `HermesInternal` surface를 제공한다.
+- Fabric, TurboModule, Codegen, Metro, debugger, profiler 경계가 기존 앱 코드 수정을 요구하지 않는다.
+- Android와 iOS에서 사용자가 선택하는 엔진 경험이 동일해야 한다.
+
+## 필수가 아닌 것
+
+다음은 호환성 목표가 아니다.
+
+- Hermes HBC 파일을 그대로 실행하는 것
+- Hermes bytecode format을 Iris의 내부 IR로 고정하는 것
+- `hermesc` 산출물을 Iris release의 유일한 입력으로 유지하는 것
+- QuickJS, JavaScriptCore, 자체 IR 같은 backend 실험을 금지하는 것
+
+Hermes HBC는 strict 비교와 분석용 baseline으로 사용할 수 있다. 하지만 HBC 실행 성공이 RN/Hermes 관측 가능 동작 호환을 증명하지는 않는다.
+
+## Bundle Pipeline 원칙
+
+Iris는 자체 bundle pipeline을 가질 수 있다.
+
+```mermaid
+flowchart TD
+  Source["기존 RN 앱 소스"] --> Metro["Metro 또는 Iris용 변환 단계"]
+  Metro --> Artifact["Iris bundle 또는 Iris IR"]
+  Artifact --> Runtime["Iris Runtime"]
+  Runtime --> RN["React Native JSI surface"]
+```
+
+허용되는 변경은 다음 조건을 만족해야 한다.
+
+- 앱 소스 코드는 Hermes 기준선과 동일해야 한다.
+- 사용자는 Babel plugin, JS shim, import path 변경 같은 앱 코드 마이그레이션을 요구받지 않아야 한다.
+- bundle artifact가 Hermes HBC가 아니라면 PR과 benchmark artifact에 compiler, input source hash, transform 옵션, runtime backend를 기록한다.
+- Iris 전용 transform이 observable behavior를 바꾼다면 기본 경로가 아니라 opt-in 실험으로 격리한다.
+- Hermes/JSC fallback을 Iris 성능값으로 측정하지 않는다.
+
+## Backend 후보 정책
+
+Backend는 구현 세부사항이다. 후보 선택은 React Native/Hermes 관측 가능 동작 호환과 성능 측정으로 판단한다.
+
+- `iris-hbc`: Hermes HBC 분석, strict 동일 입력 비교, scalar executor 기준선에 사용한다. 최종 제품 경로로 고정하지 않는다.
+- `iris-qjs`: QuickJS 기반 RN bootstrap/JSI 호환성 실험 backend로 사용할 수 있다. Hermes 관측 가능 동작 shim과 RN 경계 검증이 동반되어야 한다.
+- `iris-ir`: 장기적으로 Iris 자체 IR/compiler를 둘 수 있다. 이 경우 Metro/RN bundle pipeline 계약과 source map/debugger 전략을 먼저 문서화한다.
+- JavaScriptCore는 플랫폼 참고 또는 opt-in 실험으로 다룬다.
+- V8은 iOS 동일 비교축이 없으므로 기본 Hermes 대체 엔진 후보가 아니라 사례 참고 대상으로만 다룬다.
+
+## Benchmark 분류
+
+성능 주장은 다음 분류를 명시해야 한다.
+
+| 분류                        | 의미                                                                                                    | ratio 허용                          |
+| --------------------------- | ------------------------------------------------------------------------------------------------------- | ----------------------------------- |
+| RN strict engine comparison | 같은 RN 앱 코드, 같은 benchmark case, release build, Hermes/Iris runtime이 모두 실제 JS workload를 완료 | 허용                                |
+| HBC strict microbenchmark   | 같은 JS 소스와 같은 HBC 파일을 Hermes와 Iris HBC executor가 실행                                        | 허용하되 RN 체감 성능으로 주장 금지 |
+| Iris bootstrap/frontier     | Iris runtime이 metadata parse, coverage scan, execution frontier를 측정                                 | Hermes JS workload ratio 금지       |
+| Native mirror               | JS workload와 비슷한 native 계산 probe                                                                  | strict engine ratio 금지            |
+
+HBC strict microbenchmark는 좋은 회귀 기준선이지만, 사용자가 체감하는 "엔진만 바꿨더니 빨라짐"을 증명하려면 RN strict engine comparison이 필요하다.

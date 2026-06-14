@@ -15,12 +15,15 @@ Iris에서 작업하는 모든 에이전트와 개발자는 이 규칙을 따른
 
 ## Iris 호환성 원칙
 
-- Iris v1의 최우선 목표는 React Native 최신 안정 버전과 Hermes V1의 관측 가능한 동작 호환성이다.
+- Iris v1의 최우선 목표는 React Native 최신 안정 버전과 Hermes V1의 관측 가능한 동작 호환성이다. 세부 기준은 [엔진 전략](engine-strategy.md)을 단일 출처로 둔다.
 - 기존 React Native 앱 코드 수정을 요구하는 최적화는 기본 경로에 넣지 않는다.
-- QuickJS, JavaScriptCore, Hermes, Lynx 등 외부 런타임은 동작 비교와 설계 참고 대상으로 사용한다. V8은 iOS 동일 축이 없으므로 Hermes 대체 엔진 후보가 아니라 과거 사례 참고 대상으로만 다룬다. 코드 표현을 그대로 옮기지 않는다.
+- Hermes bytecode format 호환은 필수 목표가 아니다. Iris는 Hermes HBC 대신 자체 bundle pipeline, 자체 IR, QuickJS backend 같은 내부 구현을 선택할 수 있다.
+- QuickJS, JavaScriptCore, Hermes, Lynx 등 외부 런타임은 동작 비교와 설계 참고 대상으로 사용한다. QuickJS는 React Native bootstrap/JSI 호환성 실험 backend로 허용하지만 Hermes 관측 가능 동작 shim과 검증 계획을 함께 둔다. V8은 iOS 동일 축이 없으므로 Hermes 대체 엔진 후보가 아니라 과거 사례 참고 대상으로만 다룬다. 코드 표현을 그대로 옮기지 않는다.
 - 외부 런타임 소스는 `references/` 아래 read-only 참고 자료로만 사용한다. `references/`는 git에 커밋하지 않는 로컬 체크아웃이며, 무엇을 받는지는 [레퍼런스](references.md)를 단일 출처로 둔다(`mise run fetch-references`).
 - 엔진, JSI, TurboModule, Fabric, Metro, source map, debugger 경계를 바꾸는 변경은 호환성 테스트와 벤치마크 계획을 먼저 남긴다.
+- Iris 전용 bundle pipeline을 도입해도 앱 소스 코드는 Hermes 기준선과 같아야 한다. compiler, source hash, transform option, runtime backend는 benchmark artifact와 PR에 기록한다.
 - 성능 주장은 수치로 검증한다. 기준선, 기기, OS, 빌드 타입, 반복 횟수, 측정 도구를 기록하지 않은 주장은 PR에서 성능 개선으로 쓰지 않는다.
+- HBC strict microbenchmark, Iris bootstrap/frontier, native mirror 측정은 RN strict engine comparison과 구분한다. 분류 기준은 [엔진 전략](engine-strategy.md)의 benchmark 분류를 따른다.
 - `core performance budget` 필수 체크는 항상 존재해야 한다. 실제 benchmark가 없는 단계에서는 placeholder 게이트임을 문서와 산출물에 명시한다.
 
 ## 의존성

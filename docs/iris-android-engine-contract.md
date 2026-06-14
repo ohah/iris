@@ -60,21 +60,25 @@ object IrisJSRuntimeFactoryProvider {
 
 ## Bundle 계약
 
-Iris는 Hermes 대체 엔진으로 비교한다. 따라서 `irisRelease`도 Hermes 기준선과 같은 RN release bundle pipeline을 탄다.
+Iris는 Hermes 대체 엔진으로 비교하지만, 제품 목표는 Hermes HBC 형식 호환이 아니라 React Native/Hermes 관측 가능 동작 호환이다. 따라서 `irisRelease`는 Hermes 기준선과 같은 앱 소스를 사용해야 하지만, 내부 bundle artifact는 Hermes HBC가 아니어도 된다.
 
-- `irisRelease`의 `index.android.bundle`은 hermesc가 만든 bytecode bundle이다.
-- plain JS bundle이나 JSC fallback을 Iris 성능값으로 측정하지 않는다.
+- `irisRelease`는 같은 RN 앱 소스, 같은 benchmark case, 같은 native module surface를 사용해야 한다.
+- Iris 전용 bundle pipeline을 쓰는 경우 compiler, source hash, transform option, runtime backend를 artifact에 기록한다.
+- Hermes HBC를 쓰는 경로는 strict HBC microbenchmark 또는 기존 skeleton/bootstrap 비교용 baseline으로만 고정한다.
+- Hermes, JSC, 또는 다른 런타임 fallback을 Iris 성능값으로 측정하지 않는다.
+- QuickJS backend는 Iris-owned runtime 내부 구현으로 사용할 수 있지만, RN 앱 코드 수정을 요구하지 않고 Hermes 관측 가능 동작 shim과 검증 계획을 제공해야 한다.
 - V8은 iOS 동일 비교축이 없으므로 Iris/Hermes 대체 성능 비교 대상에 포함하지 않는다.
-- Iris가 이 bytecode를 검증한 뒤 아직 실행할 수 없다면 실패가 맞다. 성공한 것처럼 우회하지 않는다.
+- Iris가 선택한 bundle artifact를 아직 실행할 수 없다면 실패가 맞다. 성공한 것처럼 우회하지 않는다.
 - skeleton `irisRelease` APK에는 `libhermesvm.so`가 없어야 한다. `libhermestooling.so`는 RN의 hermesc bytecode/tooling packaging 경로 때문에 남을 수 있지만 runtime factory와 runtime object는 Iris AAR에서 온다.
-- `bench-android-engine-compare-check`는 실제 APK 안의 `assets/index.android.bundle`도 검증한다. generated bundle과 APK bundle이 다르거나 Hermes/Iris packaged bundle SHA-256이 다르면 측정하지 않는다.
+- 현재 `bench-android-engine-compare-check`는 HBC 비교 모드의 preflight라서 실제 APK 안의 `assets/index.android.bundle`도 검증한다. Iris 전용 bundle pipeline이 들어오면 같은 앱 소스와 artifact manifest parity를 확인하는 preflight로 확장해야 한다.
 - `bench-android-engine-compare-check`는 Hermes APK에 `libhermesvm.so`가 있고 `libirisengine.so`/`libjsc.so`가 없는지, Iris APK에 `libirisengine.so`가 있고 `libhermesvm.so`/`libjsc.so`가 없는지도 확인한다.
 - skeleton의 smoke 기준은 RN 초기화가 Iris runtime host surface를 통과하고 Hermes bytecode를 확인한 뒤 `iris-engine-bootstrap` benchmark artifact를 앱 로그에 출력하는 것이다. RN 0.85 local skeleton HBC gap 기준 coverage는 `supportedInstructions=2888/2888`, `supportedUniqueOpcodes=46/46`, `unsupportedUniqueOpcodes=0`, `firstUnsupported=none`이다. 현재 `iris-hbc-scalar-execution-frontier` case는 `detail=status=frontier, error=Iris scalar executor function 3 exceeded step limit 50000`처럼 bounded scalar execution frontier를 남긴다. artifact에는 Hermes benchmark case와 sample shape를 맞춘 `iris-native-*-mirror` C++ probe도 포함한다. 이 mirror case는 JavaScript 실행이나 JS/TurboModule boundary를 통과하지 않으므로 strict engine comparison 값이 아니다. 이는 module factory와 React 앱 실행 완료나 Hermes/RN 실행 호환성 완료를 의미하지 않는다. detail이 `status=frontier`이면 그 값은 성공 workload 시간이 아니라 첫 의미론 차단점까지의 실행 시간이다.
 
 ## 호환성 기준
 
-Iris의 목표는 React Native Hermes 100% 호환이다. 최소 기준은 다음이다.
+Iris의 목표는 React Native Hermes 관측 가능 동작 100% 호환이다. Hermes HBC 형식 호환은 필수 목표가 아니다. 최소 기준은 다음이다.
 
+- 기존 RN 앱 코드 수정을 요구하지 않는다.
 - RN 0.85 New Architecture, Fabric, TurboModule 경로가 Hermes와 같은 JS surface로 동작한다.
 - RN core가 참조하는 Hermes observable surface를 제공한다. 예: `HermesInternal`, stack 형식, Promise rejection tracker, microtask 동작.
 - Hermes와 비교하는 RN JS workload benchmark artifact는 release build, New Architecture, TurboModule number/string case, Iris native module probe를 모두 포함해야 한다. 현재 skeleton의 `iris-engine-bootstrap` artifact는 이 기준을 만족하는 비교 artifact가 아니라 HBC bootstrap/frontier 측정 artifact다.

@@ -4,6 +4,10 @@ Iris is a React Native JavaScript runtime experiment focused on preserving
 React Native 0.85 and Hermes V1 observable compatibility before making
 performance claims.
 
+Iris does not require Hermes bytecode format compatibility as a product goal.
+The compatibility target is Hermes-observable React Native behavior with zero
+application-code migration. See [engine strategy](docs/engine-strategy.md).
+
 ## Tooling
 
 - `mise` pins Bun, Node.js, and Rust.

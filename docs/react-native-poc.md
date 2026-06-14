@@ -35,6 +35,8 @@ mise run rn-android-build-debug
 mise run rn-android-build-iris-engine
 mise run rn-android-build-iris-release
 mise run rn-android-build-iris-release-local
+mise run rn-android-build-engine-comparison
+mise run rn-android-build-engine-comparison-local
 mise run rn-ios-build-debug
 mise run rn-android-build-release
 mise run rn-ios-build-release
@@ -42,6 +44,8 @@ mise run bench-smoke
 mise run bench-js
 mise run bench-android-release
 mise run bench-android-release-repeat
+mise run bench-android-engine-compare-check
+mise run bench-android-engine-compare-local-check
 mise run bench-android-engine-compare
 mise run bench-extract-fixture
 mise run bench-extract-release-fixture
@@ -55,7 +59,7 @@ mise run check
 
 현재 앱의 측정 버튼은 개발 중 빠르게 기준을 확인하기 위한 smoke benchmark다. `mise run bench-*` 명령은 같은 JS benchmark case를 로컬 산출물로 기록하지만 아직 CI 필수 체크는 아니다. 개발 중 Hermes 앱 smoke 기준선은 Metro 로그의 `IRIS_BENCHMARK_ARTIFACT`를 `mise run bench-extract-hermes`로 추출해 `artifacts/bench/hermes-baseline.json`에 남긴다.
 
-릴리스 성능 주장을 하려면 물리 기기에서 실행한 release 앱 로그의 `IRIS_BENCHMARK_ARTIFACT`를 `mise run bench-extract-hermes-release`로 추출해 `artifacts/bench/hermes-release-baseline.json`에 남긴다. Android 반복 측정은 `mise run bench-android-release-repeat`로 run별 report와 `artifacts/bench/hermes-release-baseline-summary.json`을 남긴다. Hermes/Iris 엔진 대체 비교는 `IRIS_ENGINE_AAR`로 실제 Iris 엔진 APK를 빌드한 뒤 `mise run bench-android-engine-compare`로 남긴다. Iris AAR 계약은 `docs/iris-android-engine-contract.md`를 따른다. 이 추출은 release build, Hermes 또는 Iris 엔진 runtime, New Architecture, Iris module compute, TurboModule number/string case를 모두 요구한다. RN 0.85 bridgeless Android에서는 `global.__turboModuleProxy`가 노출되지 않을 수 있으므로 전역 proxy 플래그가 아니라 실제 Codegen TurboModule benchmark case 실행 여부를 기준으로 삼는다. 산출물에는 다음 조건을 기록해야 한다.
+릴리스 성능 주장을 하려면 물리 기기에서 실행한 release 앱 로그의 `IRIS_BENCHMARK_ARTIFACT`를 `mise run bench-extract-hermes-release`로 추출해 `artifacts/bench/hermes-release-baseline.json`에 남긴다. Android 반복 측정은 `mise run bench-android-release-repeat`로 run별 report와 `artifacts/bench/hermes-release-baseline-summary.json`을 남긴다. Hermes/Iris 엔진 대체 비교는 `IRIS_ENGINE_AAR`로 실제 Iris 엔진 APK를 빌드한 뒤 `mise run bench-android-engine-compare-check`로 APK runtime boundary와 HBC 입력 parity를 확인하고 `mise run bench-android-engine-compare`로 남긴다. 로컬 skeleton은 `mise run bench-android-engine-compare-local-check`로 preflight까지만 검증한다. Iris AAR 계약은 `docs/iris-android-engine-contract.md`를 따른다. 이 추출은 release build, Hermes 또는 Iris 엔진 runtime, New Architecture, Iris module compute, TurboModule number/string case를 모두 요구한다. RN 0.85 bridgeless Android에서는 `global.__turboModuleProxy`가 노출되지 않을 수 있으므로 전역 proxy 플래그가 아니라 실제 Codegen TurboModule benchmark case 실행 여부를 기준으로 삼는다. 산출물에는 다음 조건을 기록해야 한다.
 
 - 기기 모델, OS 버전, 빌드 타입
 - React Native, Hermes, Iris commit

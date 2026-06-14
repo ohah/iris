@@ -83,6 +83,8 @@ android {
     defaultConfig {
         applicationId "com.iris.bench"
         manifestPlaceholders["appLabel"] = "IrisBench"
+        manifestPlaceholders["mainApplicationName"] = "com.iris.bench.MainApplication"
+        manifestPlaceholders["mainActivityName"] = "com.iris.bench.MainActivity"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1
@@ -94,12 +96,16 @@ android {
             dimension "engine"
             applicationId "com.iris.bench.hermes"
             manifestPlaceholders["appLabel"] = "IrisBench Hermes"
+            manifestPlaceholders["mainApplicationName"] = "com.iris.bench.hermes.MainApplication"
+            manifestPlaceholders["mainActivityName"] = "com.iris.bench.hermes.MainActivity"
             buildConfigField "String", "IRIS_ENGINE_FLAVOR", "\"hermes\""
         }
         iris {
             dimension "engine"
             applicationId "com.iris.bench.iris"
             manifestPlaceholders["appLabel"] = "IrisBench Iris"
+            manifestPlaceholders["mainApplicationName"] = "com.iris.bench.iris.MainApplication"
+            manifestPlaceholders["mainActivityName"] = "com.iris.bench.iris.MainActivity"
             buildConfigField "String", "IRIS_ENGINE_FLAVOR", "\"iris\""
         }
     }

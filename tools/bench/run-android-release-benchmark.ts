@@ -49,6 +49,7 @@ const waitMs = readNumberArg("--wait-ms", 45_000);
 const runs = readNumberArg("--runs", 1);
 const allowNonHermes = hasArg("--allow-non-hermes");
 const keepSession = hasArg("--keep-session");
+const nativeBootstrapArtifact = hasArg("--native-bootstrap-artifact");
 
 type AgentJson<T> = {
   data: T;
@@ -114,6 +115,28 @@ function run(command: string, args: string[]) {
       );
     }
 
+    if (error instanceof Error && "stdout" in error && "stderr" in error) {
+      const stdout = error.stdout == null ? "" : String(error.stdout);
+      const stderr = error.stderr == null ? "" : String(error.stderr);
+      const output = `${stdout}${stderr}`.trim();
+      throw new Error(`${commandLine(command, args)} failed.\n${output}`);
+    }
+
+    throw error;
+  }
+}
+
+function readCommand(command: string, args: string[]) {
+  console.log(`$ ${commandLine(command, args)}`);
+
+  try {
+    return execFileSync(command, args, {
+      cwd: root,
+      encoding: "utf8",
+      maxBuffer: 64 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (error) {
     if (error instanceof Error && "stdout" in error && "stderr" in error) {
       const stdout = error.stdout == null ? "" : String(error.stdout);
       const stderr = error.stderr == null ? "" : String(error.stderr);
@@ -213,18 +236,33 @@ function summarizeMetric(samples: number[]): CaseMetricSummary {
 }
 
 function extractBenchmarkReport(inputLogPath: string, outputReportPath: string) {
-  runPassthrough("bun", [
+  const extractionArgs = [
     "run",
     "tools/bench/extract-hermes-report.ts",
     `--input=${inputLogPath}`,
     `--output=${outputReportPath}`,
     ...(allowNonHermes ? ["--allow-non-hermes"] : []),
     "--require-release",
-    "--require-new-architecture",
-    "--require-case=iris-module-native-compute",
-    "--require-case=turbomodule-number-round-trip",
-    "--require-case=turbomodule-string-round-trip",
-  ]);
+  ];
+
+  if (nativeBootstrapArtifact) {
+    extractionArgs.push(
+      "--suite-id=iris-engine-bootstrap",
+      "--require-case=iris-hbc-metadata-parse",
+      "--require-case=iris-hbc-static-coverage-scan",
+      "--require-case=iris-hbc-scalar-execution-frontier",
+    );
+  } else {
+    extractionArgs.push(
+      "--suite-id=rn-hermes-js-baseline",
+      "--require-new-architecture",
+      "--require-case=iris-module-native-compute",
+      "--require-case=turbomodule-number-round-trip",
+      "--require-case=turbomodule-string-round-trip",
+    );
+  }
+
+  runPassthrough("bun", extractionArgs);
 
   return JSON.parse(readFileSync(outputReportPath, "utf8")) as BenchmarkSuiteReport;
 }
@@ -321,6 +359,19 @@ function runBenchmarkIteration(runIndex: number) {
   const nextReportPath = runs === 1 ? reportPath : pathWithRunIndex(reportPath, runIndex);
 
   console.log(`Android release benchmark run ${runIndex}/${runs}`);
+  if (nativeBootstrapArtifact) {
+    run("adb", ["logcat", "-c"]);
+    closeSession(session);
+    openApp();
+    sleep(waitMs);
+    writeFileSync(nextLogPath, readCommand("adb", ["logcat", "-d", "-v", "time"]));
+
+    return {
+      report: extractBenchmarkReport(nextLogPath, nextReportPath),
+      reportPath: nextReportPath,
+    };
+  }
+
   runAgent(["wait", 'label="Run suite"', "10000", "--session", session, "--platform", "android"]);
   runAgent(["logs", "clear", "--restart", "--session", session, "--platform", "android"]);
   runAgent([
@@ -357,7 +408,9 @@ function runBenchmarkIteration(runIndex: number) {
 function runBenchmark() {
   runAgent(["install", appId, apkPath, "--platform", "android"]);
   closeSession(session);
-  openApp();
+  if (!nativeBootstrapArtifact) {
+    openApp();
+  }
 
   const reports: BenchmarkSuiteReport[] = [];
   const sourceReports: string[] = [];

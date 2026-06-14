@@ -9,7 +9,12 @@ mise run bench-smoke
 mise run bench-js
 mise run bench-android-release
 mise run bench-android-release-repeat
+mise run bench-android-engine-compare-check
+mise run bench-android-engine-compare-local-check
 mise run bench-android-engine-compare
+mise run bench-android-iris-bootstrap-local
+mise run bench-android-local-performance
+mise run bench-android-local-performance-report
 mise run bench-extract-fixture
 mise run bench-extract-release-fixture
 mise run bench-extract-android-release-fixture
@@ -18,6 +23,8 @@ mise run rn-android-build-debug
 mise run rn-android-build-iris-engine
 mise run rn-android-build-iris-release
 mise run rn-android-build-iris-release-local
+mise run rn-android-build-engine-comparison
+mise run rn-android-build-engine-comparison-local
 mise run rn-ios-build-debug
 mise run rn-android-build-release
 mise run rn-ios-build-release
@@ -27,7 +34,12 @@ mise run rn-ios-build-release
 - `bench-js`는 Hermes 기준선 앱과 같은 JS benchmark case를 로컬 JavaScript runtime에서 실행한다.
 - `bench-android-release`는 Android 물리 기기에서 release APK 설치, 앱 실행, `Run suite`, 로그 저장, release artifact 추출을 한 번에 수행한다.
 - `bench-android-release-repeat`는 같은 release APK에서 3회 반복 측정하고 run별 report와 summary artifact를 남긴다.
+- `bench-android-engine-compare-check`는 Hermes/Iris APK와 bundle을 확인해 두 release variant가 byte-identical Hermes bytecode를 입력으로 쓰는지 검증한다. generated bundle과 APK에 패키징된 bundle도 같아야 한다. 이 검증은 Iris runtime이 HBC를 실행할 수 있음을 보장하지는 않는다.
+- `bench-android-engine-compare-local-check`는 로컬 skeleton AAR로 Hermes/Iris APK를 빌드하고 같은 preflight만 실행한다. 이 경로는 성능 비교를 만들지 않는다.
 - `bench-android-engine-compare`는 Hermes release APK와 Iris release APK를 같은 하네스로 순서대로 측정하고 비교 artifact를 남긴다. Iris APK가 없으면 실패한다.
+- `bench-android-iris-bootstrap-local`은 로컬 skeleton Iris release APK를 물리 기기에서 실행하고 `iris-engine-bootstrap` artifact를 logcat에서 추출한다. 현재 case는 HBC metadata parse, static coverage scan, scalar execution frontier다.
+- `bench-android-local-performance`는 로컬 skeleton 기준으로 Hermes release JS 기준선과 Iris native bootstrap/frontier/native mirror 측정을 연속 실행한 뒤 성능 리포트를 남긴다. strict engine ratio는 금지하고, case별 native mirror ratio만 별도 필드에 기록한다.
+- `bench-android-local-performance-report`는 이미 생성된 Hermes/Iris summary에서 같은 성능 리포트만 다시 생성한다.
 - `bench-extract-fixture`는 fixture 로그에서 Hermes report를 추출해 파서와 검증 규칙을 확인한다.
 - `bench-extract-release-fixture`는 release/Hermes/New Architecture/TurboModule case 요구 조건을 확인한다.
 - `bench-extract-android-release-fixture`는 Android logcat의 quoted JSON 형식과 RN 0.85 bridgeless Android의 TurboModule case 기준 검증을 확인한다.
@@ -37,6 +49,8 @@ mise run rn-ios-build-release
 - `rn-android-build-iris-engine`은 로컬 Iris Android 엔진 AAR skeleton을 빌드한다.
 - `rn-android-build-iris-release`는 `IRIS_ENGINE_AAR`가 실제 RN 호환 Iris 엔진 artifact를 가리킬 때만 `irisRelease` APK를 빌드한다.
 - `rn-android-build-iris-release-local`은 로컬 skeleton AAR로 `irisRelease` APK 빌드 계약을 검증한다. 이 APK는 Iris-owned JSI runtime과 RN 초기화용 host surface를 만들지만 bundle 실행에서 의도적으로 실패하므로 성능 비교값으로 쓰지 않는다.
+- `rn-android-build-engine-comparison`은 실제 Iris AAR을 사용해 Hermes/Iris release APK를 모두 빌드한다.
+- `rn-android-build-engine-comparison-local`은 로컬 skeleton AAR을 사용해 Hermes/Iris release APK를 모두 빌드하고 preflight 재현성을 확인한다.
 - 이 명령들은 CI 필수 체크에 포함하지 않는다.
 
 ## 산출물
@@ -53,9 +67,13 @@ artifacts/bench/hermes-release-baseline-run-*.json
 artifacts/bench/hermes-release-baseline-summary.json
 artifacts/bench/iris-release-baseline-run-*.json
 artifacts/bench/iris-release-baseline-summary.json
+artifacts/bench/iris-bootstrap-baseline-run-*.json
+artifacts/bench/iris-bootstrap-baseline-summary.json
+artifacts/bench/android-local-performance-report.json
 artifacts/bench/android-engine-comparison.json
 artifacts/bench/rn-release-hermes-run-*.log
 artifacts/bench/rn-release-iris-run-*.log
+artifacts/bench/rn-release-iris-bootstrap-run-*.log
 ```
 
 산출물 schema는 `iris.benchmark.v1`이며 다음 정보를 포함한다.
@@ -74,6 +92,9 @@ artifacts/bench/rn-release-iris-run-*.log
 Iris가 Hermes를 대체하는 엔진으로 들어가는 비교는 독립 앱 두 개가 아니라 같은 `apps/rn-bench` 소스의 엔진별 release variant 두 개로 수행한다. 기준은 다음과 같다.
 
 - `Hermes release`와 `Iris release`는 같은 benchmark JS, 같은 RN 버전, 같은 native module surface를 사용한다.
+- 두 release variant의 generated `index.android.bundle`과 APK 내부 `assets/index.android.bundle`은 Hermes bytecode magic, bytecode version, source hash, file length, SHA-256이 같아야 한다.
+- Hermes APK에는 `libhermesvm.so`가 있어야 하고 `libirisengine.so`/`libjsc.so`가 없어야 한다.
+- Iris APK에는 `libirisengine.so`가 있어야 하고 `libhermesvm.so`/`libjsc.so`가 없어야 한다. `libhermestooling.so`는 RN의 hermesc packaging 경로 때문에 허용한다.
 - 앱 프로젝트를 복제하지 않는다. 복제 앱은 Gradle, RN, ProGuard, Codegen, assets 설정이 drift되어 비교 신뢰도를 떨어뜨린다.
 - Iris 엔진 artifact가 준비되기 전에는 JSC나 Hermes를 `Iris release` 대체값으로 쓰지 않는다.
 - V8은 iOS 동일 비교축이 없으므로 Hermes 대체 엔진 후보나 벤치마크 비교 대상으로 두지 않는다.
@@ -99,7 +120,45 @@ Iris AAR은 `docs/iris-android-engine-contract.md`의 `IrisJSRuntimeFactoryProvi
 mise run rn-android-build-iris-release-local
 ```
 
-이 APK는 `libirisengine.so`와 hermesc bytecode bundle이 같이 패키징되고 RN이 Iris-owned JSI runtime 객체, 초기화용 host surface, Hermes bytecode header 검증 경계를 받는지 확인하기 위한 것이다. 아직 Iris runtime의 JS 실행 기능이 구현되지 않았으므로 벤치마크 비교값으로 쓰지 않는다.
+이 APK는 `libirisengine.so`와 hermesc bytecode bundle이 같이 패키징되고 RN이 Iris-owned JSI runtime 객체, 초기화용 host surface, Hermes bytecode 검증 경계를 받는지 확인하기 위한 것이다. 아직 Iris runtime의 JS 실행 기능이 구현되지 않았으므로 Hermes와의 RN JS workload 비교값으로 쓰지 않는다. RN 0.85 기준 local skeleton HBC gap의 현재 coverage는 `supportedInstructions=2888/2888`, `supportedUniqueOpcodes=46/46`, `unsupportedUniqueOpcodes=0`, `firstUnsupported=none`이다. 현재 Rust scalar executor는 같은 bundle에서 bounded scalar execution을 시도하고, `SCALAR_EXECUTION_GLOBAL_STEP_LIMIT`에 도달하면 `status=frontier`와 차단 함수를 detail에 남긴다. 이는 module factory와 React 앱 실행 완료, Hermes/RN 실행 호환성 완료, 성능 우위를 의미하지 않는다.
+
+로컬에서 APK 실행 없이 같은 report를 확인할 때는 다음 명령을 사용한다.
+
+```sh
+mise run bench-android-iris-hbc-gap-local
+mise run bench-android-iris-hbc-exec-local
+mise run bench-android-iris-hbc-trace-local
+```
+
+Iris native bootstrap 비용은 물리 기기에서 다음 명령으로 측정한다.
+
+```sh
+mise run bench-android-iris-bootstrap-local
+```
+
+이 명령은 `irisRelease` APK를 설치하고 앱 시작 중 `IRIS_BENCHMARK_ARTIFACT_CHUNK` logcat payload를 모아 `iris-engine-bootstrap` report를 만든다. 현재 bootstrap case는 `iris-hbc-metadata-parse`, `iris-hbc-static-coverage-scan`, `iris-hbc-scalar-execution-frontier`다. frontier case는 Rust scalar executor가 실제로 실행을 시도해 완료하거나 첫 의미론 차단점까지 간 시간을 측정한다. 현재 RN 0.85 local skeleton bundle에서는 `detail=status=frontier, error=Iris scalar executor function 3 exceeded step limit 50000`처럼 bounded execution frontier를 남긴다. RN JS bundle의 module factory와 React 앱을 끝까지 실행하는 단계는 아니므로 Hermes release의 `rn-hermes-js-baseline`과 strict ratio를 계산하지 않는다.
+
+같은 artifact에는 다음 native mirror case도 포함한다. 이들은 Hermes JS/TurboModule case와 sample shape를 맞춘 C++ probe지만 JavaScript 실행이나 JS/TurboModule boundary를 통과하지 않는다.
+
+- `iris-native-js-compute-mirror`
+- `iris-native-json-round-trip-mirror`
+- `iris-native-object-traversal-mirror`
+- `iris-native-typed-array-copy-mirror`
+- `iris-native-number-round-trip-mirror`
+- `iris-native-string-round-trip-mirror`
+- `iris-native-module-compute-mirror`
+
+Hermes release 기준선과 Iris bootstrap/frontier 측정을 같은 물리 기기에서 한 번에 갱신하려면 다음 명령을 사용한다.
+
+```sh
+mise run bench-android-local-performance
+```
+
+이 명령은 `hermes-release-baseline-summary.json`, `iris-bootstrap-baseline-summary.json`, `android-local-performance-report.json`을 생성한다. `android-local-performance-report.json`은 두 측정이 서로 다른 suite임을 명시하고 `ratioAllowed=false`로 기록한다. 또한 `caseComparisons`에는 Hermes case와 Iris native mirror case의 p50/p95 ratio를 `strictComparable=false`, `nativeMirrorComparable=true`로 남긴다. 이미 summary가 있으면 다음 명령으로 리포트만 다시 쓸 수 있다.
+
+```sh
+mise run bench-android-local-performance-report
+```
 
 자동화 스크립트는 다른 엔진 APK가 생겼을 때 다음처럼 같은 하네스에 연결한다.
 
@@ -115,8 +174,20 @@ bun run tools/bench/run-android-release-benchmark.ts \
 두 엔진 APK가 모두 준비되면 다음 명령으로 같은 물리 기기에서 순서대로 측정한다.
 
 ```sh
+IRIS_ENGINE_AAR=/absolute/path/to/iris-engine.aar mise run rn-android-build-engine-comparison
+mise run bench-android-engine-compare-check
 mise run bench-android-engine-compare
 ```
+
+로컬 skeleton으로는 다음 preflight까지만 실행한다.
+
+```sh
+mise run bench-android-engine-compare-local-check
+```
+
+`bench-android-engine-compare`는 측정 전에 같은 APK/runtime/HBC preflight를 먼저 수행한다. preflight가 통과해도 Iris runtime이 HBC parser나 bytecode execution 단계에서 실패하면 비교 artifact를 쓰지 않는다. 그 경우는 성능 열위가 아니라 호환성 차단으로 분류한다.
+
+비교 artifact는 두 summary의 반복 횟수, suite id/name, benchmark case set, 단위가 모두 같을 때만 생성한다. 이 조건이 깨지면 ratio를 계산하지 않고 실패시킨다.
 
 Metro 로그를 파일로 남긴 뒤 Hermes baseline artifact로 추출한다.
 

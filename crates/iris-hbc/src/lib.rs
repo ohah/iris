@@ -1,9 +1,12 @@
-//! Hermes bytecode metadata parsing for Iris.
+//! Hermes bytecode parsing and early execution contracts for Iris.
 //!
-//! This crate only validates and exposes metadata from an immutable byte slice.
-//! It does not execute bytecode and does not copy the bytecode payload.
+//! This crate validates Hermes bytecode from an immutable byte slice without
+//! copying the payload. It also owns the first narrow scalar execution subset
+//! used to make Iris bytecode runtime work measurable before the full JavaScript
+//! object model is available.
 
 use std::fmt;
+use std::fmt::Write as _;
 
 #[cxx::bridge(namespace = "iris::hbc")]
 mod ffi {
@@ -40,6 +43,9 @@ mod ffi {
 
     extern "Rust" {
         fn parse_hbc_metadata(bytes: &[u8]) -> Result<HbcMetadata>;
+        fn describe_hbc_execution_gap(bytes: &[u8]) -> Result<String>;
+        fn execute_hbc_global_scalar_function(bytes: &[u8]) -> Result<String>;
+        fn describe_hbc_scalar_execution(bytes: &[u8]) -> Result<String>;
     }
 }
 
@@ -56,7 +62,7 @@ pub const HERMES_BYTECODE_FOOTER_SIZE: usize = 20;
 pub const HERMES_BYTECODE_ALIGNMENT: usize = 4;
 
 /// Number of opcodes in the Hermes bytecode table mirrored by Iris.
-pub const HERMES_OPCODE_COUNT: usize = 220;
+pub const HERMES_OPCODE_COUNT: usize = 219;
 
 const HERMES_SOURCE_HASH_SIZE: usize = 20;
 const SMALL_FUNC_HEADER_SIZE: usize = 12;
@@ -98,21 +104,260 @@ const SERIALIZED_LITERAL_TAG_LONG_STRING: u8 = 4 << 4;
 const SERIALIZED_LITERAL_TAG_SHORT_STRING: u8 = 5 << 4;
 const SERIALIZED_LITERAL_TAG_UNDEFINED: u8 = 6 << 4;
 const SERIALIZED_LITERAL_TAG_INTEGER: u8 = 7 << 4;
+const SMALL_STRING_UTF16_FLAG: u32 = 1;
+const SMALL_STRING_OFFSET_SHIFT: u32 = 1;
+const SMALL_STRING_OFFSET_MASK: u32 = 0x7f_ffff;
+const SMALL_STRING_LENGTH_SHIFT: u32 = 24;
+const SMALL_STRING_OVERFLOW_LENGTH: u32 = 0xff;
+const SCALAR_EXECUTION_STEP_MULTIPLIER: usize = 64;
+const SCALAR_EXECUTION_GLOBAL_STEP_LIMIT: usize = 50_000;
+const TYPEOF_IS_UNDEFINED: u16 = 1 << 0;
+const TYPEOF_IS_OBJECT: u16 = 1 << 1;
+const TYPEOF_IS_STRING: u16 = 1 << 2;
+const TYPEOF_IS_BOOLEAN: u16 = 1 << 4;
+const TYPEOF_IS_NUMBER: u16 = 1 << 5;
+const TYPEOF_IS_FUNCTION: u16 = 1 << 7;
+const TYPEOF_IS_NULL: u16 = 1 << 8;
+const HERMES_BUILTIN_COPY_DATA_PROPERTIES: u32 = 46;
+const HERMES_BUILTIN_FUNCTION_PROTOTYPE_CALL: u32 = 56;
 const HERMES_OPCODE_WIDTHS: [u8; HERMES_OPCODE_COUNT] = [
-    1, 6, 10, 11, 12, 2, 3, 8, 10, 4, 5, 3, 4, 4, 3, 3, 3, 9, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4,
-    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 3, 3, 4, 4, 5, 5, 3, 4, 3, 4, 5, 4, 5, 4, 5, 2,
-    2, 3, 3, 6, 7, 5, 5, 6, 8, 9, 6, 8, 6, 6, 8, 8, 6, 6, 8, 8, 4, 7, 4, 7, 6, 8, 4, 7, 4, 5, 5, 4,
-    4, 5, 4, 4, 6, 5, 4, 5, 5, 6, 5, 6, 4, 4, 4, 5, 5, 6, 7, 5, 7, 4, 7, 3, 2, 2, 4, 2, 3, 3, 2, 1,
-    1, 3, 6, 8, 7, 9, 5, 7, 4, 5, 4, 3, 6, 3, 6, 10, 4, 6, 4, 6, 2, 2, 2, 2, 2, 2, 3, 2, 3, 3, 3,
-    3, 3, 6, 4, 4, 3, 2, 2, 3, 14, 18, 18, 5, 7, 3, 4, 3, 3, 2, 5, 3, 6, 3, 6, 3, 6, 8, 4, 7, 4, 7,
-    4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7,
+    1, 6, 10, 11, 2, 3, 8, 10, 4, 4, 3, 4, 4, 3, 3, 8, 3, 9, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 3, 3, 4, 4, 5, 5, 3, 4, 3, 4, 5, 4, 5, 4, 5, 2, 2,
+    3, 3, 6, 7, 5, 5, 6, 8, 9, 6, 8, 6, 6, 8, 8, 6, 6, 8, 8, 4, 7, 4, 7, 6, 8, 4, 7, 4, 5, 5, 4, 4,
+    5, 4, 4, 6, 5, 4, 5, 5, 6, 5, 6, 4, 4, 4, 5, 5, 6, 7, 5, 7, 4, 7, 3, 2, 2, 4, 2, 3, 3, 2, 1, 1,
+    3, 6, 8, 7, 9, 5, 7, 4, 5, 4, 3, 6, 3, 6, 10, 4, 6, 4, 6, 2, 2, 2, 2, 2, 2, 3, 2, 3, 3, 3, 3,
+    6, 4, 4, 3, 2, 2, 3, 14, 18, 18, 5, 7, 3, 4, 3, 3, 2, 5, 3, 6, 3, 6, 3, 6, 8, 4, 7, 4, 7, 4, 7,
+    4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7,
 ];
 
-const BYTECODE_TABLE_OPERANDS: [BytecodeTableOperand; 35] = [
+const HERMES_OPCODE_NAMES: [&str; HERMES_OPCODE_COUNT] = [
+    "Unreachable",
+    "NewObjectWithBuffer",
+    "NewObjectWithBufferLong",
+    "NewObjectWithBufferAndParent",
+    "NewObject",
+    "NewObjectWithParent",
+    "NewArrayWithBuffer",
+    "NewArrayWithBufferLong",
+    "NewArray",
+    "NewFastArray",
+    "FastArrayLength",
+    "FastArrayLoad",
+    "FastArrayStore",
+    "FastArrayPush",
+    "FastArrayAppend",
+    "CacheNewObject",
+    "Mov",
+    "MovLong",
+    "Negate",
+    "Not",
+    "BitNot",
+    "TypeOf",
+    "Eq",
+    "StrictEq",
+    "Neq",
+    "StrictNeq",
+    "Less",
+    "LessEq",
+    "Greater",
+    "GreaterEq",
+    "Add",
+    "AddN",
+    "AddS",
+    "Mul",
+    "MulN",
+    "Div",
+    "DivN",
+    "Mod",
+    "Sub",
+    "SubN",
+    "LShift",
+    "RShift",
+    "URshift",
+    "BitAnd",
+    "BitXor",
+    "BitOr",
+    "Inc",
+    "Dec",
+    "InstanceOf",
+    "IsIn",
+    "PrivateIsIn",
+    "TypeOfIs",
+    "GetParentEnvironment",
+    "GetEnvironment",
+    "GetClosureEnvironment",
+    "StoreToEnvironment",
+    "StoreToEnvironmentL",
+    "StoreNPToEnvironment",
+    "StoreNPToEnvironmentL",
+    "LoadFromEnvironment",
+    "LoadFromEnvironmentL",
+    "GetGlobalObject",
+    "GetNewTarget",
+    "LoadParentNoTraps",
+    "CreateFunctionEnvironment",
+    "CreateTopLevelEnvironment",
+    "CreateEnvironment",
+    "DeclareGlobalVar",
+    "GetByIdShort",
+    "GetById",
+    "GetByIdLong",
+    "GetByIdWithReceiverLong",
+    "TryGetById",
+    "TryGetByIdLong",
+    "PutByIdLoose",
+    "PutByIdStrict",
+    "PutByIdLooseLong",
+    "PutByIdStrictLong",
+    "TryPutByIdLoose",
+    "TryPutByIdStrict",
+    "TryPutByIdLooseLong",
+    "TryPutByIdStrictLong",
+    "PutOwnBySlotIdx",
+    "PutOwnBySlotIdxLong",
+    "GetOwnBySlotIdx",
+    "GetOwnBySlotIdxLong",
+    "DefineOwnById",
+    "DefineOwnByIdLong",
+    "DefineOwnByIndex",
+    "DefineOwnByIndexL",
+    "DefineOwnInDenseArray",
+    "DefineOwnInDenseArrayL",
+    "DefineOwnByVal",
+    "GetByVal",
+    "GetByIndex",
+    "GetByValWithReceiver",
+    "PutByValLoose",
+    "PutByValStrict",
+    "PutByValWithReceiver",
+    "DelByVal",
+    "AddOwnPrivateBySym",
+    "GetOwnPrivateBySym",
+    "PutOwnPrivateBySym",
+    "DefineOwnGetterSetterByVal",
+    "GetPNameList",
+    "GetNextPName",
+    "Call",
+    "Construct",
+    "Call1",
+    "CallWithNewTarget",
+    "Call2",
+    "Call3",
+    "Call4",
+    "CallWithNewTargetLong",
+    "CallRequire",
+    "CallBuiltin",
+    "CallBuiltinLong",
+    "GetBuiltinClosure",
+    "Ret",
+    "Catch",
+    "DirectEval",
+    "Throw",
+    "ThrowIfEmpty",
+    "ThrowIfUndefined",
+    "ThrowIfThisInitialized",
+    "Debugger",
+    "AsyncBreakCheck",
+    "ProfilePoint",
+    "CreateBaseClass",
+    "CreateBaseClassLongIndex",
+    "CreateDerivedClass",
+    "CreateDerivedClassLongIndex",
+    "CreateClosure",
+    "CreateClosureLongIndex",
+    "CreateThisForNew",
+    "CreateThisForSuper",
+    "SelectObject",
+    "LoadParam",
+    "LoadParamLong",
+    "LoadConstUInt8",
+    "LoadConstInt",
+    "LoadConstDouble",
+    "LoadConstBigInt",
+    "LoadConstBigIntLongIndex",
+    "LoadConstString",
+    "LoadConstStringLongIndex",
+    "LoadConstEmpty",
+    "LoadConstUndefined",
+    "LoadConstNull",
+    "LoadConstTrue",
+    "LoadConstFalse",
+    "LoadConstZero",
+    "CoerceThisNS",
+    "LoadThisNS",
+    "ToNumber",
+    "ToNumeric",
+    "ToInt32",
+    "AddEmptyString",
+    "CreatePrivateName",
+    "GetArgumentsPropByValLoose",
+    "GetArgumentsPropByValStrict",
+    "GetArgumentsLength",
+    "ReifyArgumentsStrict",
+    "ReifyArgumentsLoose",
+    "ToPropertyKey",
+    "CreateRegExp",
+    "UIntSwitchImm",
+    "StringSwitchImm",
+    "CreateGenerator",
+    "CreateGeneratorLongIndex",
+    "IteratorBegin",
+    "IteratorNext",
+    "IteratorClose",
+    "TypedLoadParent",
+    "Jmp",
+    "JmpLong",
+    "JmpTrue",
+    "JmpTrueLong",
+    "JmpFalse",
+    "JmpFalseLong",
+    "JmpUndefined",
+    "JmpUndefinedLong",
+    "JmpTypeOfIs",
+    "JLess",
+    "JLessLong",
+    "JNotLess",
+    "JNotLessLong",
+    "JLessN",
+    "JLessNLong",
+    "JNotLessN",
+    "JNotLessNLong",
+    "JLessEqual",
+    "JLessEqualLong",
+    "JNotLessEqual",
+    "JNotLessEqualLong",
+    "JLessEqualN",
+    "JLessEqualNLong",
+    "JNotLessEqualN",
+    "JNotLessEqualNLong",
+    "JGreater",
+    "JGreaterLong",
+    "JNotGreater",
+    "JNotGreaterLong",
+    "JGreaterEqual",
+    "JGreaterEqualLong",
+    "JNotGreaterEqual",
+    "JNotGreaterEqualLong",
+    "JEqual",
+    "JEqualLong",
+    "JNotEqual",
+    "JNotEqualLong",
+    "JStrictEqual",
+    "JStrictEqualLong",
+    "JStrictNotEqual",
+    "JStrictNotEqualLong",
+    "JmpBuiltinIs",
+    "JmpBuiltinIsLong",
+    "JmpBuiltinIsNot",
+    "JmpBuiltinIsNotLong",
+];
+
+const EXECUTION_GAP_TOP_LIMIT: usize = 8;
+
+const BYTECODE_TABLE_OPERANDS: [BytecodeTableOperand; 31] = [
     BytecodeTableOperand::new(1, 2, 2, BytecodeTable::ObjectShape),
     BytecodeTableOperand::new(2, 2, 4, BytecodeTable::ObjectShape),
     BytecodeTableOperand::new(3, 3, 4, BytecodeTable::ObjectShape),
-    BytecodeTableOperand::new(4, 3, 4, BytecodeTable::ObjectShape),
     BytecodeTableOperand::new(67, 1, 4, BytecodeTable::String),
     BytecodeTableOperand::new(68, 4, 1, BytecodeTable::String),
     BytecodeTableOperand::new(69, 4, 2, BytecodeTable::String),
@@ -128,86 +373,82 @@ const BYTECODE_TABLE_OPERANDS: [BytecodeTableOperand; 35] = [
     BytecodeTableOperand::new(79, 4, 2, BytecodeTable::String),
     BytecodeTableOperand::new(80, 4, 4, BytecodeTable::String),
     BytecodeTableOperand::new(81, 4, 4, BytecodeTable::String),
+    BytecodeTableOperand::new(86, 4, 2, BytecodeTable::String),
     BytecodeTableOperand::new(87, 4, 4, BytecodeTable::String),
-    BytecodeTableOperand::new(128, 4, 2, BytecodeTable::Function),
-    BytecodeTableOperand::new(129, 4, 4, BytecodeTable::Function),
-    BytecodeTableOperand::new(130, 5, 2, BytecodeTable::Function),
-    BytecodeTableOperand::new(131, 5, 4, BytecodeTable::Function),
     BytecodeTableOperand::new(132, 3, 2, BytecodeTable::Function),
     BytecodeTableOperand::new(133, 3, 4, BytecodeTable::Function),
     BytecodeTableOperand::new(142, 2, 2, BytecodeTable::BigInt),
     BytecodeTableOperand::new(143, 2, 4, BytecodeTable::BigInt),
     BytecodeTableOperand::new(144, 2, 2, BytecodeTable::String),
     BytecodeTableOperand::new(145, 2, 4, BytecodeTable::String),
-    BytecodeTableOperand::new(159, 2, 4, BytecodeTable::String),
-    BytecodeTableOperand::new(166, 2, 4, BytecodeTable::String),
-    BytecodeTableOperand::new(166, 6, 4, BytecodeTable::String),
-    BytecodeTableOperand::new(169, 3, 2, BytecodeTable::Function),
-    BytecodeTableOperand::new(170, 3, 4, BytecodeTable::Function),
+    BytecodeTableOperand::new(158, 2, 4, BytecodeTable::String),
+    BytecodeTableOperand::new(165, 2, 4, BytecodeTable::String),
+    BytecodeTableOperand::new(165, 6, 4, BytecodeTable::String),
+    BytecodeTableOperand::new(168, 3, 2, BytecodeTable::Function),
+    BytecodeTableOperand::new(169, 3, 4, BytecodeTable::Function),
 ];
 
-const OBJECT_LITERAL_OPERANDS: [ObjectLiteralOperand; 4] = [
+const OBJECT_LITERAL_OPERANDS: [ObjectLiteralOperand; 3] = [
     ObjectLiteralOperand::new(1, 2, 2, 4, 2),
     ObjectLiteralOperand::new(2, 2, 4, 6, 4),
     ObjectLiteralOperand::new(3, 3, 4, 7, 4),
-    ObjectLiteralOperand::new(4, 3, 4, 7, 4),
 ];
 
 const ARRAY_LITERAL_OPERANDS: [ArrayLiteralOperand; 2] = [
-    ArrayLiteralOperand::new(7, 4, 2, 6, 2),
-    ArrayLiteralOperand::new(8, 4, 2, 6, 4),
+    ArrayLiteralOperand::new(6, 4, 2, 6, 2),
+    ArrayLiteralOperand::new(7, 4, 2, 6, 4),
 ];
 
 const JUMP_OPERANDS: [JumpOperand; 45] = [
-    JumpOperand::new(175, 1, 1),
-    JumpOperand::new(176, 1, 4),
-    JumpOperand::new(177, 1, 1),
-    JumpOperand::new(178, 1, 4),
-    JumpOperand::new(179, 1, 1),
-    JumpOperand::new(180, 1, 4),
-    JumpOperand::new(181, 1, 1),
+    JumpOperand::new(174, 1, 1),
+    JumpOperand::new(175, 1, 4),
+    JumpOperand::new(176, 1, 1),
+    JumpOperand::new(177, 1, 4),
+    JumpOperand::new(178, 1, 1),
+    JumpOperand::new(179, 1, 4),
+    JumpOperand::new(180, 1, 1),
+    JumpOperand::new(181, 1, 4),
     JumpOperand::new(182, 1, 4),
-    JumpOperand::new(183, 1, 4),
-    JumpOperand::new(184, 1, 1),
-    JumpOperand::new(185, 1, 4),
-    JumpOperand::new(186, 1, 1),
-    JumpOperand::new(187, 1, 4),
-    JumpOperand::new(188, 1, 1),
-    JumpOperand::new(189, 1, 4),
-    JumpOperand::new(190, 1, 1),
-    JumpOperand::new(191, 1, 4),
-    JumpOperand::new(192, 1, 1),
-    JumpOperand::new(193, 1, 4),
-    JumpOperand::new(194, 1, 1),
-    JumpOperand::new(195, 1, 4),
-    JumpOperand::new(196, 1, 1),
-    JumpOperand::new(197, 1, 4),
-    JumpOperand::new(198, 1, 1),
-    JumpOperand::new(199, 1, 4),
-    JumpOperand::new(200, 1, 1),
-    JumpOperand::new(201, 1, 4),
-    JumpOperand::new(202, 1, 1),
-    JumpOperand::new(203, 1, 4),
-    JumpOperand::new(204, 1, 1),
-    JumpOperand::new(205, 1, 4),
-    JumpOperand::new(206, 1, 1),
-    JumpOperand::new(207, 1, 4),
-    JumpOperand::new(208, 1, 1),
-    JumpOperand::new(209, 1, 4),
-    JumpOperand::new(210, 1, 1),
-    JumpOperand::new(211, 1, 4),
-    JumpOperand::new(212, 1, 1),
-    JumpOperand::new(213, 1, 4),
-    JumpOperand::new(214, 1, 1),
-    JumpOperand::new(215, 1, 4),
-    JumpOperand::new(216, 1, 1),
-    JumpOperand::new(217, 1, 4),
-    JumpOperand::new(218, 1, 1),
-    JumpOperand::new(219, 1, 4),
+    JumpOperand::new(183, 1, 1),
+    JumpOperand::new(184, 1, 4),
+    JumpOperand::new(185, 1, 1),
+    JumpOperand::new(186, 1, 4),
+    JumpOperand::new(187, 1, 1),
+    JumpOperand::new(188, 1, 4),
+    JumpOperand::new(189, 1, 1),
+    JumpOperand::new(190, 1, 4),
+    JumpOperand::new(191, 1, 1),
+    JumpOperand::new(192, 1, 4),
+    JumpOperand::new(193, 1, 1),
+    JumpOperand::new(194, 1, 4),
+    JumpOperand::new(195, 1, 1),
+    JumpOperand::new(196, 1, 4),
+    JumpOperand::new(197, 1, 1),
+    JumpOperand::new(198, 1, 4),
+    JumpOperand::new(199, 1, 1),
+    JumpOperand::new(200, 1, 4),
+    JumpOperand::new(201, 1, 1),
+    JumpOperand::new(202, 1, 4),
+    JumpOperand::new(203, 1, 1),
+    JumpOperand::new(204, 1, 4),
+    JumpOperand::new(205, 1, 1),
+    JumpOperand::new(206, 1, 4),
+    JumpOperand::new(207, 1, 1),
+    JumpOperand::new(208, 1, 4),
+    JumpOperand::new(209, 1, 1),
+    JumpOperand::new(210, 1, 4),
+    JumpOperand::new(211, 1, 1),
+    JumpOperand::new(212, 1, 4),
+    JumpOperand::new(213, 1, 1),
+    JumpOperand::new(214, 1, 4),
+    JumpOperand::new(215, 1, 1),
+    JumpOperand::new(216, 1, 4),
+    JumpOperand::new(217, 1, 1),
+    JumpOperand::new(218, 1, 4),
 ];
 
-const UINT_SWITCH_IMM_OPCODE: u8 = 167;
-const STRING_SWITCH_IMM_OPCODE: u8 = 168;
+const UINT_SWITCH_IMM_OPCODE: u8 = 166;
+const STRING_SWITCH_IMM_OPCODE: u8 = 167;
 
 const MAGIC_OFFSET: usize = 0;
 const VERSION_OFFSET: usize = 8;
@@ -353,6 +594,16 @@ impl<'a> HermesBytecode<'a> {
     /// Returns [`ParseError`] if the global function body cannot be decoded.
     pub fn global_instruction_count(self) -> Result<u32, ParseError> {
         self.function_instruction_count(self.header.global_code_index)
+    }
+
+    /// Returns one string table entry as a zero-copy view into string storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParseError`] if `string_id` is outside the string table or
+    /// the decoded string table entry points outside string storage.
+    pub fn string(self, string_id: u32) -> Result<HermesString<'a>, ParseError> {
+        string_at(self.header, &self.sections, string_id)
     }
 }
 
@@ -509,7 +760,12 @@ impl<'a> HermesBytecodeSections<'a> {
             header.overflow_string_count,
             header.string_storage_size,
         )?;
-        validate_object_shape_table(obj_shape_table.bytes, obj_key_buffer.bytes, header)?;
+        validate_object_shape_table(
+            obj_shape_table.bytes,
+            obj_key_buffer.bytes,
+            string_kinds.bytes,
+            header,
+        )?;
         validate_storage_table(
             "big_int_table",
             big_int_table.bytes,
@@ -694,6 +950,53 @@ impl<'a> SectionView<'a> {
     }
 }
 
+/// One zero-copy string table entry decoded from Hermes bytecode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HermesString<'a> {
+    string_id: u32,
+    offset: u32,
+    bytes: &'a [u8],
+    is_utf16: bool,
+}
+
+impl<'a> HermesString<'a> {
+    /// Returns the string table id.
+    #[must_use]
+    pub const fn string_id(self) -> u32 {
+        self.string_id
+    }
+
+    /// Returns the byte offset inside Hermes string storage.
+    #[must_use]
+    pub const fn offset(self) -> u32 {
+        self.offset
+    }
+
+    /// Returns the raw string storage bytes without copying.
+    #[must_use]
+    pub const fn bytes(self) -> &'a [u8] {
+        self.bytes
+    }
+
+    /// Returns the raw byte length.
+    #[must_use]
+    pub const fn len(self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Returns whether this string is empty.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    /// Returns whether the Hermes entry marks the string as UTF-16.
+    #[must_use]
+    pub const fn is_utf16(self) -> bool {
+        self.is_utf16
+    }
+}
+
 /// Parsed Hermes runtime function header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HermesFunctionHeader {
@@ -752,6 +1055,445 @@ pub struct HermesInstruction {
     pub opcode: u8,
     /// Instruction size including the opcode byte and all operands.
     pub width: u8,
+}
+
+/// Opaque object handle supported by Iris' first execution subset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarObjectHandle {
+    /// JavaScript global object.
+    Global,
+    /// Hermes-specific global object exposed by Hermes runtimes.
+    HermesInternal,
+    /// Plain JavaScript object allocated by `NewObject`.
+    Object(u32),
+    /// JavaScript array object allocated by `NewArray*`.
+    Array(u32),
+    /// JavaScript `WeakMap` object allocated by `new WeakMap()`.
+    WeakMap(u32),
+    /// React Native native module stub returned by `__turboModuleProxy`.
+    NativeModule(u32),
+}
+
+/// Opaque environment handle supported by Iris' first execution subset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScalarEnvironmentHandle {
+    /// Executor-local environment id.
+    pub environment_id: u32,
+}
+
+/// Opaque function handle supported by Iris' first execution subset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarFunctionHandle {
+    /// React Native host function exposed on the global object.
+    NativePerformanceNow,
+    /// Native `Date` constructor exposed on the global object.
+    NativeDateConstructor,
+    /// Native `Date.now` function.
+    NativeDateNow,
+    /// Native `Error` constructor exposed on the global object.
+    NativeErrorConstructor,
+    /// Native `Map` constructor exposed on the global object.
+    NativeMapConstructor,
+    /// Native `WeakMap` constructor exposed on the global object.
+    NativeWeakMapConstructor,
+    /// Native `WeakMap.prototype.get` function.
+    NativeWeakMapGet,
+    /// Native `WeakMap.prototype.has` function.
+    NativeWeakMapHas,
+    /// Native `WeakMap.prototype.set` function.
+    NativeWeakMapSet,
+    /// Native `String.prototype.replace` function.
+    NativeStringReplace,
+    /// React Native `global.__turboModuleProxy` host function.
+    NativeTurboModuleProxy,
+    /// React Native native module `getConstants` host function.
+    NativeModuleGetConstants,
+    /// Generic no-op host function used by native module stubs.
+    NativeNoopFunction,
+    /// Native `Object` constructor exposed on the global object.
+    NativeObjectConstructor,
+    /// Native `Object.defineProperty` function.
+    NativeObjectDefineProperty,
+    /// Native `Object.getOwnPropertyDescriptor` function.
+    NativeObjectGetOwnPropertyDescriptor,
+    /// Native `Object.prototype.hasOwnProperty` function.
+    NativeObjectHasOwnProperty,
+    /// Native `Object.prototype.hasOwnProperty.call` function.
+    NativeObjectHasOwnPropertyCall,
+    /// Hermes string concatenation intrinsic exposed from `HermesInternal`.
+    HermesInternalConcat,
+    /// Metro's global module definition helper.
+    NativeMetroDefine,
+    /// Metro's global module require helper.
+    NativeMetroRequire,
+    /// Metro's global segment registration helper.
+    NativeMetroRegisterSegment,
+    /// Hermes bytecode function allocated by `CreateClosure`.
+    Bytecode {
+        /// Function table id referenced by the closure instruction.
+        function_id: u32,
+        /// Parent environment captured by the closure, if present.
+        environment: Option<ScalarEnvironmentHandle>,
+    },
+}
+
+/// Opaque string handle supported by Iris' first execution subset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScalarStringHandle {
+    /// Hermes string table id.
+    pub string_id: u32,
+    /// Whether the referenced JavaScript string is empty.
+    pub is_empty: bool,
+}
+
+/// Value type supported by Iris' first Hermes bytecode executor subset.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ScalarValue {
+    /// Hermes empty value, used for uninitialized lexical bindings.
+    Empty,
+    /// Opaque JavaScript object reference.
+    Object(ScalarObjectHandle),
+    /// Opaque JavaScript environment reference.
+    Environment(ScalarEnvironmentHandle),
+    /// Opaque JavaScript function reference.
+    Function(ScalarFunctionHandle),
+    /// Opaque JavaScript string reference.
+    String(ScalarStringHandle),
+    /// JavaScript `undefined`.
+    Undefined,
+    /// JavaScript `null`.
+    Null,
+    /// JavaScript boolean.
+    Boolean(bool),
+    /// JavaScript number.
+    Number(f64),
+}
+
+/// Result of Iris' first Hermes bytecode executor subset.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScalarExecutionReport<'a> {
+    /// Value returned by the interpreted function.
+    pub value: ScalarValue,
+    /// Global `var` names declared by `DeclareGlobalVar`.
+    pub declared_globals: Vec<&'a str>,
+}
+
+/// Error returned by Iris' first Hermes bytecode executor subset.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScalarExecutionError {
+    /// The bytecode failed structural validation.
+    Parse(ParseError),
+    /// The bytecode reached an opcode outside the current scalar subset.
+    UnsupportedOpcode {
+        /// Function being interpreted.
+        function_id: u32,
+        /// File offset of the unsupported opcode.
+        offset: u32,
+        /// Raw opcode value.
+        opcode: u8,
+        /// Stable Hermes opcode name mirrored by Iris.
+        opcode_name: &'static str,
+    },
+    /// The bytecode accessed a register outside the function frame.
+    RegisterOutOfBounds {
+        /// Function being interpreted.
+        function_id: u32,
+        /// File offset of the instruction.
+        offset: u32,
+        /// Raw opcode value.
+        opcode: u8,
+        /// Register index referenced by the instruction.
+        register: u32,
+        /// Function frame size.
+        frame_size: u32,
+    },
+    /// The executor reached a string encoding outside the current subset.
+    UnsupportedStringEncoding {
+        /// Function being interpreted.
+        function_id: u32,
+        /// File offset of the instruction.
+        offset: u32,
+        /// Raw opcode value.
+        opcode: u8,
+        /// String table id referenced by the instruction.
+        string_id: u32,
+        /// Encoding name that is not supported yet.
+        encoding: &'static str,
+    },
+    /// A non-UTF-16 string entry was not valid UTF-8.
+    InvalidUtf8String {
+        /// Function being interpreted.
+        function_id: u32,
+        /// File offset of the instruction.
+        offset: u32,
+        /// Raw opcode value.
+        opcode: u8,
+        /// String table id referenced by the instruction.
+        string_id: u32,
+    },
+    /// The executor reached property access on a value outside the current
+    /// object subset.
+    UnsupportedPropertyBase {
+        /// Function being interpreted.
+        function_id: u32,
+        /// File offset of the instruction.
+        offset: u32,
+        /// Raw opcode value.
+        opcode: u8,
+        /// Register index used as the property base.
+        register: u32,
+        /// Value currently stored in the base register.
+        value: ScalarValue,
+    },
+    /// The executor reached computed property access with a key outside the
+    /// current string-key subset.
+    UnsupportedPropertyKey {
+        /// Function being interpreted.
+        function_id: u32,
+        /// File offset of the instruction.
+        offset: u32,
+        /// Raw opcode value.
+        opcode: u8,
+        /// Register index used as the computed property key.
+        register: u32,
+        /// Value currently stored in the key register.
+        value: ScalarValue,
+    },
+    /// The executor reached an object literal key outside the current string-key
+    /// subset.
+    UnsupportedObjectLiteralKey {
+        /// Function being interpreted.
+        function_id: u32,
+        /// File offset of the instruction.
+        offset: u32,
+        /// Raw opcode value.
+        opcode: u8,
+        /// Serialized literal tag that is not supported as an object key yet.
+        tag: u8,
+    },
+    /// The executor reached environment access on a value outside the current
+    /// environment subset.
+    UnsupportedEnvironmentBase {
+        /// Function being interpreted.
+        function_id: u32,
+        /// File offset of the instruction.
+        offset: u32,
+        /// Raw opcode value.
+        opcode: u8,
+        /// Register index used as the environment base.
+        register: u32,
+        /// Value currently stored in the base register.
+        value: ScalarValue,
+    },
+    /// The executor reached a function call target outside the current subset.
+    UnsupportedCallTarget {
+        /// Function being interpreted.
+        function_id: u32,
+        /// File offset of the instruction.
+        offset: u32,
+        /// Raw opcode value.
+        opcode: u8,
+        /// Register index used as the call target.
+        register: u32,
+        /// Value currently stored in the call target register.
+        value: ScalarValue,
+    },
+    /// The executor reached a Hermes native builtin outside the current subset.
+    UnsupportedBuiltin {
+        /// Function being interpreted.
+        function_id: u32,
+        /// File offset of the instruction.
+        offset: u32,
+        /// Raw opcode value.
+        opcode: u8,
+        /// Hermes builtin method id.
+        builtin_id: u32,
+        /// Encoded argument count operand.
+        argument_count: u32,
+    },
+    /// The executor reached a constructor operation for a value outside the
+    /// current bytecode constructor subset.
+    UnsupportedConstructorTarget {
+        /// Function being interpreted.
+        function_id: u32,
+        /// File offset of the instruction.
+        offset: u32,
+        /// Raw opcode value.
+        opcode: u8,
+        /// Register index used as the constructor target.
+        register: u32,
+        /// Value currently stored in the constructor target register.
+        value: ScalarValue,
+    },
+    /// The executor reached a JavaScript throw completion.
+    ThrownValue {
+        /// Function being interpreted.
+        function_id: u32,
+        /// File offset of the instruction.
+        offset: u32,
+        /// Raw opcode value.
+        opcode: u8,
+        /// Register index containing the thrown value.
+        register: u32,
+        /// Value being thrown.
+        value: ScalarValue,
+    },
+    /// The function ended without executing a `Ret` instruction.
+    MissingReturn {
+        /// Function being interpreted.
+        function_id: u32,
+    },
+    /// The scalar executor exceeded its defensive step budget.
+    StepLimitExceeded {
+        /// Function being interpreted.
+        function_id: u32,
+        /// Maximum instruction steps allowed by the executor.
+        step_limit: usize,
+    },
+}
+
+impl fmt::Display for ScalarExecutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Parse(error) => write!(formatter, "{error}"),
+            Self::UnsupportedOpcode {
+                function_id,
+                offset,
+                opcode,
+                opcode_name,
+            } => write!(
+                formatter,
+                "Iris scalar executor does not support Hermes opcode {opcode_name}({opcode}) in function {function_id} at {offset}",
+            ),
+            Self::RegisterOutOfBounds {
+                function_id,
+                offset,
+                opcode,
+                register,
+                frame_size,
+            } => write!(
+                formatter,
+                "Iris scalar executor function {function_id} opcode {opcode} at {offset} references register {register}, but frame size is {frame_size}",
+            ),
+            Self::UnsupportedStringEncoding {
+                function_id,
+                offset,
+                opcode,
+                string_id,
+                encoding,
+            } => write!(
+                formatter,
+                "Iris scalar executor function {function_id} opcode {opcode} at {offset} references string {string_id} with unsupported {encoding} encoding",
+            ),
+            Self::InvalidUtf8String {
+                function_id,
+                offset,
+                opcode,
+                string_id,
+            } => write!(
+                formatter,
+                "Iris scalar executor function {function_id} opcode {opcode} at {offset} references string {string_id} that is not valid UTF-8",
+            ),
+            Self::UnsupportedPropertyBase {
+                function_id,
+                offset,
+                opcode,
+                register,
+                value,
+            } => write!(
+                formatter,
+                "Iris scalar executor function {function_id} opcode {opcode} at {offset} cannot read a property from register {register} containing {value:?}",
+            ),
+            Self::UnsupportedPropertyKey {
+                function_id,
+                offset,
+                opcode,
+                register,
+                value,
+            } => write!(
+                formatter,
+                "Iris scalar executor function {function_id} opcode {opcode} at {offset} cannot use register {register} containing {value:?} as a computed property key",
+            ),
+            Self::UnsupportedObjectLiteralKey {
+                function_id,
+                offset,
+                opcode,
+                tag,
+            } => write!(
+                formatter,
+                "Iris scalar executor function {function_id} opcode {opcode} at {offset} cannot decode object literal key tag {tag:#04x}",
+            ),
+            Self::UnsupportedEnvironmentBase {
+                function_id,
+                offset,
+                opcode,
+                register,
+                value,
+            } => write!(
+                formatter,
+                "Iris scalar executor function {function_id} opcode {opcode} at {offset} cannot access environment register {register} containing {value:?}",
+            ),
+            Self::UnsupportedCallTarget {
+                function_id,
+                offset,
+                opcode,
+                register,
+                value,
+            } => write!(
+                formatter,
+                "Iris scalar executor function {function_id} opcode {opcode} at {offset} cannot call register {register} containing {value:?}",
+            ),
+            Self::UnsupportedBuiltin {
+                function_id,
+                offset,
+                opcode,
+                builtin_id,
+                argument_count,
+            } => write!(
+                formatter,
+                "Iris scalar executor function {function_id} opcode {opcode} at {offset} cannot call Hermes builtin {builtin_id} with argument count {argument_count}",
+            ),
+            Self::UnsupportedConstructorTarget {
+                function_id,
+                offset,
+                opcode,
+                register,
+                value,
+            } => write!(
+                formatter,
+                "Iris scalar executor function {function_id} opcode {opcode} at {offset} cannot use register {register} containing {value:?} as a constructor target",
+            ),
+            Self::ThrownValue {
+                function_id,
+                offset,
+                opcode,
+                register,
+                value,
+            } => write!(
+                formatter,
+                "Iris scalar executor function {function_id} opcode {opcode} at {offset} threw register {register} containing {value:?}",
+            ),
+            Self::MissingReturn { function_id } => write!(
+                formatter,
+                "Iris scalar executor function {function_id} ended without a Ret instruction",
+            ),
+            Self::StepLimitExceeded {
+                function_id,
+                step_limit,
+            } => write!(
+                formatter,
+                "Iris scalar executor function {function_id} exceeded step limit {step_limit}",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ScalarExecutionError {}
+
+impl From<ParseError> for ScalarExecutionError {
+    fn from(error: ParseError) -> Self {
+        Self::Parse(error)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1198,6 +1940,13 @@ pub enum ParseError {
         /// Declared string storage byte length.
         storage_size: u32,
     },
+    /// A requested string id is outside the string table.
+    InvalidStringIndex {
+        /// String id being read.
+        string_id: u32,
+        /// Declared string count.
+        string_count: u32,
+    },
     /// A storage-backed table entry points outside its byte storage section.
     StorageTableEntryOutOfBounds {
         /// Table section name.
@@ -1583,6 +2332,13 @@ impl fmt::Display for ParseError {
                 formatter,
                 "Hermes bytecode string entry {string_index} at offset {offset} with length {length} exceeds string storage size {storage_size}",
             ),
+            Self::InvalidStringIndex {
+                string_id,
+                string_count,
+            } => write!(
+                formatter,
+                "Hermes bytecode string id {string_id} is outside string table count {string_count}",
+            ),
             Self::StorageTableEntryOutOfBounds {
                 section,
                 entry_index,
@@ -1865,6 +2621,3286 @@ fn parse_hbc_metadata(bytes: &[u8]) -> Result<ffi::HbcMetadata, ParseError> {
     })
 }
 
+/// Executes the global function when it only uses Iris' first narrow opcode
+/// subset.
+///
+/// This is not a full JavaScript runtime. It is a deliberately narrow
+/// execution contract used to validate register handling, constant loading,
+/// global object/property/environment references, and `Ret` behavior before
+/// closure and broader call opcodes are implemented.
+///
+/// # Errors
+///
+/// Returns [`ScalarExecutionError`] if the bytecode is invalid or if execution
+/// reaches an opcode outside the scalar subset.
+pub fn execute_global_scalar_function(bytes: &[u8]) -> Result<ScalarValue, ScalarExecutionError> {
+    execute_global_scalar_function_report(bytes).map(|report| report.value)
+}
+
+/// Executes the global function and returns the scalar execution report.
+///
+/// # Errors
+///
+/// Returns [`ScalarExecutionError`] if the bytecode is invalid or if execution
+/// reaches an opcode outside the scalar subset.
+pub fn execute_global_scalar_function_report(
+    bytes: &[u8],
+) -> Result<ScalarExecutionReport<'_>, ScalarExecutionError> {
+    let bytecode = HermesBytecode::parse(bytes)?;
+    execute_scalar_function(&bytecode, bytecode.header().global_code_index)
+}
+
+/// Executes the global function and returns a compact CXX-safe summary.
+///
+/// # Errors
+///
+/// Returns [`ScalarExecutionError`] if the bytecode is invalid or if execution
+/// reaches an instruction outside the current scalar subset.
+pub fn execute_hbc_global_scalar_function(bytes: &[u8]) -> Result<String, ScalarExecutionError> {
+    let report = execute_global_scalar_function_report(bytes)?;
+    Ok(format!(
+        "value={:?}, declaredGlobals={}",
+        report.value,
+        report.declared_globals.len()
+    ))
+}
+
+/// Executes the global function and reports either completion or the current
+/// scalar execution frontier.
+///
+/// # Errors
+///
+/// Returns [`ParseError`] if the bytecode is structurally invalid. Execution
+/// subset errors are encoded in the returned report so benchmark callers can
+/// still measure the current frontier without pretending it completed.
+pub fn describe_hbc_scalar_execution(bytes: &[u8]) -> Result<String, ParseError> {
+    let bytecode = HermesBytecode::parse(bytes)?;
+    match execute_scalar_function_relaxed(&bytecode, bytecode.header().global_code_index) {
+        Ok(report) => Ok(format!(
+            "status=completed, value={:?}, declaredGlobals={}",
+            report.value,
+            report.declared_globals.len()
+        )),
+        Err(error) => Ok(format!("status=frontier, error={error}")),
+    }
+}
+
+/// Executes the global function and returns a compact trace ending at the first
+/// scalar execution frontier.
+///
+/// # Errors
+///
+/// Returns [`ParseError`] when the bytecode is structurally invalid before
+/// scalar execution begins.
+pub fn describe_hbc_scalar_frontier_trace(bytes: &[u8]) -> Result<String, ParseError> {
+    let bytecode = HermesBytecode::parse(bytes)?;
+    describe_scalar_frontier_trace(&bytecode, bytecode.header().global_code_index, 24)
+}
+
+/// Describes the instructions around a bytecode offset in one function.
+///
+/// # Errors
+///
+/// Returns [`ParseError`] if the function or instruction stream is invalid.
+pub fn describe_hbc_instruction_window(
+    bytes: &[u8],
+    function_id: u32,
+    target_offset: u32,
+    context: usize,
+) -> Result<String, ParseError> {
+    let bytecode = HermesBytecode::parse(bytes)?;
+    let body = bytecode.function_body(function_id)?;
+    let instructions = bytecode
+        .function_instructions(function_id)?
+        .collect::<Result<Vec<_>, _>>()?;
+    let target_index = instructions
+        .iter()
+        .position(|instruction| instruction.offset >= target_offset)
+        .unwrap_or_else(|| instructions.len().saturating_sub(1));
+    let start = target_index.saturating_sub(context);
+    let end = (target_index + context + 1).min(instructions.len());
+    let mut lines = Vec::new();
+
+    for instruction in &instructions[start..end] {
+        lines.push(describe_scalar_instruction(&bytecode, body, *instruction));
+    }
+
+    Ok(lines.join(" | "))
+}
+
+#[derive(Debug, Default)]
+struct ScalarExecutorState<'a> {
+    array_elements: Vec<(ScalarObjectHandle, u32, ScalarValue)>,
+    array_lengths: Vec<(ScalarObjectHandle, u32)>,
+    declared_globals: Vec<&'a str>,
+    environment_parents: Vec<(ScalarEnvironmentHandle, Option<ScalarEnvironmentHandle>)>,
+    environment_slots: Vec<(ScalarEnvironmentHandle, u32, ScalarValue)>,
+    function_properties: Vec<(ScalarFunctionHandle, &'a str, ScalarValue)>,
+    global_properties: Vec<(&'a str, ScalarValue)>,
+    metro_module_exports: Vec<(u32, ScalarValue)>,
+    metro_modules: Vec<(u32, ScalarFunctionHandle, ScalarValue)>,
+    next_environment_id: u32,
+    next_object_id: u32,
+    object_properties: Vec<(ScalarObjectHandle, &'a str, ScalarValue)>,
+    object_slot_names: Vec<(ScalarObjectHandle, u32, &'a str)>,
+    object_slots: Vec<(ScalarObjectHandle, u32, ScalarValue)>,
+    relaxed_host_stubs: bool,
+    remaining_steps: Option<usize>,
+    weak_map_entries: Vec<(ScalarObjectHandle, ScalarValue, ScalarValue)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ScalarInstructionResult {
+    Continue,
+    Jump(u32),
+    Return(ScalarValue),
+}
+
+fn execute_scalar_function<'a>(
+    bytecode: &HermesBytecode<'a>,
+    function_id: u32,
+) -> Result<ScalarExecutionReport<'a>, ScalarExecutionError> {
+    let mut state = ScalarExecutorState {
+        remaining_steps: Some(SCALAR_EXECUTION_GLOBAL_STEP_LIMIT),
+        ..ScalarExecutorState::default()
+    };
+    execute_scalar_function_with_state(bytecode, &mut state, function_id, &[])
+}
+
+fn execute_scalar_function_relaxed<'a>(
+    bytecode: &HermesBytecode<'a>,
+    function_id: u32,
+) -> Result<ScalarExecutionReport<'a>, ScalarExecutionError> {
+    let mut state = ScalarExecutorState {
+        relaxed_host_stubs: true,
+        remaining_steps: Some(SCALAR_EXECUTION_GLOBAL_STEP_LIMIT),
+        ..ScalarExecutorState::default()
+    };
+    execute_scalar_function_with_state(bytecode, &mut state, function_id, &[])
+}
+
+fn execute_scalar_function_with_state<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
+    function_id: u32,
+    arguments: &[ScalarValue],
+) -> Result<ScalarExecutionReport<'a>, ScalarExecutionError> {
+    execute_scalar_function_with_state_and_environment(
+        bytecode,
+        state,
+        function_id,
+        None,
+        arguments,
+    )
+}
+
+fn execute_scalar_function_with_state_and_environment<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
+    function_id: u32,
+    closure_environment: Option<ScalarEnvironmentHandle>,
+    arguments: &[ScalarValue],
+) -> Result<ScalarExecutionReport<'a>, ScalarExecutionError> {
+    let body = bytecode.function_body(function_id)?;
+    let function_header = bytecode.function_header(function_id)?;
+    let frame_size = usize::try_from(function_header.frame_size)
+        .expect("Hermes function frame size fits in usize on supported targets");
+    let mut registers = vec![ScalarValue::Empty; frame_size];
+    let instructions = bytecode
+        .function_instructions(function_id)?
+        .collect::<Result<Vec<_>, _>>()?;
+    let step_limit = instructions
+        .len()
+        .saturating_mul(SCALAR_EXECUTION_STEP_MULTIPLIER)
+        .max(1);
+    let mut instruction_index = 0_usize;
+    let mut step_count = 0_usize;
+
+    while instruction_index < instructions.len() {
+        if let Some(remaining_steps) = state.remaining_steps.as_mut() {
+            if *remaining_steps == 0 {
+                return Err(ScalarExecutionError::StepLimitExceeded {
+                    function_id,
+                    step_limit: SCALAR_EXECUTION_GLOBAL_STEP_LIMIT,
+                });
+            }
+            *remaining_steps -= 1;
+        }
+        if step_count >= step_limit {
+            return Err(ScalarExecutionError::StepLimitExceeded {
+                function_id,
+                step_limit,
+            });
+        }
+        step_count += 1;
+
+        let instruction = instructions[instruction_index];
+        match execute_scalar_instruction(
+            bytecode,
+            state,
+            &mut registers,
+            arguments,
+            function_id,
+            body,
+            instruction,
+            closure_environment,
+        )? {
+            ScalarInstructionResult::Continue => {
+                instruction_index += 1;
+            }
+            ScalarInstructionResult::Jump(target) => {
+                instruction_index = instructions
+                    .binary_search_by_key(&target, |instruction| instruction.offset)
+                    .map_err(|_| ParseError::InvalidJumpTarget {
+                        function_id,
+                        offset: instruction.offset,
+                        opcode: instruction.opcode,
+                        target: i64::from(target),
+                        body_start: body.offset,
+                        body_end: body.offset + body.len(),
+                    })?;
+            }
+            ScalarInstructionResult::Return(value) => {
+                return Ok(ScalarExecutionReport {
+                    value,
+                    declared_globals: state.declared_globals.clone(),
+                });
+            }
+        }
+    }
+
+    Err(ScalarExecutionError::MissingReturn { function_id })
+}
+
+fn describe_scalar_frontier_trace(
+    bytecode: &HermesBytecode<'_>,
+    function_id: u32,
+    trace_limit: usize,
+) -> Result<String, ParseError> {
+    let body = bytecode.function_body(function_id)?;
+    let function_header = bytecode.function_header(function_id)?;
+    let frame_size = usize::try_from(function_header.frame_size)
+        .expect("Hermes function frame size fits in usize on supported targets");
+    let mut registers = vec![ScalarValue::Empty; frame_size];
+    let mut state = ScalarExecutorState {
+        relaxed_host_stubs: true,
+        remaining_steps: Some(SCALAR_EXECUTION_GLOBAL_STEP_LIMIT),
+        ..ScalarExecutorState::default()
+    };
+    let instructions = bytecode
+        .function_instructions(function_id)?
+        .collect::<Result<Vec<_>, _>>()?;
+    let step_limit = instructions
+        .len()
+        .saturating_mul(SCALAR_EXECUTION_STEP_MULTIPLIER)
+        .max(1);
+    let mut instruction_index = 0_usize;
+    let mut step_count = 0_usize;
+    let mut trace = Vec::new();
+
+    while instruction_index < instructions.len() {
+        if let Some(remaining_steps) = state.remaining_steps.as_mut() {
+            if *remaining_steps == 0 {
+                return Ok(format!(
+                    "status=frontier, error=global step limit exceeded at {SCALAR_EXECUTION_GLOBAL_STEP_LIMIT}, trace={}",
+                    trace.join(" | ")
+                ));
+            }
+            *remaining_steps -= 1;
+        }
+        if step_count >= step_limit {
+            return Ok(format!(
+                "status=frontier, error=step limit exceeded at {step_limit}, trace={}",
+                trace.join(" | ")
+            ));
+        }
+        step_count += 1;
+
+        let instruction = instructions[instruction_index];
+        let description = describe_scalar_instruction(bytecode, body, instruction);
+        let before = registers.clone();
+        match execute_scalar_instruction(
+            bytecode,
+            &mut state,
+            &mut registers,
+            &[],
+            function_id,
+            body,
+            instruction,
+            None,
+        ) {
+            Ok(ScalarInstructionResult::Continue) => {
+                push_scalar_trace(
+                    &mut trace,
+                    trace_limit,
+                    format!(
+                        "{description} -> {}",
+                        describe_register_changes(&before, &registers)
+                    ),
+                );
+                instruction_index += 1;
+            }
+            Ok(ScalarInstructionResult::Jump(target)) => {
+                push_scalar_trace(
+                    &mut trace,
+                    trace_limit,
+                    format!(
+                        "{description} -> jump {target}, {}",
+                        describe_register_changes(&before, &registers)
+                    ),
+                );
+                instruction_index = instructions
+                    .binary_search_by_key(&target, |instruction| instruction.offset)
+                    .map_err(|_| ParseError::InvalidJumpTarget {
+                        function_id,
+                        offset: instruction.offset,
+                        opcode: instruction.opcode,
+                        target: i64::from(target),
+                        body_start: body.offset,
+                        body_end: body.offset + body.len(),
+                    })?;
+            }
+            Ok(ScalarInstructionResult::Return(value)) => {
+                push_scalar_trace(
+                    &mut trace,
+                    trace_limit,
+                    format!("{description} -> return {value:?}"),
+                );
+                return Ok(format!(
+                    "status=completed, value={value:?}, steps={step_count}, trace={}",
+                    trace.join(" | ")
+                ));
+            }
+            Err(error) => {
+                return Ok(format!(
+                    "status=frontier, error={error}, instruction={description}, steps={step_count}, trace={}",
+                    trace.join(" | ")
+                ));
+            }
+        }
+    }
+
+    Ok(format!(
+        "status=frontier, error=missing return in function {function_id}, steps={step_count}, trace={}",
+        trace.join(" | ")
+    ))
+}
+
+fn push_scalar_trace(trace: &mut Vec<String>, trace_limit: usize, entry: String) {
+    trace.push(entry);
+    if trace.len() > trace_limit {
+        trace.remove(0);
+    }
+}
+
+fn describe_register_changes(before: &[ScalarValue], after: &[ScalarValue]) -> String {
+    let changes = before
+        .iter()
+        .zip(after.iter())
+        .enumerate()
+        .filter(|(_, (before, after))| before != after)
+        .map(|(index, (_, after))| format!("r{index}={after:?}"))
+        .collect::<Vec<_>>();
+
+    if changes.is_empty() {
+        "registers=unchanged".to_owned()
+    } else {
+        changes.join(",")
+    }
+}
+
+fn describe_scalar_instruction(
+    bytecode: &HermesBytecode<'_>,
+    body: SectionView<'_>,
+    instruction: HermesInstruction,
+) -> String {
+    let bytes = instruction_bytes(body, instruction);
+    let mut description = format!(
+        "{}({})@{} bytes={}",
+        hermes_opcode_name(instruction.opcode),
+        instruction.opcode,
+        instruction.offset,
+        describe_bytes(bytes)
+    );
+
+    match instruction.opcode {
+        68 => {
+            let destination = read_unsigned_operand(bytes, 1, 1);
+            let base_register = read_unsigned_operand(bytes, 2, 1);
+            let string_id = read_unsigned_operand(bytes, 4, 1);
+            let property_name = describe_string_operand(bytecode, string_id);
+            let _ = write!(
+                description,
+                " dst=r{destination} base=r{base_register} property={property_name}#{string_id}"
+            );
+        }
+        69 | 72 => {
+            let destination = read_unsigned_operand(bytes, 1, 1);
+            let base_register = read_unsigned_operand(bytes, 2, 1);
+            let string_id = read_unsigned_operand(bytes, 4, 2);
+            let property_name = describe_string_operand(bytecode, string_id);
+            let _ = write!(
+                description,
+                " dst=r{destination} base=r{base_register} property={property_name}#{string_id}"
+            );
+        }
+        74 | 75 => {
+            let base_register = read_unsigned_operand(bytes, 1, 1);
+            let value_register = read_unsigned_operand(bytes, 2, 1);
+            let string_id = read_unsigned_operand(bytes, 4, 2);
+            let property_name = describe_string_operand(bytecode, string_id);
+            let _ = write!(
+                description,
+                " base=r{base_register} value=r{value_register} property={property_name}#{string_id}"
+            );
+        }
+        86 | 87 => {
+            let base_register = read_unsigned_operand(bytes, 1, 1);
+            let value_register = read_unsigned_operand(bytes, 2, 1);
+            let string_width = if instruction.opcode == 87 { 4 } else { 2 };
+            let string_id = read_unsigned_operand(bytes, 4, string_width);
+            let property_name = describe_string_operand(bytecode, string_id);
+            let _ = write!(
+                description,
+                " base=r{base_register} value=r{value_register} property={property_name}#{string_id}"
+            );
+        }
+        96 | 97 => {
+            let base_register = read_unsigned_operand(bytes, 1, 1);
+            let key_register = read_unsigned_operand(bytes, 2, 1);
+            let value_register = read_unsigned_operand(bytes, 3, 1);
+            let _ = write!(
+                description,
+                " base=r{base_register} key=r{key_register} value=r{value_register}"
+            );
+        }
+        120 => {
+            let source_register = read_unsigned_operand(bytes, 1, 1);
+            let _ = write!(description, " source=r{source_register}");
+        }
+        139 => {
+            let destination = read_unsigned_operand(bytes, 1, 1);
+            let value = read_unsigned_operand(bytes, 2, 1);
+            let _ = write!(description, " dst=r{destination} value={value}");
+        }
+        140 => {
+            let destination = read_unsigned_operand(bytes, 1, 1);
+            let value = read_i32(bytes, 2);
+            let _ = write!(description, " dst=r{destination} value={value}");
+        }
+        144 => {
+            let destination = read_unsigned_operand(bytes, 1, 1);
+            let string_id = read_unsigned_operand(bytes, 2, 2);
+            let value = describe_string_operand(bytecode, string_id);
+            let _ = write!(
+                description,
+                " dst=r{destination} string={value}#{string_id}"
+            );
+        }
+        153 => {
+            let destination = read_unsigned_operand(bytes, 1, 1);
+            let _ = write!(description, " dst=r{destination}");
+        }
+        _ => {}
+    }
+
+    description
+}
+
+fn describe_string_operand(bytecode: &HermesBytecode<'_>, string_id: u32) -> String {
+    match bytecode.string(string_id) {
+        Ok(string) if string.is_utf16() => "utf16".to_owned(),
+        Ok(string) => String::from_utf8_lossy(string.bytes()).into_owned(),
+        Err(error) => format!("invalid({error})"),
+    }
+}
+
+fn describe_bytes(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn execute_scalar_instruction<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
+    registers: &mut [ScalarValue],
+    arguments: &[ScalarValue],
+    function_id: u32,
+    body: SectionView<'_>,
+    instruction: HermesInstruction,
+    closure_environment: Option<ScalarEnvironmentHandle>,
+) -> Result<ScalarInstructionResult, ScalarExecutionError> {
+    let instruction_bytes = instruction_bytes(body, instruction);
+    match instruction.opcode {
+        1 | 2 | 3 => {
+            let destination = read_unsigned_operand(instruction_bytes, 1, 1);
+            let (shape_index, value_offset) = if instruction.opcode == 3 {
+                let _parent_register = read_unsigned_operand(instruction_bytes, 2, 1);
+                (
+                    read_unsigned_operand(instruction_bytes, 3, 4),
+                    read_unsigned_operand(instruction_bytes, 7, 4),
+                )
+            } else {
+                let operand_width = if instruction.opcode == 2 { 4 } else { 2 };
+                (
+                    read_unsigned_operand(instruction_bytes, 2, operand_width),
+                    read_unsigned_operand(instruction_bytes, 2 + operand_width, operand_width),
+                )
+            };
+            let entries = read_scalar_object_literal_entries(
+                bytecode,
+                function_id,
+                instruction,
+                shape_index,
+                value_offset,
+            )?;
+            let object = allocate_scalar_object(state);
+            for (slot, (property_name, value)) in entries.into_iter().enumerate() {
+                let slot = u32::try_from(slot).expect("object literal property count fits in u32");
+                write_scalar_object_slot(state, object, slot, value);
+                write_scalar_object_slot_name(state, object, slot, property_name);
+                write_scalar_named_object_property(state, object, property_name, value);
+            }
+            write_scalar_register(
+                registers,
+                function_id,
+                instruction,
+                destination,
+                ScalarValue::Object(object),
+            )?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        4 | 5 => {
+            if instruction.opcode == 5 {
+                let _parent_register = read_unsigned_operand(instruction_bytes, 2, 1);
+            }
+            let object = ScalarValue::Object(allocate_scalar_object(state));
+            write_scalar_destination(
+                registers,
+                function_id,
+                instruction,
+                instruction_bytes,
+                object,
+            )?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        6 | 7 => {
+            let destination = read_unsigned_operand(instruction_bytes, 1, 1);
+            let array_length = read_unsigned_operand(instruction_bytes, 2, 2);
+            let element_count = read_unsigned_operand(instruction_bytes, 4, 2);
+            let value_offset_width = if instruction.opcode == 7 { 4 } else { 2 };
+            let value_offset = read_unsigned_operand(instruction_bytes, 6, value_offset_width);
+            let values = read_scalar_literal_values(bytecode, value_offset, element_count)?;
+            let array = allocate_scalar_array(state, array_length);
+            for (index, value) in values.into_iter().enumerate() {
+                write_scalar_array_element(
+                    state,
+                    array,
+                    u32::try_from(index).expect("literal element count fits in u32"),
+                    value,
+                );
+            }
+            write_scalar_register(
+                registers,
+                function_id,
+                instruction,
+                destination,
+                ScalarValue::Object(array),
+            )?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        8 => {
+            let destination = read_unsigned_operand(instruction_bytes, 1, 1);
+            let array_length = read_unsigned_operand(instruction_bytes, 2, 2);
+            let array = allocate_scalar_array(state, array_length);
+            write_scalar_register(
+                registers,
+                function_id,
+                instruction,
+                destination,
+                ScalarValue::Object(array),
+            )?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        16 => {
+            let destination = read_unsigned_operand(instruction_bytes, 1, 1);
+            let source = read_unsigned_operand(instruction_bytes, 2, 1);
+            let value = read_scalar_register(registers, function_id, instruction, source)?;
+            write_scalar_register(registers, function_id, instruction, destination, value)?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        22..=25 => {
+            let destination = read_unsigned_operand(instruction_bytes, 1, 1);
+            let left_register = read_unsigned_operand(instruction_bytes, 2, 1);
+            let right_register = read_unsigned_operand(instruction_bytes, 3, 1);
+            let left = read_scalar_register(registers, function_id, instruction, left_register)?;
+            let right = read_scalar_register(registers, function_id, instruction, right_register)?;
+            let value = match instruction.opcode {
+                22 => scalar_abstract_equal(left, right),
+                23 => scalar_strict_equal(left, right),
+                24 => !scalar_abstract_equal(left, right),
+                25 => !scalar_strict_equal(left, right),
+                _ => unreachable!("matched equality opcodes"),
+            };
+            write_scalar_register(
+                registers,
+                function_id,
+                instruction,
+                destination,
+                ScalarValue::Boolean(value),
+            )?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        26..=29 => {
+            let destination = read_unsigned_operand(instruction_bytes, 1, 1);
+            let left_register = read_unsigned_operand(instruction_bytes, 2, 1);
+            let right_register = read_unsigned_operand(instruction_bytes, 3, 1);
+            let left = scalar_to_number(read_scalar_register(
+                registers,
+                function_id,
+                instruction,
+                left_register,
+            )?);
+            let right = scalar_to_number(read_scalar_register(
+                registers,
+                function_id,
+                instruction,
+                right_register,
+            )?);
+            let value = if left.is_nan() || right.is_nan() {
+                false
+            } else {
+                match instruction.opcode {
+                    26 => left < right,
+                    27 => left <= right,
+                    28 => left > right,
+                    29 => left >= right,
+                    _ => unreachable!("matched relational opcodes"),
+                }
+            };
+            write_scalar_register(
+                registers,
+                function_id,
+                instruction,
+                destination,
+                ScalarValue::Boolean(value),
+            )?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        30..=39 => {
+            let destination = read_unsigned_operand(instruction_bytes, 1, 1);
+            let left_register = read_unsigned_operand(instruction_bytes, 2, 1);
+            let right_register = read_unsigned_operand(instruction_bytes, 3, 1);
+            let left_value =
+                read_scalar_register(registers, function_id, instruction, left_register)?;
+            let right_value =
+                read_scalar_register(registers, function_id, instruction, right_register)?;
+            let value = if instruction.opcode == 32 {
+                match (left_value, right_value) {
+                    (value @ ScalarValue::String(_), _) | (_, value @ ScalarValue::String(_)) => {
+                        value
+                    }
+                    _ => ScalarValue::Number(
+                        scalar_to_number(left_value) + scalar_to_number(right_value),
+                    ),
+                }
+            } else {
+                let left = scalar_to_number(left_value);
+                let right = scalar_to_number(right_value);
+                let value = match instruction.opcode {
+                    30 | 31 => left + right,
+                    33 | 34 => left * right,
+                    35 | 36 => left / right,
+                    37 => left % right,
+                    38 | 39 => left - right,
+                    _ => unreachable!("matched arithmetic opcodes"),
+                };
+                ScalarValue::Number(value)
+            };
+            write_scalar_register(registers, function_id, instruction, destination, value)?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        51 => {
+            let destination = read_unsigned_operand(instruction_bytes, 1, 1);
+            let source_register = read_unsigned_operand(instruction_bytes, 2, 1);
+            let mask = read_scalar_typeof_is_mask(instruction_bytes, 3);
+            let source =
+                read_scalar_register(registers, function_id, instruction, source_register)?;
+            write_scalar_register(
+                registers,
+                function_id,
+                instruction,
+                destination,
+                ScalarValue::Boolean(scalar_typeof_is_matches(source, mask)),
+            )?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        52 => {
+            let destination = read_unsigned_operand(instruction_bytes, 1, 1);
+            let level = read_unsigned_operand(instruction_bytes, 2, 1);
+            let value = closure_environment
+                .and_then(|environment| read_scalar_environment_ancestor(state, environment, level))
+                .map_or(ScalarValue::Undefined, ScalarValue::Environment);
+            write_scalar_register(registers, function_id, instruction, destination, value)?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        55 | 56 | 57 | 58 => {
+            let environment_register = read_unsigned_operand(instruction_bytes, 1, 1);
+            let slot_width = if matches!(instruction.opcode, 56 | 58) {
+                2
+            } else {
+                1
+            };
+            let slot = read_unsigned_operand(instruction_bytes, 2, slot_width);
+            let value_register = read_unsigned_operand(instruction_bytes, 2 + slot_width, 1);
+            let value = read_scalar_register(registers, function_id, instruction, value_register)?;
+            write_scalar_environment_slot(
+                state,
+                registers,
+                function_id,
+                instruction,
+                environment_register,
+                slot,
+                value,
+            )?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        59 | 60 => {
+            let destination = read_unsigned_operand(instruction_bytes, 1, 1);
+            let environment_register = read_unsigned_operand(instruction_bytes, 2, 1);
+            let slot_width = if instruction.opcode == 60 { 2 } else { 1 };
+            let slot = read_unsigned_operand(instruction_bytes, 3, slot_width);
+            let value = read_scalar_environment_slot(
+                state,
+                registers,
+                function_id,
+                instruction,
+                environment_register,
+                slot,
+            )?;
+            write_scalar_register(registers, function_id, instruction, destination, value)?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        61 => {
+            write_scalar_destination(
+                registers,
+                function_id,
+                instruction,
+                instruction_bytes,
+                ScalarValue::Object(ScalarObjectHandle::Global),
+            )?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        67 => {
+            let string_id = read_unsigned_operand(instruction_bytes, 1, 4);
+            let name = read_scalar_string_operand(bytecode, function_id, instruction, string_id)?;
+            state.declared_globals.push(name);
+            Ok(ScalarInstructionResult::Continue)
+        }
+        64 => {
+            let destination = read_unsigned_operand(instruction_bytes, 1, 1);
+            let _slot_count = read_unsigned_operand(instruction_bytes, 2, 1);
+            let environment =
+                ScalarValue::Environment(allocate_scalar_environment_with_parent(state, None));
+            write_scalar_register(
+                registers,
+                function_id,
+                instruction,
+                destination,
+                environment,
+            )?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        65 => {
+            let destination = read_unsigned_operand(instruction_bytes, 1, 1);
+            let _slot_count = read_unsigned_operand(instruction_bytes, 2, 4);
+            let environment =
+                ScalarValue::Environment(allocate_scalar_environment_with_parent(state, None));
+            write_scalar_register(
+                registers,
+                function_id,
+                instruction,
+                destination,
+                environment,
+            )?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        66 => {
+            let destination = read_unsigned_operand(instruction_bytes, 1, 1);
+            let parent_register = read_unsigned_operand(instruction_bytes, 2, 1);
+            let _slot_count = read_unsigned_operand(instruction_bytes, 3, 4);
+            let parent =
+                match read_scalar_register(registers, function_id, instruction, parent_register)? {
+                    ScalarValue::Environment(parent) => Some(parent),
+                    ScalarValue::Undefined | ScalarValue::Empty if state.relaxed_host_stubs => None,
+                    value => {
+                        return Err(ScalarExecutionError::UnsupportedEnvironmentBase {
+                            function_id,
+                            offset: instruction.offset,
+                            opcode: instruction.opcode,
+                            register: parent_register,
+                            value,
+                        });
+                    }
+                };
+            let environment =
+                ScalarValue::Environment(allocate_scalar_environment_with_parent(state, parent));
+            write_scalar_register(
+                registers,
+                function_id,
+                instruction,
+                destination,
+                environment,
+            )?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        68 => {
+            let destination = read_unsigned_operand(instruction_bytes, 1, 1);
+            let base_register = read_unsigned_operand(instruction_bytes, 2, 1);
+            let string_id = read_unsigned_operand(instruction_bytes, 4, 1);
+            let property_name =
+                read_scalar_string_operand(bytecode, function_id, instruction, string_id)?;
+            let value = read_scalar_property(
+                state,
+                registers,
+                function_id,
+                instruction,
+                base_register,
+                property_name,
+            )?;
+            write_scalar_register(registers, function_id, instruction, destination, value)?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        69 | 72 => {
+            let destination = read_unsigned_operand(instruction_bytes, 1, 1);
+            let base_register = read_unsigned_operand(instruction_bytes, 2, 1);
+            let string_id = read_unsigned_operand(instruction_bytes, 4, 2);
+            let property_name =
+                read_scalar_string_operand(bytecode, function_id, instruction, string_id)?;
+            let value = read_scalar_property(
+                state,
+                registers,
+                function_id,
+                instruction,
+                base_register,
+                property_name,
+            )?;
+            write_scalar_register(registers, function_id, instruction, destination, value)?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        74 | 75 => {
+            let base_register = read_unsigned_operand(instruction_bytes, 1, 1);
+            let value_register = read_unsigned_operand(instruction_bytes, 2, 1);
+            let string_id = read_unsigned_operand(instruction_bytes, 4, 2);
+            let property_name =
+                read_scalar_string_operand(bytecode, function_id, instruction, string_id)?;
+            let value = read_scalar_register(registers, function_id, instruction, value_register)?;
+            write_scalar_property(
+                state,
+                registers,
+                function_id,
+                instruction,
+                base_register,
+                property_name,
+                value,
+            )?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        82 | 83 => {
+            let base_register = read_unsigned_operand(instruction_bytes, 1, 1);
+            let value_register = read_unsigned_operand(instruction_bytes, 2, 1);
+            let slot_width = if instruction.opcode == 83 { 4 } else { 1 };
+            let slot = read_unsigned_operand(instruction_bytes, 3, slot_width);
+            let object =
+                read_scalar_object_handle(registers, function_id, instruction, base_register)?;
+            let value = read_scalar_register(registers, function_id, instruction, value_register)?;
+            write_scalar_object_slot(state, object, slot, value);
+            if let Some(property_name) = read_scalar_object_slot_name(state, object, slot) {
+                write_scalar_named_object_property(state, object, property_name, value);
+            }
+            Ok(ScalarInstructionResult::Continue)
+        }
+        86 | 87 => {
+            let base_register = read_unsigned_operand(instruction_bytes, 1, 1);
+            let value_register = read_unsigned_operand(instruction_bytes, 2, 1);
+            let string_width = if instruction.opcode == 87 { 4 } else { 2 };
+            let string_id = read_unsigned_operand(instruction_bytes, 4, string_width);
+            let property_name =
+                read_scalar_string_operand(bytecode, function_id, instruction, string_id)?;
+            let value = read_scalar_register(registers, function_id, instruction, value_register)?;
+            write_scalar_property(
+                state,
+                registers,
+                function_id,
+                instruction,
+                base_register,
+                property_name,
+                value,
+            )?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        90 | 91 => {
+            let array_register = read_unsigned_operand(instruction_bytes, 1, 1);
+            let value_register = read_unsigned_operand(instruction_bytes, 2, 1);
+            let index_width = if instruction.opcode == 91 { 2 } else { 1 };
+            let index = read_unsigned_operand(instruction_bytes, 3, index_width);
+            let array =
+                read_scalar_object_handle(registers, function_id, instruction, array_register)?;
+            let value = read_scalar_register(registers, function_id, instruction, value_register)?;
+            write_scalar_array_element(state, array, index, value);
+            Ok(ScalarInstructionResult::Continue)
+        }
+        96 | 97 => {
+            let base_register = read_unsigned_operand(instruction_bytes, 1, 1);
+            let key_register = read_unsigned_operand(instruction_bytes, 2, 1);
+            let value_register = read_unsigned_operand(instruction_bytes, 3, 1);
+            let property_name = read_scalar_property_key(
+                bytecode,
+                registers,
+                function_id,
+                instruction,
+                key_register,
+            )?;
+            let value = read_scalar_register(registers, function_id, instruction, value_register)?;
+            write_scalar_property(
+                state,
+                registers,
+                function_id,
+                instruction,
+                base_register,
+                property_name,
+                value,
+            )?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        94 => {
+            let destination = read_unsigned_operand(instruction_bytes, 1, 1);
+            let base_register = read_unsigned_operand(instruction_bytes, 2, 1);
+            let index = read_unsigned_operand(instruction_bytes, 3, 1);
+            let base = read_scalar_register(registers, function_id, instruction, base_register)?;
+            let value = match base {
+                ScalarValue::Object(array) => read_scalar_array_element(state, array, index),
+                ScalarValue::Undefined | ScalarValue::Null | ScalarValue::Empty
+                    if state.relaxed_host_stubs =>
+                {
+                    ScalarValue::Undefined
+                }
+                value => {
+                    return Err(ScalarExecutionError::UnsupportedPropertyBase {
+                        function_id,
+                        offset: instruction.offset,
+                        opcode: instruction.opcode,
+                        register: base_register,
+                        value,
+                    });
+                }
+            };
+            write_scalar_register(registers, function_id, instruction, destination, value)?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        93 => {
+            let destination = read_unsigned_operand(instruction_bytes, 1, 1);
+            let base_register = read_unsigned_operand(instruction_bytes, 2, 1);
+            let key_register = read_unsigned_operand(instruction_bytes, 3, 1);
+            let property_name = read_scalar_property_key(
+                bytecode,
+                registers,
+                function_id,
+                instruction,
+                key_register,
+            )?;
+            let value = read_scalar_property(
+                state,
+                registers,
+                function_id,
+                instruction,
+                base_register,
+                property_name,
+            )?;
+            write_scalar_register(registers, function_id, instruction, destination, value)?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        103 => {
+            let base_register = read_unsigned_operand(instruction_bytes, 1, 1);
+            let key_register = read_unsigned_operand(instruction_bytes, 2, 1);
+            let getter_register = read_unsigned_operand(instruction_bytes, 3, 1);
+            let _setter_register = read_unsigned_operand(instruction_bytes, 4, 1);
+            let _enumerable = read_unsigned_operand(instruction_bytes, 5, 1);
+            let property_name = read_scalar_property_key(
+                bytecode,
+                registers,
+                function_id,
+                instruction,
+                key_register,
+            )?;
+            let getter =
+                read_scalar_register(registers, function_id, instruction, getter_register)?;
+            let value = match getter {
+                ScalarValue::Function(ScalarFunctionHandle::Bytecode {
+                    function_id: getter_function_id,
+                    environment,
+                }) => execute_scalar_function_with_state_and_environment(
+                    bytecode,
+                    state,
+                    getter_function_id,
+                    environment,
+                    &[ScalarValue::Undefined],
+                )
+                .map(|report| report.value)
+                .unwrap_or(ScalarValue::Undefined),
+                ScalarValue::Undefined | ScalarValue::Null | ScalarValue::Empty => {
+                    ScalarValue::Undefined
+                }
+                value => value,
+            };
+            write_scalar_property(
+                state,
+                registers,
+                function_id,
+                instruction,
+                base_register,
+                property_name,
+                value,
+            )?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        104 => {
+            let destination = read_unsigned_operand(instruction_bytes, 1, 1);
+            let object_register = read_unsigned_operand(instruction_bytes, 2, 1);
+            let index_register = read_unsigned_operand(instruction_bytes, 3, 1);
+            let size_register = read_unsigned_operand(instruction_bytes, 4, 1);
+            let object =
+                read_scalar_register(registers, function_id, instruction, object_register)?;
+
+            if matches!(object, ScalarValue::Undefined | ScalarValue::Null) {
+                write_scalar_register(
+                    registers,
+                    function_id,
+                    instruction,
+                    destination,
+                    ScalarValue::Undefined,
+                )?;
+                Ok(ScalarInstructionResult::Continue)
+            } else if let ScalarValue::Object(object) = object {
+                let names = scalar_object_property_names(bytecode, state, object);
+                let property_list = allocate_scalar_array(
+                    state,
+                    u32::try_from(names.len()).expect("property list length fits in u32"),
+                );
+                for (index, name) in names.into_iter().enumerate() {
+                    write_scalar_array_element(
+                        state,
+                        property_list,
+                        u32::try_from(index).expect("property list index fits in u32"),
+                        name,
+                    );
+                }
+                write_scalar_register(
+                    registers,
+                    function_id,
+                    instruction,
+                    index_register,
+                    ScalarValue::Number(0.0),
+                )?;
+                write_scalar_register(
+                    registers,
+                    function_id,
+                    instruction,
+                    size_register,
+                    ScalarValue::Number(
+                        read_scalar_array_length(state, property_list).map_or(0.0, f64::from),
+                    ),
+                )?;
+                write_scalar_register(
+                    registers,
+                    function_id,
+                    instruction,
+                    destination,
+                    ScalarValue::Object(property_list),
+                )?;
+                Ok(ScalarInstructionResult::Continue)
+            } else {
+                write_scalar_register(
+                    registers,
+                    function_id,
+                    instruction,
+                    destination,
+                    ScalarValue::Undefined,
+                )?;
+                Ok(ScalarInstructionResult::Continue)
+            }
+        }
+        105 => {
+            let destination = read_unsigned_operand(instruction_bytes, 1, 1);
+            let property_list_register = read_unsigned_operand(instruction_bytes, 2, 1);
+            let _object_register = read_unsigned_operand(instruction_bytes, 3, 1);
+            let index_register = read_unsigned_operand(instruction_bytes, 4, 1);
+            let size_register = read_unsigned_operand(instruction_bytes, 5, 1);
+            let property_list = read_scalar_object_handle(
+                registers,
+                function_id,
+                instruction,
+                property_list_register,
+            )?;
+            let index = read_scalar_register(registers, function_id, instruction, index_register)
+                .ok()
+                .and_then(scalar_value_to_u32)
+                .unwrap_or(0);
+            let size = read_scalar_register(registers, function_id, instruction, size_register)
+                .ok()
+                .and_then(scalar_value_to_u32)
+                .unwrap_or(0);
+            let value = if index >= size {
+                ScalarValue::Undefined
+            } else {
+                read_scalar_array_element(state, property_list, index)
+            };
+            write_scalar_register(
+                registers,
+                function_id,
+                instruction,
+                index_register,
+                ScalarValue::Number(f64::from(index.saturating_add(1))),
+            )?;
+            write_scalar_register(registers, function_id, instruction, destination, value)?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        107 => {
+            let destination = read_unsigned_operand(instruction_bytes, 1, 1);
+            let constructor_register = read_unsigned_operand(instruction_bytes, 2, 1);
+            let argument_count = read_unsigned_operand(instruction_bytes, 3, 1);
+            let constructor =
+                read_scalar_register(registers, function_id, instruction, constructor_register)?;
+            let value = construct_scalar_function(
+                function_id,
+                instruction,
+                constructor_register,
+                constructor,
+                argument_count,
+                state.relaxed_host_stubs,
+            )?;
+            write_scalar_register(registers, function_id, instruction, destination, value)?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        108 | 110 | 111 | 112 => {
+            let destination = read_unsigned_operand(instruction_bytes, 1, 1);
+            let callee_register = read_unsigned_operand(instruction_bytes, 2, 1);
+            let callee =
+                read_scalar_register(registers, function_id, instruction, callee_register)?;
+            let arguments = read_scalar_direct_call_arguments(
+                registers,
+                function_id,
+                instruction,
+                instruction_bytes,
+            )?;
+            let value = call_scalar_function(
+                bytecode,
+                state,
+                function_id,
+                instruction,
+                callee_register,
+                callee,
+                &arguments,
+            )?;
+            write_scalar_register(registers, function_id, instruction, destination, value)?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        115 | 116 => {
+            let destination = read_unsigned_operand(instruction_bytes, 1, 1);
+            let builtin_id = read_unsigned_operand(instruction_bytes, 2, 1);
+            let argument_count_width = if instruction.opcode == 116 { 4 } else { 1 };
+            let argument_count = read_unsigned_operand(instruction_bytes, 3, argument_count_width);
+            let value = call_scalar_builtin(
+                state,
+                registers,
+                function_id,
+                instruction,
+                builtin_id,
+                argument_count,
+            )?;
+            write_scalar_register(registers, function_id, instruction, destination, value)?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        132 | 133 => {
+            let destination = read_unsigned_operand(instruction_bytes, 1, 1);
+            let environment_register = read_unsigned_operand(instruction_bytes, 2, 1);
+            let target_function_width = if instruction.opcode == 133 { 4 } else { 2 };
+            let target_function_id =
+                read_unsigned_operand(instruction_bytes, 3, target_function_width);
+            let _ = bytecode.function_header(target_function_id)?;
+            let environment = read_scalar_optional_environment_handle(
+                registers,
+                function_id,
+                instruction,
+                environment_register,
+            )?;
+            let value = ScalarValue::Function(ScalarFunctionHandle::Bytecode {
+                function_id: target_function_id,
+                environment,
+            });
+            write_scalar_register(registers, function_id, instruction, destination, value)?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        134 => {
+            let destination = read_unsigned_operand(instruction_bytes, 1, 1);
+            let constructor_register = read_unsigned_operand(instruction_bytes, 2, 1);
+            let _cache_index = read_unsigned_operand(instruction_bytes, 3, 1);
+            let value = create_scalar_this_for_new(
+                state,
+                registers,
+                function_id,
+                instruction,
+                constructor_register,
+            )?;
+            write_scalar_register(registers, function_id, instruction, destination, value)?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        136 => {
+            let destination = read_unsigned_operand(instruction_bytes, 1, 1);
+            let this_register = read_unsigned_operand(instruction_bytes, 2, 1);
+            let return_register = read_unsigned_operand(instruction_bytes, 3, 1);
+            let this_value =
+                read_scalar_register(registers, function_id, instruction, this_register)?;
+            let return_value =
+                read_scalar_register(registers, function_id, instruction, return_register)?;
+            let value = select_scalar_constructor_result(
+                function_id,
+                instruction,
+                this_register,
+                this_value,
+                return_value,
+            )?;
+            write_scalar_register(registers, function_id, instruction, destination, value)?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        137 | 138 => {
+            let destination = read_unsigned_operand(instruction_bytes, 1, 1);
+            let argument_width = if instruction.opcode == 138 { 4 } else { 1 };
+            let argument_index = read_unsigned_operand(instruction_bytes, 2, argument_width);
+            let value = arguments
+                .get(
+                    usize::try_from(argument_index)
+                        .expect("Hermes argument index fits in usize on supported targets"),
+                )
+                .copied()
+                .unwrap_or(ScalarValue::Undefined);
+            write_scalar_register(registers, function_id, instruction, destination, value)?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        165 => {
+            let object = ScalarValue::Object(allocate_scalar_object(state));
+            write_scalar_destination(
+                registers,
+                function_id,
+                instruction,
+                instruction_bytes,
+                object,
+            )?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        174 | 175 => Ok(ScalarInstructionResult::Jump(read_scalar_jump_target(
+            instruction,
+            instruction_bytes,
+            1,
+            scalar_jump_delta_width(instruction.opcode),
+        ))),
+        176 | 177 | 178 | 179 => {
+            let delta_width = scalar_jump_delta_width(instruction.opcode);
+            let condition_register = read_unsigned_operand(instruction_bytes, 1 + delta_width, 1);
+            let condition =
+                read_scalar_register(registers, function_id, instruction, condition_register)?;
+            let should_jump = match instruction.opcode {
+                176 | 177 => scalar_to_boolean(condition),
+                178 | 179 => !scalar_to_boolean(condition),
+                _ => unreachable!("matched conditional jump opcodes"),
+            };
+
+            if should_jump {
+                Ok(ScalarInstructionResult::Jump(read_scalar_jump_target(
+                    instruction,
+                    instruction_bytes,
+                    1,
+                    delta_width,
+                )))
+            } else {
+                Ok(ScalarInstructionResult::Continue)
+            }
+        }
+        180 | 181 => {
+            let delta_width = scalar_jump_delta_width(instruction.opcode);
+            let source_register = read_unsigned_operand(instruction_bytes, 1 + delta_width, 1);
+            let source =
+                read_scalar_register(registers, function_id, instruction, source_register)?;
+            if source == ScalarValue::Undefined {
+                Ok(ScalarInstructionResult::Jump(read_scalar_jump_target(
+                    instruction,
+                    instruction_bytes,
+                    1,
+                    delta_width,
+                )))
+            } else {
+                Ok(ScalarInstructionResult::Continue)
+            }
+        }
+        182 => {
+            let target = read_scalar_jump_target(instruction, instruction_bytes, 1, 4);
+            let source_register = read_unsigned_operand(instruction_bytes, 5, 1);
+            let mask = read_scalar_typeof_is_mask(instruction_bytes, 6);
+            let source =
+                read_scalar_register(registers, function_id, instruction, source_register)?;
+
+            if scalar_typeof_is_matches(source, mask) {
+                Ok(ScalarInstructionResult::Jump(target))
+            } else {
+                Ok(ScalarInstructionResult::Continue)
+            }
+        }
+        207..=214 => {
+            let delta_width = if matches!(instruction.opcode, 208 | 210 | 212 | 214) {
+                4
+            } else {
+                1
+            };
+            let left_register = read_unsigned_operand(instruction_bytes, 1 + delta_width, 1);
+            let right_register = read_unsigned_operand(instruction_bytes, 2 + delta_width, 1);
+            let left = read_scalar_register(registers, function_id, instruction, left_register)?;
+            let right = read_scalar_register(registers, function_id, instruction, right_register)?;
+            let should_jump = match instruction.opcode {
+                207 | 208 => scalar_abstract_equal(left, right),
+                209 | 210 => !scalar_abstract_equal(left, right),
+                211 | 212 => scalar_strict_equal(left, right),
+                213 | 214 => !scalar_strict_equal(left, right),
+                _ => unreachable!("matched equality jump opcodes"),
+            };
+
+            if should_jump {
+                Ok(ScalarInstructionResult::Jump(read_scalar_jump_target(
+                    instruction,
+                    instruction_bytes,
+                    1,
+                    delta_width,
+                )))
+            } else {
+                Ok(ScalarInstructionResult::Continue)
+            }
+        }
+        215..=218 => {
+            let delta_width = if matches!(instruction.opcode, 216 | 218) {
+                4
+            } else {
+                1
+            };
+            let builtin_id = read_unsigned_operand(instruction_bytes, 1 + delta_width, 1);
+            let source_register = read_unsigned_operand(instruction_bytes, 2 + delta_width, 1);
+            let source =
+                read_scalar_register(registers, function_id, instruction, source_register)?;
+            let is_builtin = scalar_builtin_matches(source, builtin_id);
+            let should_jump = match instruction.opcode {
+                215 | 216 => is_builtin,
+                217 | 218 => !is_builtin,
+                _ => unreachable!("matched builtin jump opcodes"),
+            };
+
+            if should_jump {
+                Ok(ScalarInstructionResult::Jump(read_scalar_jump_target(
+                    instruction,
+                    instruction_bytes,
+                    1,
+                    delta_width,
+                )))
+            } else {
+                Ok(ScalarInstructionResult::Continue)
+            }
+        }
+        118 => {
+            let source = read_unsigned_operand(instruction_bytes, 1, 1);
+            read_scalar_register(registers, function_id, instruction, source)
+                .map(ScalarInstructionResult::Return)
+        }
+        121 => {
+            let source = read_unsigned_operand(instruction_bytes, 1, 1);
+            let value = read_scalar_register(registers, function_id, instruction, source)?;
+            Err(ScalarExecutionError::ThrownValue {
+                function_id,
+                offset: instruction.offset,
+                opcode: instruction.opcode,
+                register: source,
+                value,
+            })
+        }
+        139 => {
+            let value =
+                ScalarValue::Number(f64::from(read_unsigned_operand(instruction_bytes, 2, 1)));
+            write_scalar_destination(
+                registers,
+                function_id,
+                instruction,
+                instruction_bytes,
+                value,
+            )?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        140 => {
+            let value = ScalarValue::Number(f64::from(read_i32(instruction_bytes, 2)));
+            write_scalar_destination(
+                registers,
+                function_id,
+                instruction,
+                instruction_bytes,
+                value,
+            )?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        141 => {
+            let value = ScalarValue::Number(read_f64(instruction_bytes, 2));
+            write_scalar_destination(
+                registers,
+                function_id,
+                instruction,
+                instruction_bytes,
+                value,
+            )?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        144 => {
+            let string_id = read_unsigned_operand(instruction_bytes, 2, 2);
+            let string = bytecode.string(string_id)?;
+            let value = ScalarValue::String(ScalarStringHandle {
+                string_id,
+                is_empty: string.is_empty(),
+            });
+            write_scalar_destination(
+                registers,
+                function_id,
+                instruction,
+                instruction_bytes,
+                value,
+            )?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        153 => {
+            write_scalar_destination(
+                registers,
+                function_id,
+                instruction,
+                instruction_bytes,
+                ScalarValue::Object(ScalarObjectHandle::Global),
+            )?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        opcode if scalar_common_constant(opcode).is_some() => {
+            let value =
+                scalar_common_constant(opcode).expect("checked scalar common constant opcode");
+            write_scalar_destination(
+                registers,
+                function_id,
+                instruction,
+                instruction_bytes,
+                value,
+            )?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        opcode => Err(ScalarExecutionError::UnsupportedOpcode {
+            function_id,
+            offset: instruction.offset,
+            opcode,
+            opcode_name: hermes_opcode_name(opcode),
+        }),
+    }
+}
+
+fn read_scalar_string_operand<'a>(
+    bytecode: &HermesBytecode<'a>,
+    function_id: u32,
+    instruction: HermesInstruction,
+    string_id: u32,
+) -> Result<&'a str, ScalarExecutionError> {
+    let string = bytecode.string(string_id)?;
+    if string.is_utf16() {
+        return Err(ScalarExecutionError::UnsupportedStringEncoding {
+            function_id,
+            offset: instruction.offset,
+            opcode: instruction.opcode,
+            string_id,
+            encoding: "UTF-16",
+        });
+    }
+
+    std::str::from_utf8(string.bytes()).map_err(|_| ScalarExecutionError::InvalidUtf8String {
+        function_id,
+        offset: instruction.offset,
+        opcode: instruction.opcode,
+        string_id,
+    })
+}
+
+fn scalar_jump_delta_width(opcode: u8) -> usize {
+    match opcode {
+        175 | 177 | 179 | 181 | 208 | 216 | 218 => 4,
+        _ => 1,
+    }
+}
+
+fn read_scalar_jump_target(
+    instruction: HermesInstruction,
+    instruction_bytes: &[u8],
+    offset: usize,
+    width: usize,
+) -> u32 {
+    let delta = read_signed_operand(instruction_bytes, offset, width);
+    let target = i64::from(instruction.offset) + delta;
+    u32::try_from(target).expect("validated Hermes jump target fits in u32")
+}
+
+fn read_scalar_typeof_is_mask(instruction_bytes: &[u8], offset: usize) -> u16 {
+    u16::try_from(read_unsigned_operand(instruction_bytes, offset, 2))
+        .expect("TypeOfIs UInt16 operand fits in u16")
+}
+
+fn scalar_typeof_is_matches(value: ScalarValue, mask: u16) -> bool {
+    let type_bit = match value {
+        ScalarValue::Undefined => TYPEOF_IS_UNDEFINED,
+        ScalarValue::Null => TYPEOF_IS_NULL,
+        ScalarValue::Boolean(_) => TYPEOF_IS_BOOLEAN,
+        ScalarValue::Number(_) => TYPEOF_IS_NUMBER,
+        ScalarValue::String(_) => TYPEOF_IS_STRING,
+        ScalarValue::Environment(_) | ScalarValue::Object(_) => TYPEOF_IS_OBJECT,
+        ScalarValue::Function(_) => TYPEOF_IS_FUNCTION,
+        ScalarValue::Empty => return false,
+    };
+
+    mask & type_bit != 0
+}
+
+fn scalar_to_boolean(value: ScalarValue) -> bool {
+    match value {
+        ScalarValue::Empty | ScalarValue::Undefined | ScalarValue::Null => false,
+        ScalarValue::Boolean(value) => value,
+        ScalarValue::Number(value) => value != 0.0 && !value.is_nan(),
+        ScalarValue::String(handle) => !handle.is_empty,
+        ScalarValue::Environment(_) | ScalarValue::Object(_) | ScalarValue::Function(_) => true,
+    }
+}
+
+fn scalar_to_number(value: ScalarValue) -> f64 {
+    match value {
+        ScalarValue::Number(value) => value,
+        ScalarValue::Boolean(true) => 1.0,
+        ScalarValue::Boolean(false) | ScalarValue::Null => 0.0,
+        ScalarValue::Empty | ScalarValue::Undefined => f64::NAN,
+        ScalarValue::String(_) => f64::NAN,
+        ScalarValue::Environment(_) | ScalarValue::Object(_) | ScalarValue::Function(_) => f64::NAN,
+    }
+}
+
+fn scalar_strict_equal(left: ScalarValue, right: ScalarValue) -> bool {
+    match (left, right) {
+        (ScalarValue::Empty, ScalarValue::Empty)
+        | (ScalarValue::Undefined, ScalarValue::Undefined)
+        | (ScalarValue::Null, ScalarValue::Null) => true,
+        (ScalarValue::Boolean(left), ScalarValue::Boolean(right)) => left == right,
+        (ScalarValue::Number(left), ScalarValue::Number(right)) => left == right,
+        (ScalarValue::String(left), ScalarValue::String(right)) => left == right,
+        (ScalarValue::Object(left), ScalarValue::Object(right)) => left == right,
+        (ScalarValue::Environment(left), ScalarValue::Environment(right)) => left == right,
+        (ScalarValue::Function(left), ScalarValue::Function(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn scalar_abstract_equal(left: ScalarValue, right: ScalarValue) -> bool {
+    scalar_strict_equal(left, right)
+        || matches!(
+            (left, right),
+            (ScalarValue::Null, ScalarValue::Undefined)
+                | (ScalarValue::Undefined, ScalarValue::Null)
+        )
+}
+
+fn scalar_builtin_matches(value: ScalarValue, builtin_id: u32) -> bool {
+    matches!(
+        (value, builtin_id),
+        (
+            ScalarValue::Function(ScalarFunctionHandle::NativeObjectHasOwnPropertyCall),
+            HERMES_BUILTIN_FUNCTION_PROTOTYPE_CALL,
+        )
+    )
+}
+
+fn call_scalar_function<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
+    function_id: u32,
+    instruction: HermesInstruction,
+    register: u32,
+    callee: ScalarValue,
+    arguments: &[ScalarValue],
+) -> Result<ScalarValue, ScalarExecutionError> {
+    match callee {
+        ScalarValue::Function(ScalarFunctionHandle::NativePerformanceNow) => {
+            Ok(ScalarValue::Number(0.0))
+        }
+        ScalarValue::Function(ScalarFunctionHandle::NativeDateNow) => Ok(ScalarValue::Number(0.0)),
+        ScalarValue::Function(ScalarFunctionHandle::HermesInternalConcat) => {
+            Ok(call_scalar_hermes_internal_concat(arguments))
+        }
+        ScalarValue::Function(ScalarFunctionHandle::NativeObjectDefineProperty) => {
+            Ok(scalar_actual_arguments(arguments)
+                .first()
+                .copied()
+                .unwrap_or(ScalarValue::Undefined))
+        }
+        ScalarValue::Function(ScalarFunctionHandle::NativeObjectGetOwnPropertyDescriptor) => {
+            call_scalar_object_get_own_property_descriptor(
+                bytecode,
+                state,
+                function_id,
+                instruction,
+                arguments,
+            )
+        }
+        ScalarValue::Function(ScalarFunctionHandle::NativeObjectHasOwnProperty) => {
+            Ok(ScalarValue::Boolean(call_scalar_object_has_own_property(
+                bytecode,
+                state,
+                function_id,
+                instruction,
+                arguments.first().copied().unwrap_or(ScalarValue::Undefined),
+                scalar_actual_arguments(arguments)
+                    .first()
+                    .copied()
+                    .unwrap_or(ScalarValue::Undefined),
+            )))
+        }
+        ScalarValue::Function(ScalarFunctionHandle::NativeObjectHasOwnPropertyCall) => {
+            let actual_arguments = scalar_actual_arguments(arguments);
+            Ok(ScalarValue::Boolean(call_scalar_object_has_own_property(
+                bytecode,
+                state,
+                function_id,
+                instruction,
+                actual_arguments
+                    .first()
+                    .copied()
+                    .unwrap_or(ScalarValue::Undefined),
+                actual_arguments
+                    .get(1)
+                    .copied()
+                    .unwrap_or(ScalarValue::Undefined),
+            )))
+        }
+        ScalarValue::Function(ScalarFunctionHandle::NativeWeakMapGet) => {
+            Ok(call_scalar_weak_map_get(state, arguments))
+        }
+        ScalarValue::Function(ScalarFunctionHandle::NativeWeakMapHas) => Ok(ScalarValue::Boolean(
+            call_scalar_weak_map_has(state, arguments),
+        )),
+        ScalarValue::Function(ScalarFunctionHandle::NativeWeakMapSet) => {
+            Ok(call_scalar_weak_map_set(state, arguments))
+        }
+        ScalarValue::Function(ScalarFunctionHandle::NativeStringReplace) => {
+            Ok(arguments.first().copied().unwrap_or(ScalarValue::Undefined))
+        }
+        ScalarValue::Function(ScalarFunctionHandle::NativeTurboModuleProxy) => {
+            Ok(call_scalar_turbo_module_proxy(state))
+        }
+        ScalarValue::Function(ScalarFunctionHandle::NativeModuleGetConstants) => {
+            Ok(call_scalar_native_module_get_constants(bytecode, state))
+        }
+        ScalarValue::Function(ScalarFunctionHandle::NativeNoopFunction) => {
+            Ok(ScalarValue::Undefined)
+        }
+        ScalarValue::Function(ScalarFunctionHandle::NativeMetroDefine) => {
+            call_scalar_metro_define(state, arguments);
+            Ok(ScalarValue::Undefined)
+        }
+        ScalarValue::Function(ScalarFunctionHandle::NativeMetroRequire) => {
+            call_scalar_metro_require(bytecode, state, arguments)
+        }
+        ScalarValue::Function(ScalarFunctionHandle::NativeMetroRegisterSegment) => {
+            Ok(ScalarValue::Undefined)
+        }
+        ScalarValue::Function(ScalarFunctionHandle::Bytecode {
+            function_id: target_function_id,
+            environment,
+        }) => {
+            let report = execute_scalar_function_with_state_and_environment(
+                bytecode,
+                state,
+                target_function_id,
+                environment,
+                arguments,
+            )?;
+            Ok(report.value)
+        }
+        ScalarValue::Object(_) if state.relaxed_host_stubs => Ok(ScalarValue::Undefined),
+        ScalarValue::Undefined | ScalarValue::Null | ScalarValue::Empty
+            if state.relaxed_host_stubs =>
+        {
+            Ok(ScalarValue::Undefined)
+        }
+        value => Err(ScalarExecutionError::UnsupportedCallTarget {
+            function_id,
+            offset: instruction.offset,
+            opcode: instruction.opcode,
+            register,
+            value,
+        }),
+    }
+}
+
+fn scalar_actual_arguments(arguments: &[ScalarValue]) -> &[ScalarValue] {
+    arguments.get(1..).unwrap_or(&[])
+}
+
+fn call_scalar_hermes_internal_concat(arguments: &[ScalarValue]) -> ScalarValue {
+    scalar_actual_arguments(arguments)
+        .iter()
+        .rev()
+        .find(|argument| {
+            matches!(
+                argument,
+                ScalarValue::String(ScalarStringHandle {
+                    is_empty: false,
+                    ..
+                })
+            )
+        })
+        .or_else(|| {
+            scalar_actual_arguments(arguments)
+                .iter()
+                .find(|argument| matches!(argument, ScalarValue::String(_)))
+        })
+        .copied()
+        .unwrap_or(ScalarValue::Undefined)
+}
+
+fn call_scalar_object_get_own_property_descriptor<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
+    function_id: u32,
+    instruction: HermesInstruction,
+    arguments: &[ScalarValue],
+) -> Result<ScalarValue, ScalarExecutionError> {
+    let actual_arguments = scalar_actual_arguments(arguments);
+    let Some(object) = actual_arguments.first().copied() else {
+        return Ok(ScalarValue::Undefined);
+    };
+    let Some(property_name) = actual_arguments
+        .get(1)
+        .and_then(|value| scalar_value_to_string(bytecode, function_id, instruction, *value).ok())
+    else {
+        return Ok(ScalarValue::Undefined);
+    };
+
+    let value = match object {
+        ScalarValue::Object(ScalarObjectHandle::Global) => {
+            read_scalar_global_property(state, property_name)
+        }
+        ScalarValue::Object(handle) => read_scalar_object_property(state, handle, property_name),
+        ScalarValue::Function(handle) => {
+            read_scalar_function_property(state, handle, property_name)
+        }
+        _ => ScalarValue::Undefined,
+    };
+
+    if value == ScalarValue::Undefined {
+        return Ok(ScalarValue::Undefined);
+    }
+
+    let descriptor = allocate_scalar_object(state);
+    write_scalar_named_object_property(state, descriptor, "value", value);
+    write_scalar_named_object_property(state, descriptor, "enumerable", ScalarValue::Boolean(true));
+    write_scalar_named_object_property(state, descriptor, "writable", ScalarValue::Boolean(true));
+    write_scalar_named_object_property(
+        state,
+        descriptor,
+        "configurable",
+        ScalarValue::Boolean(true),
+    );
+    Ok(ScalarValue::Object(descriptor))
+}
+
+fn call_scalar_object_has_own_property(
+    bytecode: &HermesBytecode<'_>,
+    state: &ScalarExecutorState<'_>,
+    function_id: u32,
+    instruction: HermesInstruction,
+    object: ScalarValue,
+    key: ScalarValue,
+) -> bool {
+    let Ok(property_name) = scalar_value_to_string(bytecode, function_id, instruction, key) else {
+        return false;
+    };
+
+    match object {
+        ScalarValue::Object(ScalarObjectHandle::Global) => state
+            .global_properties
+            .iter()
+            .any(|(name, _)| *name == property_name),
+        ScalarValue::Object(handle) => state
+            .object_properties
+            .iter()
+            .any(|(stored_object, name, _)| *stored_object == handle && *name == property_name),
+        ScalarValue::Function(handle) => state
+            .function_properties
+            .iter()
+            .any(|(stored_function, name, _)| *stored_function == handle && *name == property_name),
+        _ => false,
+    }
+}
+
+fn call_scalar_weak_map_get(
+    state: &ScalarExecutorState<'_>,
+    arguments: &[ScalarValue],
+) -> ScalarValue {
+    let Some(ScalarValue::Object(weak_map)) = arguments.first().copied() else {
+        return ScalarValue::Undefined;
+    };
+    let Some(key) = scalar_actual_arguments(arguments).first().copied() else {
+        return ScalarValue::Undefined;
+    };
+
+    state
+        .weak_map_entries
+        .iter()
+        .rev()
+        .find(|(stored_map, stored_key, _)| *stored_map == weak_map && *stored_key == key)
+        .map_or(ScalarValue::Undefined, |(_, _, value)| *value)
+}
+
+fn call_scalar_weak_map_has(state: &ScalarExecutorState<'_>, arguments: &[ScalarValue]) -> bool {
+    let Some(ScalarValue::Object(weak_map)) = arguments.first().copied() else {
+        return false;
+    };
+    let Some(key) = scalar_actual_arguments(arguments).first().copied() else {
+        return false;
+    };
+
+    state
+        .weak_map_entries
+        .iter()
+        .rev()
+        .any(|(stored_map, stored_key, _)| *stored_map == weak_map && *stored_key == key)
+}
+
+fn call_scalar_weak_map_set(
+    state: &mut ScalarExecutorState<'_>,
+    arguments: &[ScalarValue],
+) -> ScalarValue {
+    let receiver = arguments.first().copied().unwrap_or(ScalarValue::Undefined);
+    let ScalarValue::Object(weak_map) = receiver else {
+        return ScalarValue::Undefined;
+    };
+    let actual_arguments = scalar_actual_arguments(arguments);
+    let Some(key) = actual_arguments.first().copied() else {
+        return receiver;
+    };
+    let value = actual_arguments
+        .get(1)
+        .copied()
+        .unwrap_or(ScalarValue::Undefined);
+
+    if let Some((_, _, stored_value)) = state
+        .weak_map_entries
+        .iter_mut()
+        .rev()
+        .find(|(stored_map, stored_key, _)| *stored_map == weak_map && *stored_key == key)
+    {
+        *stored_value = value;
+    } else {
+        state.weak_map_entries.push((weak_map, key, value));
+    }
+    receiver
+}
+
+fn call_scalar_turbo_module_proxy(state: &mut ScalarExecutorState<'_>) -> ScalarValue {
+    let module = allocate_scalar_native_module(state);
+    ScalarValue::Object(module)
+}
+
+fn call_scalar_native_module_get_constants(
+    bytecode: &HermesBytecode<'_>,
+    state: &mut ScalarExecutorState<'_>,
+) -> ScalarValue {
+    let constants = allocate_scalar_object(state);
+    let dimensions = allocate_scalar_object(state);
+    let window = allocate_scalar_object(state);
+    let version = allocate_scalar_object(state);
+
+    for object in [window] {
+        write_scalar_named_object_property(state, object, "width", ScalarValue::Number(360.0));
+        write_scalar_named_object_property(state, object, "height", ScalarValue::Number(800.0));
+        write_scalar_named_object_property(state, object, "scale", ScalarValue::Number(3.0));
+        write_scalar_named_object_property(state, object, "fontScale", ScalarValue::Number(1.0));
+        write_scalar_named_object_property(state, object, "densityDpi", ScalarValue::Number(480.0));
+    }
+
+    write_scalar_named_object_property(state, dimensions, "window", ScalarValue::Object(window));
+    write_scalar_named_object_property(state, dimensions, "screen", ScalarValue::Object(window));
+    write_scalar_named_object_property(
+        state,
+        constants,
+        "Dimensions",
+        ScalarValue::Object(dimensions),
+    );
+    write_scalar_named_object_property(
+        state,
+        constants,
+        "isEdgeToEdge",
+        ScalarValue::Boolean(false),
+    );
+
+    write_scalar_named_object_property(state, version, "major", ScalarValue::Number(0.0));
+    write_scalar_named_object_property(state, version, "minor", ScalarValue::Number(85.0));
+    write_scalar_named_object_property(state, version, "patch", ScalarValue::Number(0.0));
+    write_scalar_named_object_property(state, version, "prerelease", ScalarValue::Null);
+    write_scalar_named_object_property(
+        state,
+        constants,
+        "reactNativeVersion",
+        ScalarValue::Object(version),
+    );
+    write_scalar_named_object_property(state, constants, "Version", ScalarValue::Number(35.0));
+
+    if let Some(android) = scalar_string_value_for_name(bytecode, "android") {
+        write_scalar_named_object_property(state, constants, "OS", android);
+        write_scalar_named_object_property(state, constants, "uiMode", android);
+    }
+    if let Some(script_url) = scalar_string_value_for_name(bytecode, "index.android.bundle") {
+        write_scalar_named_object_property(state, constants, "scriptURL", script_url);
+    }
+
+    ScalarValue::Object(constants)
+}
+
+fn call_scalar_metro_define(state: &mut ScalarExecutorState<'_>, arguments: &[ScalarValue]) {
+    let actual_arguments = scalar_actual_arguments(arguments);
+    let Some(ScalarValue::Function(factory)) = actual_arguments.first().copied() else {
+        return;
+    };
+    let Some(module_id) = actual_arguments
+        .get(1)
+        .and_then(|value| scalar_value_to_u32(*value))
+    else {
+        return;
+    };
+    let dependency_map = actual_arguments
+        .get(2)
+        .copied()
+        .unwrap_or(ScalarValue::Undefined);
+
+    if let Some((_, stored_factory, stored_dependency_map)) = state
+        .metro_modules
+        .iter_mut()
+        .rev()
+        .find(|(stored_module_id, _, _)| *stored_module_id == module_id)
+    {
+        *stored_factory = factory;
+        *stored_dependency_map = dependency_map;
+    } else {
+        state
+            .metro_modules
+            .push((module_id, factory, dependency_map));
+    }
+}
+
+fn call_scalar_metro_require<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
+    arguments: &[ScalarValue],
+) -> Result<ScalarValue, ScalarExecutionError> {
+    let actual_arguments = scalar_actual_arguments(arguments);
+    let Some(module_id) = actual_arguments
+        .first()
+        .and_then(|value| scalar_value_to_u32(*value))
+    else {
+        return Ok(ScalarValue::Undefined);
+    };
+
+    if let Some((_, exports)) = state
+        .metro_module_exports
+        .iter()
+        .rev()
+        .find(|(stored_module_id, _)| *stored_module_id == module_id)
+    {
+        return Ok(*exports);
+    }
+
+    let Some((factory, dependency_map)) = state
+        .metro_modules
+        .iter()
+        .rev()
+        .find(|(stored_module_id, _, _)| *stored_module_id == module_id)
+        .map(|(_, factory, dependency_map)| (*factory, *dependency_map))
+    else {
+        return Ok(ScalarValue::Undefined);
+    };
+
+    let ScalarFunctionHandle::Bytecode { function_id, .. } = factory else {
+        return Ok(ScalarValue::Undefined);
+    };
+
+    let module = allocate_scalar_object(state);
+    let exports = allocate_scalar_object(state);
+    let module_value = ScalarValue::Object(module);
+    let exports_value = ScalarValue::Object(exports);
+    write_scalar_named_object_property(state, module, "exports", exports_value);
+
+    let require = ScalarValue::Function(ScalarFunctionHandle::NativeMetroRequire);
+    let import_default = read_scalar_function_property(
+        state,
+        ScalarFunctionHandle::NativeMetroRequire,
+        "importDefault",
+    );
+    let import_all =
+        read_scalar_function_property(state, ScalarFunctionHandle::NativeMetroRequire, "importAll");
+    let factory_arguments = [
+        ScalarValue::Undefined,
+        ScalarValue::Object(ScalarObjectHandle::Global),
+        require,
+        import_default,
+        import_all,
+        module_value,
+        exports_value,
+        dependency_map,
+    ];
+    let _ = execute_scalar_function_with_state(bytecode, state, function_id, &factory_arguments)?;
+    let module_exports = read_scalar_object_property(state, module, "exports");
+    state.metro_module_exports.push((module_id, module_exports));
+
+    Ok(module_exports)
+}
+
+fn scalar_value_to_u32(value: ScalarValue) -> Option<u32> {
+    match value {
+        ScalarValue::Number(value)
+            if value.is_finite() && value >= 0.0 && value <= f64::from(u32::MAX) =>
+        {
+            Some(value as u32)
+        }
+        _ => None,
+    }
+}
+
+fn scalar_value_to_string<'a>(
+    bytecode: &HermesBytecode<'a>,
+    function_id: u32,
+    instruction: HermesInstruction,
+    value: ScalarValue,
+) -> Result<&'a str, ScalarExecutionError> {
+    match value {
+        ScalarValue::String(handle) => {
+            read_scalar_string_operand(bytecode, function_id, instruction, handle.string_id)
+        }
+        _ => Err(ScalarExecutionError::UnsupportedPropertyKey {
+            function_id,
+            offset: instruction.offset,
+            opcode: instruction.opcode,
+            register: 0,
+            value,
+        }),
+    }
+}
+
+fn call_scalar_builtin<'a>(
+    state: &mut ScalarExecutorState<'a>,
+    registers: &[ScalarValue],
+    function_id: u32,
+    instruction: HermesInstruction,
+    builtin_id: u32,
+    argument_count: u32,
+) -> Result<ScalarValue, ScalarExecutionError> {
+    match builtin_id {
+        HERMES_BUILTIN_COPY_DATA_PROPERTIES if argument_count >= 3 => {
+            let target_register =
+                u32::try_from(registers.len() - 1).expect("Hermes frame size is stored as u32");
+            let source_register =
+                u32::try_from(registers.len() - 2).expect("Hermes frame size is stored as u32");
+            let target =
+                read_scalar_object_handle(registers, function_id, instruction, target_register)?;
+            let source =
+                read_scalar_register(registers, function_id, instruction, source_register)?;
+
+            match source {
+                ScalarValue::Undefined | ScalarValue::Null => {}
+                ScalarValue::Object(source) => {
+                    let properties = state
+                        .object_properties
+                        .iter()
+                        .filter(|(object, _, _)| *object == source)
+                        .map(|(_, name, value)| (*name, *value))
+                        .collect::<Vec<_>>();
+                    for (name, value) in properties {
+                        write_scalar_named_object_property(state, target, name, value);
+                    }
+                }
+                value => {
+                    return Err(ScalarExecutionError::UnsupportedPropertyBase {
+                        function_id,
+                        offset: instruction.offset,
+                        opcode: instruction.opcode,
+                        register: source_register,
+                        value,
+                    });
+                }
+            }
+
+            Ok(ScalarValue::Object(target))
+        }
+        _ => Err(ScalarExecutionError::UnsupportedBuiltin {
+            function_id,
+            offset: instruction.offset,
+            opcode: instruction.opcode,
+            builtin_id,
+            argument_count,
+        }),
+    }
+}
+
+fn construct_scalar_function(
+    function_id: u32,
+    instruction: HermesInstruction,
+    register: u32,
+    constructor: ScalarValue,
+    _argument_count: u32,
+    relaxed_host_stubs: bool,
+) -> Result<ScalarValue, ScalarExecutionError> {
+    match constructor {
+        ScalarValue::Undefined | ScalarValue::Null | ScalarValue::Empty if relaxed_host_stubs => {
+            Ok(ScalarValue::Undefined)
+        }
+        ScalarValue::Function(
+            ScalarFunctionHandle::Bytecode { .. }
+            | ScalarFunctionHandle::NativeDateConstructor
+            | ScalarFunctionHandle::NativeErrorConstructor
+            | ScalarFunctionHandle::NativeMapConstructor
+            | ScalarFunctionHandle::NativeWeakMapConstructor
+            | ScalarFunctionHandle::NativeObjectConstructor,
+        ) => Ok(ScalarValue::Undefined),
+        value => Err(ScalarExecutionError::UnsupportedConstructorTarget {
+            function_id,
+            offset: instruction.offset,
+            opcode: instruction.opcode,
+            register,
+            value,
+        }),
+    }
+}
+
+fn select_scalar_constructor_result(
+    function_id: u32,
+    instruction: HermesInstruction,
+    this_register: u32,
+    this_value: ScalarValue,
+    return_value: ScalarValue,
+) -> Result<ScalarValue, ScalarExecutionError> {
+    if matches!(return_value, ScalarValue::Object(_)) {
+        return Ok(return_value);
+    }
+
+    match this_value {
+        ScalarValue::Object(_) => Ok(this_value),
+        value => Err(ScalarExecutionError::UnsupportedConstructorTarget {
+            function_id,
+            offset: instruction.offset,
+            opcode: instruction.opcode,
+            register: this_register,
+            value,
+        }),
+    }
+}
+
+fn read_scalar_direct_call_arguments(
+    registers: &[ScalarValue],
+    function_id: u32,
+    instruction: HermesInstruction,
+    instruction_bytes: &[u8],
+) -> Result<Vec<ScalarValue>, ScalarExecutionError> {
+    let argument_count = scalar_direct_call_argument_count(instruction.opcode);
+    let mut arguments = Vec::with_capacity(argument_count);
+    for argument_index in 0..argument_count {
+        let register = read_unsigned_operand(instruction_bytes, 3 + argument_index, 1);
+        arguments.push(read_scalar_register(
+            registers,
+            function_id,
+            instruction,
+            register,
+        )?);
+    }
+    Ok(arguments)
+}
+
+fn scalar_direct_call_argument_count(opcode: u8) -> usize {
+    match opcode {
+        108 => 1,
+        110 => 2,
+        111 => 3,
+        112 => 4,
+        _ => unreachable!("direct call argument count only supports Call1 through Call4"),
+    }
+}
+
+fn create_scalar_this_for_new(
+    state: &mut ScalarExecutorState<'_>,
+    registers: &[ScalarValue],
+    function_id: u32,
+    instruction: HermesInstruction,
+    constructor_register: u32,
+) -> Result<ScalarValue, ScalarExecutionError> {
+    match read_scalar_register(registers, function_id, instruction, constructor_register)? {
+        ScalarValue::Function(ScalarFunctionHandle::NativeWeakMapConstructor) => {
+            Ok(ScalarValue::Object(allocate_scalar_weak_map(state)))
+        }
+        ScalarValue::Function(
+            ScalarFunctionHandle::Bytecode { .. }
+            | ScalarFunctionHandle::NativeDateConstructor
+            | ScalarFunctionHandle::NativeErrorConstructor
+            | ScalarFunctionHandle::NativeMapConstructor
+            | ScalarFunctionHandle::NativeObjectConstructor,
+        ) => Ok(ScalarValue::Object(allocate_scalar_object(state))),
+        ScalarValue::Undefined | ScalarValue::Null | ScalarValue::Empty
+            if state.relaxed_host_stubs =>
+        {
+            Ok(ScalarValue::Object(allocate_scalar_object(state)))
+        }
+        value => Err(ScalarExecutionError::UnsupportedConstructorTarget {
+            function_id,
+            offset: instruction.offset,
+            opcode: instruction.opcode,
+            register: constructor_register,
+            value,
+        }),
+    }
+}
+
+fn read_scalar_literal_values<'a>(
+    bytecode: &HermesBytecode<'a>,
+    offset: u32,
+    element_count: u32,
+) -> Result<Vec<ScalarValue>, ScalarExecutionError> {
+    let buffer = bytecode.sections().literal_value_buffer().bytes();
+    validate_serialized_literal_buffer(
+        "literal_value_buffer",
+        buffer,
+        offset,
+        element_count,
+        false,
+        None,
+        bytecode.header(),
+    )?;
+
+    let mut values = Vec::with_capacity(
+        usize::try_from(element_count).expect("u32 always fits in usize on supported targets"),
+    );
+    let mut remaining = element_count;
+    let mut cursor =
+        usize::try_from(offset).expect("u32 always fits in usize on supported targets");
+
+    while remaining > 0 {
+        let tag = buffer[cursor];
+        cursor += 1;
+        let sequence_len = if tag & SERIALIZED_LITERAL_TAG_LONG_SEQUENCE != 0 {
+            let low_len = buffer[cursor];
+            cursor += 1;
+            (u32::from(tag & SERIALIZED_LITERAL_TAG_LENGTH_MASK) << 8) | u32::from(low_len)
+        } else {
+            u32::from(tag & SERIALIZED_LITERAL_TAG_LENGTH_MASK)
+        };
+        let to_read = remaining.min(sequence_len);
+        let tag_type = tag & SERIALIZED_LITERAL_TAG_MASK;
+
+        match tag_type {
+            0 => {
+                values.extend(std::iter::repeat_n(
+                    ScalarValue::Null,
+                    usize::try_from(to_read)
+                        .expect("u32 always fits in usize on supported targets"),
+                ));
+            }
+            SERIALIZED_LITERAL_TAG_TRUE => {
+                values.extend(std::iter::repeat_n(
+                    ScalarValue::Boolean(true),
+                    usize::try_from(to_read)
+                        .expect("u32 always fits in usize on supported targets"),
+                ));
+            }
+            SERIALIZED_LITERAL_TAG_FALSE => {
+                values.extend(std::iter::repeat_n(
+                    ScalarValue::Boolean(false),
+                    usize::try_from(to_read)
+                        .expect("u32 always fits in usize on supported targets"),
+                ));
+            }
+            SERIALIZED_LITERAL_TAG_NUMBER => {
+                for _ in 0..to_read {
+                    values.push(ScalarValue::Number(read_f64(buffer, cursor)));
+                    cursor += 8;
+                }
+            }
+            SERIALIZED_LITERAL_TAG_LONG_STRING | SERIALIZED_LITERAL_TAG_SHORT_STRING => {
+                let string_id_width = if tag_type == SERIALIZED_LITERAL_TAG_LONG_STRING {
+                    4
+                } else {
+                    2
+                };
+                for _ in 0..to_read {
+                    let string_id = read_unsigned_operand(buffer, cursor, string_id_width);
+                    let string = bytecode.string(string_id)?;
+                    values.push(ScalarValue::String(ScalarStringHandle {
+                        string_id,
+                        is_empty: string.is_empty(),
+                    }));
+                    cursor += string_id_width;
+                }
+            }
+            SERIALIZED_LITERAL_TAG_UNDEFINED => {
+                values.extend(std::iter::repeat_n(
+                    ScalarValue::Undefined,
+                    usize::try_from(to_read)
+                        .expect("u32 always fits in usize on supported targets"),
+                ));
+            }
+            SERIALIZED_LITERAL_TAG_INTEGER => {
+                for _ in 0..to_read {
+                    values.push(ScalarValue::Number(f64::from(read_i32(buffer, cursor))));
+                    cursor += 4;
+                }
+            }
+            _ => {
+                return Err(ParseError::InvalidSerializedLiteralTag {
+                    buffer: "literal_value_buffer",
+                    offset: u32::try_from(cursor.saturating_sub(1))
+                        .expect("validated HBC section offset fits in u32"),
+                    tag,
+                }
+                .into());
+            }
+        }
+
+        remaining -= to_read;
+    }
+
+    Ok(values)
+}
+
+fn read_scalar_object_literal_entries<'a>(
+    bytecode: &HermesBytecode<'a>,
+    function_id: u32,
+    instruction: HermesInstruction,
+    shape_index: u32,
+    value_offset: u32,
+) -> Result<Vec<(&'a str, ScalarValue)>, ScalarExecutionError> {
+    let shape = object_shape_entry_at(bytecode.sections().obj_shape_table().bytes(), shape_index)
+        .expect("object shape table operand was validated before scalar execution");
+    let keys = read_scalar_object_literal_keys(
+        bytecode,
+        function_id,
+        instruction,
+        shape.key_buffer_offset,
+        shape.num_props,
+    )?;
+    let values = read_scalar_literal_values(bytecode, value_offset, shape.num_props)?;
+
+    Ok(keys.into_iter().zip(values).collect())
+}
+
+fn read_scalar_object_literal_keys<'a>(
+    bytecode: &HermesBytecode<'a>,
+    function_id: u32,
+    instruction: HermesInstruction,
+    offset: u32,
+    property_count: u32,
+) -> Result<Vec<&'a str>, ScalarExecutionError> {
+    let sections = bytecode.sections();
+    let buffer = sections.obj_key_buffer().bytes();
+    validate_serialized_literal_buffer(
+        "obj_key_buffer",
+        buffer,
+        offset,
+        property_count,
+        true,
+        Some(sections.string_kinds().bytes()),
+        bytecode.header(),
+    )?;
+
+    let mut keys = Vec::with_capacity(
+        usize::try_from(property_count).expect("u32 always fits in usize on supported targets"),
+    );
+    let mut remaining = property_count;
+    let mut cursor =
+        usize::try_from(offset).expect("u32 always fits in usize on supported targets");
+
+    while remaining > 0 {
+        let tag = buffer[cursor];
+        cursor += 1;
+        let sequence_len = if tag & SERIALIZED_LITERAL_TAG_LONG_SEQUENCE != 0 {
+            let low_len = buffer[cursor];
+            cursor += 1;
+            (u32::from(tag & SERIALIZED_LITERAL_TAG_LENGTH_MASK) << 8) | u32::from(low_len)
+        } else {
+            u32::from(tag & SERIALIZED_LITERAL_TAG_LENGTH_MASK)
+        };
+        let to_read = remaining.min(sequence_len);
+        let tag_type = tag & SERIALIZED_LITERAL_TAG_MASK;
+        let string_id_width = match tag_type {
+            SERIALIZED_LITERAL_TAG_SHORT_STRING => 2,
+            SERIALIZED_LITERAL_TAG_LONG_STRING => 4,
+            _ => {
+                return Err(ScalarExecutionError::UnsupportedObjectLiteralKey {
+                    function_id,
+                    offset: instruction.offset,
+                    opcode: instruction.opcode,
+                    tag,
+                });
+            }
+        };
+
+        for _ in 0..to_read {
+            let string_id = read_unsigned_operand(buffer, cursor, string_id_width);
+            keys.push(read_scalar_string_operand(
+                bytecode,
+                function_id,
+                instruction,
+                string_id,
+            )?);
+            cursor += string_id_width;
+        }
+
+        remaining -= to_read;
+    }
+
+    Ok(keys)
+}
+
+fn allocate_scalar_object(state: &mut ScalarExecutorState<'_>) -> ScalarObjectHandle {
+    let object_id = state.next_object_id;
+    state.next_object_id = state
+        .next_object_id
+        .checked_add(1)
+        .expect("scalar object id cannot overflow before the step limit");
+    ScalarObjectHandle::Object(object_id)
+}
+
+fn allocate_scalar_array(state: &mut ScalarExecutorState<'_>, length: u32) -> ScalarObjectHandle {
+    let object_id = state.next_object_id;
+    state.next_object_id = state
+        .next_object_id
+        .checked_add(1)
+        .expect("scalar object id cannot overflow before the step limit");
+    let handle = ScalarObjectHandle::Array(object_id);
+    state.array_lengths.push((handle, length));
+    handle
+}
+
+fn allocate_scalar_weak_map(state: &mut ScalarExecutorState<'_>) -> ScalarObjectHandle {
+    let object_id = state.next_object_id;
+    state.next_object_id = state
+        .next_object_id
+        .checked_add(1)
+        .expect("scalar object id cannot overflow before the step limit");
+    ScalarObjectHandle::WeakMap(object_id)
+}
+
+fn allocate_scalar_native_module(state: &mut ScalarExecutorState<'_>) -> ScalarObjectHandle {
+    let object_id = state.next_object_id;
+    state.next_object_id = state
+        .next_object_id
+        .checked_add(1)
+        .expect("scalar object id cannot overflow before the step limit");
+    ScalarObjectHandle::NativeModule(object_id)
+}
+
+fn write_scalar_array_element(
+    state: &mut ScalarExecutorState<'_>,
+    array: ScalarObjectHandle,
+    index: u32,
+    value: ScalarValue,
+) {
+    if let Some((_, _, stored_value)) = state
+        .array_elements
+        .iter_mut()
+        .rev()
+        .find(|(handle, stored_index, _)| *handle == array && *stored_index == index)
+    {
+        *stored_value = value;
+    } else {
+        state.array_elements.push((array, index, value));
+    }
+}
+
+fn read_scalar_array_element(
+    state: &ScalarExecutorState<'_>,
+    array: ScalarObjectHandle,
+    index: u32,
+) -> ScalarValue {
+    state
+        .array_elements
+        .iter()
+        .rev()
+        .find(|(handle, stored_index, _)| *handle == array && *stored_index == index)
+        .map_or(ScalarValue::Undefined, |(_, _, value)| *value)
+}
+
+fn read_scalar_array_length(
+    state: &ScalarExecutorState<'_>,
+    array: ScalarObjectHandle,
+) -> Option<u32> {
+    state
+        .array_lengths
+        .iter()
+        .rev()
+        .find(|(handle, _)| *handle == array)
+        .map(|(_, length)| *length)
+}
+
+fn scalar_object_property_names(
+    bytecode: &HermesBytecode<'_>,
+    state: &ScalarExecutorState<'_>,
+    object: ScalarObjectHandle,
+) -> Vec<ScalarValue> {
+    let mut names = Vec::new();
+    for (_, property_name, _) in state
+        .object_properties
+        .iter()
+        .filter(|(stored_object, _, _)| *stored_object == object)
+    {
+        if names
+            .iter()
+            .any(|name| scalar_string_matches(bytecode, *name, property_name))
+        {
+            continue;
+        }
+        if let Some(name) = scalar_string_value_for_name(bytecode, property_name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+fn scalar_string_matches(
+    bytecode: &HermesBytecode<'_>,
+    value: ScalarValue,
+    expected: &str,
+) -> bool {
+    let ScalarValue::String(handle) = value else {
+        return false;
+    };
+    bytecode
+        .string(handle.string_id)
+        .ok()
+        .filter(|string| !string.is_utf16())
+        .is_some_and(|string| string.bytes() == expected.as_bytes())
+}
+
+fn scalar_string_value_for_name(
+    bytecode: &HermesBytecode<'_>,
+    expected: &str,
+) -> Option<ScalarValue> {
+    for string_id in 0..bytecode.header().string_count {
+        let Ok(string) = bytecode.string(string_id) else {
+            continue;
+        };
+        if string.is_utf16() || string.bytes() != expected.as_bytes() {
+            continue;
+        }
+        return Some(ScalarValue::String(ScalarStringHandle {
+            string_id,
+            is_empty: expected.is_empty(),
+        }));
+    }
+    None
+}
+
+fn read_scalar_object_handle(
+    registers: &[ScalarValue],
+    function_id: u32,
+    instruction: HermesInstruction,
+    object_register: u32,
+) -> Result<ScalarObjectHandle, ScalarExecutionError> {
+    match read_scalar_register(registers, function_id, instruction, object_register)? {
+        ScalarValue::Object(handle) => Ok(handle),
+        value => Err(ScalarExecutionError::UnsupportedPropertyBase {
+            function_id,
+            offset: instruction.offset,
+            opcode: instruction.opcode,
+            register: object_register,
+            value,
+        }),
+    }
+}
+
+fn write_scalar_object_slot(
+    state: &mut ScalarExecutorState<'_>,
+    object: ScalarObjectHandle,
+    slot: u32,
+    value: ScalarValue,
+) {
+    if let Some((_, _, stored_value)) = state
+        .object_slots
+        .iter_mut()
+        .rev()
+        .find(|(stored_object, stored_slot, _)| *stored_object == object && *stored_slot == slot)
+    {
+        *stored_value = value;
+    } else {
+        state.object_slots.push((object, slot, value));
+    }
+}
+
+fn write_scalar_object_slot_name<'a>(
+    state: &mut ScalarExecutorState<'a>,
+    object: ScalarObjectHandle,
+    slot: u32,
+    property_name: &'a str,
+) {
+    if let Some((_, _, stored_name)) = state
+        .object_slot_names
+        .iter_mut()
+        .rev()
+        .find(|(stored_object, stored_slot, _)| *stored_object == object && *stored_slot == slot)
+    {
+        *stored_name = property_name;
+    } else {
+        state.object_slot_names.push((object, slot, property_name));
+    }
+}
+
+fn read_scalar_object_slot_name<'a>(
+    state: &ScalarExecutorState<'a>,
+    object: ScalarObjectHandle,
+    slot: u32,
+) -> Option<&'a str> {
+    state
+        .object_slot_names
+        .iter()
+        .rev()
+        .find(|(stored_object, stored_slot, _)| *stored_object == object && *stored_slot == slot)
+        .map(|(_, _, property_name)| *property_name)
+}
+
+fn allocate_scalar_environment_with_parent(
+    state: &mut ScalarExecutorState<'_>,
+    parent: Option<ScalarEnvironmentHandle>,
+) -> ScalarEnvironmentHandle {
+    let environment_id = state.next_environment_id;
+    state.next_environment_id = state
+        .next_environment_id
+        .checked_add(1)
+        .expect("scalar environment id cannot overflow before the step limit");
+    let handle = ScalarEnvironmentHandle { environment_id };
+    state.environment_parents.push((handle, parent));
+    handle
+}
+
+fn read_scalar_environment_ancestor(
+    state: &ScalarExecutorState<'_>,
+    environment: ScalarEnvironmentHandle,
+    level: u32,
+) -> Option<ScalarEnvironmentHandle> {
+    let mut current = Some(environment);
+    for _ in 0..level {
+        current = current.and_then(|current| read_scalar_environment_parent(state, current));
+    }
+    current
+}
+
+fn read_scalar_environment_parent(
+    state: &ScalarExecutorState<'_>,
+    environment: ScalarEnvironmentHandle,
+) -> Option<ScalarEnvironmentHandle> {
+    state
+        .environment_parents
+        .iter()
+        .rev()
+        .find(|(handle, _)| *handle == environment)
+        .and_then(|(_, parent)| *parent)
+}
+
+fn read_scalar_environment_slot(
+    state: &ScalarExecutorState<'_>,
+    registers: &[ScalarValue],
+    function_id: u32,
+    instruction: HermesInstruction,
+    environment_register: u32,
+    slot: u32,
+) -> Result<ScalarValue, ScalarExecutionError> {
+    let environment_value =
+        read_scalar_register(registers, function_id, instruction, environment_register)?;
+    let ScalarValue::Environment(environment) = environment_value else {
+        return match environment_value {
+            ScalarValue::Undefined | ScalarValue::Empty if state.relaxed_host_stubs => {
+                Ok(ScalarValue::Undefined)
+            }
+            value => Err(ScalarExecutionError::UnsupportedEnvironmentBase {
+                function_id,
+                offset: instruction.offset,
+                opcode: instruction.opcode,
+                register: environment_register,
+                value,
+            }),
+        };
+    };
+    Ok(state
+        .environment_slots
+        .iter()
+        .rev()
+        .find(|(handle, stored_slot, _)| *handle == environment && *stored_slot == slot)
+        .map_or(ScalarValue::Empty, |(_, _, value)| *value))
+}
+
+fn write_scalar_environment_slot(
+    state: &mut ScalarExecutorState<'_>,
+    registers: &[ScalarValue],
+    function_id: u32,
+    instruction: HermesInstruction,
+    environment_register: u32,
+    slot: u32,
+    value: ScalarValue,
+) -> Result<(), ScalarExecutionError> {
+    let environment_value =
+        read_scalar_register(registers, function_id, instruction, environment_register)?;
+    let ScalarValue::Environment(environment) = environment_value else {
+        return match environment_value {
+            ScalarValue::Undefined | ScalarValue::Empty if state.relaxed_host_stubs => Ok(()),
+            value => Err(ScalarExecutionError::UnsupportedEnvironmentBase {
+                function_id,
+                offset: instruction.offset,
+                opcode: instruction.opcode,
+                register: environment_register,
+                value,
+            }),
+        };
+    };
+    if let Some((_, _, stored_value)) = state
+        .environment_slots
+        .iter_mut()
+        .rev()
+        .find(|(handle, stored_slot, _)| *handle == environment && *stored_slot == slot)
+    {
+        *stored_value = value;
+    } else {
+        state.environment_slots.push((environment, slot, value));
+    }
+    Ok(())
+}
+
+fn read_scalar_optional_environment_handle(
+    registers: &[ScalarValue],
+    function_id: u32,
+    instruction: HermesInstruction,
+    environment_register: u32,
+) -> Result<Option<ScalarEnvironmentHandle>, ScalarExecutionError> {
+    match read_scalar_register(registers, function_id, instruction, environment_register)? {
+        ScalarValue::Undefined => Ok(None),
+        ScalarValue::Environment(environment) => Ok(Some(environment)),
+        value => Err(ScalarExecutionError::UnsupportedEnvironmentBase {
+            function_id,
+            offset: instruction.offset,
+            opcode: instruction.opcode,
+            register: environment_register,
+            value,
+        }),
+    }
+}
+
+fn read_scalar_property(
+    state: &ScalarExecutorState<'_>,
+    registers: &[ScalarValue],
+    function_id: u32,
+    instruction: HermesInstruction,
+    base_register: u32,
+    property_name: &str,
+) -> Result<ScalarValue, ScalarExecutionError> {
+    let base = read_scalar_register(registers, function_id, instruction, base_register)?;
+    match base {
+        ScalarValue::Object(ScalarObjectHandle::Global) => {
+            Ok(read_scalar_global_property(state, property_name))
+        }
+        ScalarValue::Object(
+            handle @ (ScalarObjectHandle::HermesInternal
+            | ScalarObjectHandle::Object(_)
+            | ScalarObjectHandle::Array(_)
+            | ScalarObjectHandle::WeakMap(_)
+            | ScalarObjectHandle::NativeModule(_)),
+        ) => Ok(read_scalar_object_property(state, handle, property_name)),
+        ScalarValue::Function(handle) => {
+            Ok(read_scalar_function_property(state, handle, property_name))
+        }
+        ScalarValue::String(_) => Ok(read_scalar_string_property(property_name)),
+        ScalarValue::Undefined | ScalarValue::Null | ScalarValue::Empty
+            if state.relaxed_host_stubs =>
+        {
+            Ok(ScalarValue::Undefined)
+        }
+        value => Err(ScalarExecutionError::UnsupportedPropertyBase {
+            function_id,
+            offset: instruction.offset,
+            opcode: instruction.opcode,
+            register: base_register,
+            value,
+        }),
+    }
+}
+
+fn read_scalar_property_key<'a>(
+    bytecode: &HermesBytecode<'a>,
+    registers: &[ScalarValue],
+    function_id: u32,
+    instruction: HermesInstruction,
+    key_register: u32,
+) -> Result<&'a str, ScalarExecutionError> {
+    match read_scalar_register(registers, function_id, instruction, key_register)? {
+        ScalarValue::String(handle) => {
+            read_scalar_string_operand(bytecode, function_id, instruction, handle.string_id)
+        }
+        value => Err(ScalarExecutionError::UnsupportedPropertyKey {
+            function_id,
+            offset: instruction.offset,
+            opcode: instruction.opcode,
+            register: key_register,
+            value,
+        }),
+    }
+}
+
+fn write_scalar_property<'a>(
+    state: &mut ScalarExecutorState<'a>,
+    registers: &[ScalarValue],
+    function_id: u32,
+    instruction: HermesInstruction,
+    base_register: u32,
+    property_name: &'a str,
+    value: ScalarValue,
+) -> Result<(), ScalarExecutionError> {
+    let base = read_scalar_register(registers, function_id, instruction, base_register)?;
+    match base {
+        ScalarValue::Object(ScalarObjectHandle::Global) => {
+            let value = map_scalar_global_write(property_name, value);
+            if let Some((_, stored_value)) = state
+                .global_properties
+                .iter_mut()
+                .rev()
+                .find(|(name, _)| *name == property_name)
+            {
+                *stored_value = value;
+            } else {
+                state.global_properties.push((property_name, value));
+            }
+            Ok(())
+        }
+        ScalarValue::Object(
+            handle @ (ScalarObjectHandle::HermesInternal
+            | ScalarObjectHandle::Object(_)
+            | ScalarObjectHandle::Array(_)
+            | ScalarObjectHandle::WeakMap(_)
+            | ScalarObjectHandle::NativeModule(_)),
+        ) => {
+            write_scalar_named_object_property(state, handle, property_name, value);
+            Ok(())
+        }
+        ScalarValue::Function(handle) => {
+            write_scalar_named_function_property(state, handle, property_name, value);
+            Ok(())
+        }
+        ScalarValue::Undefined | ScalarValue::Null | ScalarValue::Empty
+            if state.relaxed_host_stubs =>
+        {
+            Ok(())
+        }
+        value => Err(ScalarExecutionError::UnsupportedPropertyBase {
+            function_id,
+            offset: instruction.offset,
+            opcode: instruction.opcode,
+            register: base_register,
+            value,
+        }),
+    }
+}
+
+fn map_scalar_global_write(property_name: &str, value: ScalarValue) -> ScalarValue {
+    match property_name {
+        "__d" => ScalarValue::Function(ScalarFunctionHandle::NativeMetroDefine),
+        "__r" => ScalarValue::Function(ScalarFunctionHandle::NativeMetroRequire),
+        "__turboModuleProxy" => ScalarValue::Function(ScalarFunctionHandle::NativeTurboModuleProxy),
+        "__registerSegment" => {
+            ScalarValue::Function(ScalarFunctionHandle::NativeMetroRegisterSegment)
+        }
+        _ => value,
+    }
+}
+
+fn write_scalar_named_object_property<'a>(
+    state: &mut ScalarExecutorState<'a>,
+    object: ScalarObjectHandle,
+    property_name: &'a str,
+    value: ScalarValue,
+) {
+    if let Some((_, _, stored_value)) = state
+        .object_properties
+        .iter_mut()
+        .rev()
+        .find(|(stored_object, name, _)| *stored_object == object && *name == property_name)
+    {
+        *stored_value = value;
+    } else {
+        state.object_properties.push((object, property_name, value));
+    }
+}
+
+fn write_scalar_named_function_property<'a>(
+    state: &mut ScalarExecutorState<'a>,
+    function: ScalarFunctionHandle,
+    property_name: &'a str,
+    value: ScalarValue,
+) {
+    if let Some((_, _, stored_value)) = state
+        .function_properties
+        .iter_mut()
+        .rev()
+        .find(|(stored_function, name, _)| *stored_function == function && *name == property_name)
+    {
+        *stored_value = value;
+    } else {
+        state
+            .function_properties
+            .push((function, property_name, value));
+    }
+}
+
+fn read_scalar_global_property(
+    state: &ScalarExecutorState<'_>,
+    property_name: &str,
+) -> ScalarValue {
+    if let Some((_, value)) = state
+        .global_properties
+        .iter()
+        .rev()
+        .find(|(name, _)| *name == property_name)
+    {
+        return *value;
+    }
+
+    match property_name {
+        "globalThis" => ScalarValue::Object(ScalarObjectHandle::Global),
+        "Date" => ScalarValue::Function(ScalarFunctionHandle::NativeDateConstructor),
+        "Error" => ScalarValue::Function(ScalarFunctionHandle::NativeErrorConstructor),
+        "HermesInternal" => ScalarValue::Object(ScalarObjectHandle::HermesInternal),
+        "Map" => ScalarValue::Function(ScalarFunctionHandle::NativeMapConstructor),
+        "Object" => ScalarValue::Function(ScalarFunctionHandle::NativeObjectConstructor),
+        "WeakMap" => ScalarValue::Function(ScalarFunctionHandle::NativeWeakMapConstructor),
+        "__turboModuleProxy" => ScalarValue::Function(ScalarFunctionHandle::NativeTurboModuleProxy),
+        "nativePerformanceNow" => ScalarValue::Function(ScalarFunctionHandle::NativePerformanceNow),
+        name if state.declared_globals.contains(&name) => ScalarValue::Undefined,
+        _ => ScalarValue::Undefined,
+    }
+}
+
+fn read_scalar_object_property(
+    state: &ScalarExecutorState<'_>,
+    handle: ScalarObjectHandle,
+    property_name: &str,
+) -> ScalarValue {
+    if handle == ScalarObjectHandle::HermesInternal && property_name == "concat" {
+        return ScalarValue::Function(ScalarFunctionHandle::HermesInternalConcat);
+    }
+    if matches!(
+        handle,
+        ScalarObjectHandle::Object(_)
+            | ScalarObjectHandle::Array(_)
+            | ScalarObjectHandle::WeakMap(_)
+            | ScalarObjectHandle::NativeModule(_)
+    ) && property_name == "hasOwnProperty"
+    {
+        return ScalarValue::Function(ScalarFunctionHandle::NativeObjectHasOwnProperty);
+    }
+    if matches!(handle, ScalarObjectHandle::NativeModule(_)) {
+        match property_name {
+            "getConstants" => {
+                return ScalarValue::Function(ScalarFunctionHandle::NativeModuleGetConstants);
+            }
+            "currentTimestamp" => {
+                return ScalarValue::Function(ScalarFunctionHandle::NativePerformanceNow);
+            }
+            _ => return ScalarValue::Function(ScalarFunctionHandle::NativeNoopFunction),
+        }
+    }
+    if matches!(handle, ScalarObjectHandle::WeakMap(_)) {
+        match property_name {
+            "get" => return ScalarValue::Function(ScalarFunctionHandle::NativeWeakMapGet),
+            "has" => return ScalarValue::Function(ScalarFunctionHandle::NativeWeakMapHas),
+            "set" => return ScalarValue::Function(ScalarFunctionHandle::NativeWeakMapSet),
+            _ => {}
+        }
+    }
+
+    state
+        .object_properties
+        .iter()
+        .rev()
+        .find(|(object, name, _)| *object == handle && *name == property_name)
+        .map_or(ScalarValue::Undefined, |(_, _, value)| *value)
+}
+
+fn read_scalar_function_property(
+    state: &ScalarExecutorState<'_>,
+    handle: ScalarFunctionHandle,
+    property_name: &str,
+) -> ScalarValue {
+    if handle == ScalarFunctionHandle::NativeDateConstructor && property_name == "now" {
+        return ScalarValue::Function(ScalarFunctionHandle::NativeDateNow);
+    }
+
+    if handle == ScalarFunctionHandle::NativeObjectConstructor && property_name == "defineProperty"
+    {
+        return ScalarValue::Function(ScalarFunctionHandle::NativeObjectDefineProperty);
+    }
+    if handle == ScalarFunctionHandle::NativeObjectConstructor
+        && property_name == "getOwnPropertyDescriptor"
+    {
+        return ScalarValue::Function(ScalarFunctionHandle::NativeObjectGetOwnPropertyDescriptor);
+    }
+    if handle == ScalarFunctionHandle::NativeObjectHasOwnProperty && property_name == "call" {
+        return ScalarValue::Function(ScalarFunctionHandle::NativeObjectHasOwnPropertyCall);
+    }
+
+    state
+        .function_properties
+        .iter()
+        .rev()
+        .find(|(function, name, _)| *function == handle && *name == property_name)
+        .map_or(ScalarValue::Undefined, |(_, _, value)| *value)
+}
+
+fn read_scalar_string_property(property_name: &str) -> ScalarValue {
+    match property_name {
+        "replace" => ScalarValue::Function(ScalarFunctionHandle::NativeStringReplace),
+        _ => ScalarValue::Undefined,
+    }
+}
+
+fn write_scalar_destination(
+    registers: &mut [ScalarValue],
+    function_id: u32,
+    instruction: HermesInstruction,
+    instruction_bytes: &[u8],
+    value: ScalarValue,
+) -> Result<(), ScalarExecutionError> {
+    let destination = read_unsigned_operand(instruction_bytes, 1, 1);
+    write_scalar_register(registers, function_id, instruction, destination, value)
+}
+
+fn read_scalar_register(
+    registers: &[ScalarValue],
+    function_id: u32,
+    instruction: HermesInstruction,
+    register: u32,
+) -> Result<ScalarValue, ScalarExecutionError> {
+    registers
+        .get(usize::try_from(register).expect("u32 always fits in usize on supported targets"))
+        .copied()
+        .ok_or(ScalarExecutionError::RegisterOutOfBounds {
+            function_id,
+            offset: instruction.offset,
+            opcode: instruction.opcode,
+            register,
+            frame_size: u32::try_from(registers.len()).expect("Hermes frame size is stored as u32"),
+        })
+}
+
+fn write_scalar_register(
+    registers: &mut [ScalarValue],
+    function_id: u32,
+    instruction: HermesInstruction,
+    register: u32,
+    value: ScalarValue,
+) -> Result<(), ScalarExecutionError> {
+    let frame_size = u32::try_from(registers.len()).expect("Hermes frame size is stored as u32");
+    let register_slot = registers
+        .get_mut(usize::try_from(register).expect("u32 always fits in usize on supported targets"))
+        .ok_or(ScalarExecutionError::RegisterOutOfBounds {
+            function_id,
+            offset: instruction.offset,
+            opcode: instruction.opcode,
+            register,
+            frame_size,
+        })?;
+    *register_slot = value;
+    Ok(())
+}
+
+/// Describe the current Iris scalar executor coverage against a Hermes bytecode bundle.
+pub fn describe_hbc_execution_gap(bytes: &[u8]) -> Result<String, ParseError> {
+    let bytecode = HermesBytecode::parse(bytes)?;
+    let header = bytecode.header();
+    let mut opcode_counts = [0_u32; HERMES_OPCODE_COUNT];
+    let mut first_offsets = [u32::MAX; HERMES_OPCODE_COUNT];
+    let mut instruction_count = 0_u32;
+    let mut supported_instruction_count = 0_u32;
+    let mut first_unsupported = None;
+
+    for instruction in bytecode.function_instructions(header.global_code_index)? {
+        let instruction = instruction?;
+        let opcode_index = usize::from(instruction.opcode);
+        opcode_counts[opcode_index] += 1;
+        first_offsets[opcode_index] = first_offsets[opcode_index].min(instruction.offset);
+        instruction_count += 1;
+
+        if iris_scalar_executor_supports_opcode(instruction.opcode) {
+            supported_instruction_count += 1;
+        } else if first_unsupported.is_none() {
+            first_unsupported = Some(instruction);
+        }
+    }
+
+    let unique_opcode_count = opcode_counts.iter().filter(|&&count| count > 0).count();
+    let supported_unique_opcode_count = opcode_counts
+        .iter()
+        .enumerate()
+        .filter(|&(opcode, &count)| {
+            count > 0 && iris_scalar_executor_supports_opcode(opcode_index_to_u8(opcode))
+        })
+        .count();
+    let unsupported_unique_opcode_count = unique_opcode_count - supported_unique_opcode_count;
+    let mut unsupported_opcodes = opcode_counts
+        .iter()
+        .enumerate()
+        .filter(|&(opcode, &count)| {
+            count > 0 && !iris_scalar_executor_supports_opcode(opcode_index_to_u8(opcode))
+        })
+        .map(|(opcode, &count)| (opcode_index_to_u8(opcode), count, first_offsets[opcode]))
+        .collect::<Vec<_>>();
+
+    unsupported_opcodes
+        .sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+
+    let mut report = format!(
+        "Iris scalar executor coverage: supportedInstructions={supported_instruction_count}/{instruction_count}, supportedUniqueOpcodes={supported_unique_opcode_count}/{unique_opcode_count}, unsupportedUniqueOpcodes={unsupported_unique_opcode_count}",
+    );
+
+    if let Some(instruction) = first_unsupported {
+        let _ = write!(
+            report,
+            ", firstUnsupported={}({})@{}",
+            hermes_opcode_name(instruction.opcode),
+            instruction.opcode,
+            instruction.offset,
+        );
+    } else {
+        report.push_str(", firstUnsupported=none");
+    }
+
+    if !unsupported_opcodes.is_empty() {
+        report.push_str(", topUnsupported=[");
+        for (index, (opcode, count, first_offset)) in unsupported_opcodes
+            .iter()
+            .take(EXECUTION_GAP_TOP_LIMIT)
+            .enumerate()
+        {
+            if index > 0 {
+                report.push_str(", ");
+            }
+            let _ = write!(
+                report,
+                "{}({}):{}@{}",
+                hermes_opcode_name(*opcode),
+                opcode,
+                count,
+                first_offset,
+            );
+        }
+        report.push(']');
+    }
+
+    Ok(report)
+}
+
+fn hermes_opcode_name(opcode: u8) -> &'static str {
+    HERMES_OPCODE_NAMES
+        .get(usize::from(opcode))
+        .copied()
+        .unwrap_or("Unknown")
+}
+
+fn opcode_index_to_u8(opcode: usize) -> u8 {
+    u8::try_from(opcode).expect("Hermes opcode table has fewer than 256 entries")
+}
+
+fn iris_scalar_executor_supports_opcode(opcode: u8) -> bool {
+    matches!(
+        opcode,
+        1 | 2
+            | 4
+            | 6
+            | 7
+            | 8
+            | 16
+            | 51
+            | 55
+            | 56
+            | 57
+            | 58
+            | 59
+            | 60
+            | 61
+            | 64
+            | 66
+            | 67
+            | 68
+            | 69
+            | 72
+            | 74
+            | 75
+            | 82
+            | 83
+            | 86
+            | 87
+            | 96
+            | 97
+            | 107
+            | 108
+            | 110
+            | 111
+            | 112
+            | 115
+            | 116
+            | 118
+            | 121
+            | 132
+            | 133
+            | 134
+            | 136
+            | 139
+            | 140
+            | 141
+            | 144
+            | 153
+            | 174
+            | 175
+            | 176
+            | 177
+            | 178
+            | 179
+            | 182
+            | 209..=214
+    ) || scalar_common_constant(opcode).is_some()
+}
+
+fn scalar_common_constant(opcode: u8) -> Option<ScalarValue> {
+    match opcode {
+        146 => Some(ScalarValue::Empty),
+        147 => Some(ScalarValue::Undefined),
+        148 => Some(ScalarValue::Null),
+        149 => Some(ScalarValue::Boolean(true)),
+        150 => Some(ScalarValue::Boolean(false)),
+        151 => Some(ScalarValue::Number(0.0)),
+        _ => None,
+    }
+}
+
 fn validate_header_counts(header: HermesBytecodeHeader) -> Result<(), ParseError> {
     if header.identifier_count > header.string_count {
         return Err(ParseError::InvalidHeaderCount {
@@ -1998,41 +6034,119 @@ fn validate_string_table(
         .enumerate()
     {
         let small = read_u32(entry, 0);
-        let is_overflowed = small >> 24 == 0xff;
-        let (offset, length) = if is_overflowed {
-            let overflow_index = (small >> 1) & 0x7f_ffff;
-            if overflow_index >= overflow_count {
-                return Err(ParseError::InvalidOverflowStringIndex {
-                    string_index: u32::try_from(index)
-                        .expect("validated string table index fits in u32"),
-                    overflow_index,
-                    overflow_count,
-                });
-            }
-            let overflow_offset = usize::try_from(overflow_index)
-                .expect("u32 always fits in usize on supported targets")
-                * OVERFLOW_STRING_TABLE_ENTRY_SIZE;
-            let overflow = &overflow_entries
-                [overflow_offset..overflow_offset + OVERFLOW_STRING_TABLE_ENTRY_SIZE];
-            (read_u32(overflow, 0), read_u32(overflow, 4))
-        } else {
-            ((small >> 1) & 0x7f_ffff, small >> 24)
-        };
+        let string_index = u32::try_from(index).expect("validated string table index fits in u32");
+        let entry =
+            decode_string_table_entry(small, string_index, overflow_entries, overflow_count)?;
 
-        if offset
-            .checked_add(length)
+        if entry
+            .offset
+            .checked_add(entry.length)
             .is_none_or(|end| end > storage_size)
         {
             return Err(ParseError::StringTableEntryOutOfBounds {
-                string_index: u32::try_from(index)
-                    .expect("validated string table index fits in u32"),
-                offset,
-                length,
+                string_index,
+                offset: entry.offset,
+                length: entry.length,
                 storage_size,
             });
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DecodedStringTableEntry {
+    offset: u32,
+    length: u32,
+    is_utf16: bool,
+}
+
+fn decode_string_table_entry(
+    small: u32,
+    string_index: u32,
+    overflow_entries: &[u8],
+    overflow_count: u32,
+) -> Result<DecodedStringTableEntry, ParseError> {
+    let is_utf16 = small & SMALL_STRING_UTF16_FLAG != 0;
+    let offset_or_overflow_index = (small >> SMALL_STRING_OFFSET_SHIFT) & SMALL_STRING_OFFSET_MASK;
+    let length = small >> SMALL_STRING_LENGTH_SHIFT;
+
+    if length != SMALL_STRING_OVERFLOW_LENGTH {
+        return Ok(DecodedStringTableEntry {
+            offset: offset_or_overflow_index,
+            length,
+            is_utf16,
+        });
+    }
+
+    if offset_or_overflow_index >= overflow_count {
+        return Err(ParseError::InvalidOverflowStringIndex {
+            string_index,
+            overflow_index: offset_or_overflow_index,
+            overflow_count,
+        });
+    }
+
+    let overflow_offset = usize::try_from(offset_or_overflow_index)
+        .expect("u32 always fits in usize on supported targets")
+        * OVERFLOW_STRING_TABLE_ENTRY_SIZE;
+    let overflow =
+        &overflow_entries[overflow_offset..overflow_offset + OVERFLOW_STRING_TABLE_ENTRY_SIZE];
+
+    Ok(DecodedStringTableEntry {
+        offset: read_u32(overflow, 0),
+        length: read_u32(overflow, 4),
+        is_utf16,
+    })
+}
+
+fn string_at<'a>(
+    header: HermesBytecodeHeader,
+    sections: &HermesBytecodeSections<'a>,
+    string_id: u32,
+) -> Result<HermesString<'a>, ParseError> {
+    if string_id >= header.string_count {
+        return Err(ParseError::InvalidStringIndex {
+            string_id,
+            string_count: header.string_count,
+        });
+    }
+
+    let small_offset = usize::try_from(string_id)
+        .expect("u32 always fits in usize on supported targets")
+        * SMALL_STRING_TABLE_ENTRY_SIZE;
+    let small = read_u32(sections.small_string_table().bytes(), small_offset);
+    let entry = decode_string_table_entry(
+        small,
+        string_id,
+        sections.overflow_string_table().bytes(),
+        header.overflow_string_count,
+    )?;
+
+    if entry
+        .offset
+        .checked_add(entry.length)
+        .is_none_or(|end| end > header.string_storage_size)
+    {
+        return Err(ParseError::StringTableEntryOutOfBounds {
+            string_index: string_id,
+            offset: entry.offset,
+            length: entry.length,
+            storage_size: header.string_storage_size,
+        });
+    }
+
+    let start =
+        usize::try_from(entry.offset).expect("u32 always fits in usize on supported targets");
+    let end = usize::try_from(entry.offset + entry.length)
+        .expect("u32 always fits in usize on supported targets");
+
+    Ok(HermesString {
+        string_id,
+        offset: entry.offset,
+        bytes: &sections.string_storage().bytes()[start..end],
+        is_utf16: entry.is_utf16,
+    })
 }
 
 fn validate_storage_table(
@@ -2063,6 +6177,7 @@ fn validate_storage_table(
 fn validate_object_shape_table(
     entries: &[u8],
     obj_key_buffer: &[u8],
+    string_kinds: &[u8],
     header: HermesBytecodeHeader,
 ) -> Result<(), ParseError> {
     for entry in entries.chunks_exact(SHAPE_TABLE_ENTRY_SIZE) {
@@ -2073,6 +6188,7 @@ fn validate_object_shape_table(
             shape.key_buffer_offset,
             shape.num_props,
             true,
+            Some(string_kinds),
             header,
         )?;
     }
@@ -2100,6 +6216,7 @@ fn validate_serialized_literal_buffer(
     offset: u32,
     element_count: u32,
     is_key_buffer: bool,
+    identifier_string_kinds: Option<&[u8]>,
     header: HermesBytecodeHeader,
 ) -> Result<(), ParseError> {
     let buffer_size =
@@ -2205,11 +6322,8 @@ fn validate_serialized_literal_buffer(
             cursor,
             to_read,
             tag_type,
-            if is_key_buffer {
-                header.identifier_count
-            } else {
-                header.string_count
-            },
+            header,
+            identifier_string_kinds,
         )?;
         cursor = end;
         remaining -= to_read;
@@ -2239,7 +6353,8 @@ fn validate_serialized_literal_strings(
     start: usize,
     element_count: u32,
     tag_type: u8,
-    string_count: u32,
+    header: HermesBytecodeHeader,
+    identifier_string_kinds: Option<&[u8]>,
 ) -> Result<(), ParseError> {
     match tag_type {
         SERIALIZED_LITERAL_TAG_SHORT_STRING => {
@@ -2253,7 +6368,13 @@ fn validate_serialized_literal_strings(
                         .try_into()
                         .expect("validated serialized literal string id has u16 width"),
                 ));
-                validate_serialized_literal_string(buffer_name, offset, string_id, string_count)?;
+                validate_serialized_literal_string(
+                    buffer_name,
+                    offset,
+                    string_id,
+                    header,
+                    identifier_string_kinds,
+                )?;
             }
         }
         SERIALIZED_LITERAL_TAG_LONG_STRING => {
@@ -2266,7 +6387,8 @@ fn validate_serialized_literal_strings(
                     buffer_name,
                     offset,
                     read_u32(buffer, offset),
-                    string_count,
+                    header,
+                    identifier_string_kinds,
                 )?;
             }
         }
@@ -2279,17 +6401,37 @@ fn validate_serialized_literal_string(
     buffer_name: &'static str,
     offset: usize,
     string_id: u32,
-    string_count: u32,
+    header: HermesBytecodeHeader,
+    identifier_string_kinds: Option<&[u8]>,
 ) -> Result<(), ParseError> {
-    if string_id >= string_count {
+    if string_id >= header.string_count
+        || identifier_string_kinds
+            .is_some_and(|string_kinds| !is_identifier_string_id(string_kinds, string_id))
+    {
         return Err(ParseError::InvalidSerializedLiteralStringReference {
             buffer: buffer_name,
             offset: u32::try_from(offset).expect("validated HBC section offset fits in u32"),
             string_id,
-            string_count,
+            string_count: header.string_count,
         });
     }
     Ok(())
+}
+
+fn is_identifier_string_id(string_kinds: &[u8], string_id: u32) -> bool {
+    let mut run_start = 0_u32;
+    for entry in string_kinds.chunks_exact(STRING_KIND_ENTRY_SIZE) {
+        let datum = read_u32(entry, 0);
+        let run_len = datum & 0x7fff_ffff;
+        let run_end = run_start.saturating_add(run_len);
+
+        if string_id < run_end {
+            return datum & 0x8000_0000 != 0;
+        }
+
+        run_start = run_end;
+    }
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3356,6 +7498,7 @@ fn validate_instruction_literal_operands(
             value_offset,
             shape.num_props,
             false,
+            None,
             context.header,
         )?;
     }
@@ -3380,6 +7523,7 @@ fn validate_instruction_literal_operands(
             value_offset,
             element_count,
             false,
+            None,
             context.header,
         )?;
     }
@@ -3783,10 +7927,24 @@ fn read_u32(bytes: &[u8], offset: usize) -> u32 {
     ))
 }
 
+fn read_i32(bytes: &[u8], offset: usize) -> i32 {
+    i32::from_le_bytes(bytes[offset..offset + size_of::<i32>()].try_into().expect(
+        "HermesBytecodeHeader::parse validates the full header length before reading fields",
+    ))
+}
+
 fn read_u64(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + size_of::<u64>()].try_into().expect(
         "HermesBytecodeHeader::parse validates the full header length before reading fields",
     ))
+}
+
+fn read_f64(bytes: &[u8], offset: usize) -> f64 {
+    f64::from_le_bytes(
+        bytes[offset..offset + size_of::<f64>()]
+            .try_into()
+            .expect("validated Hermes double operand has f64 width"),
+    )
 }
 
 #[cfg(test)]
@@ -3794,13 +7952,58 @@ mod tests {
     use super::*;
 
     const NEW_OBJECT_WITH_BUFFER_OPCODE: u8 = 1;
-    const NEW_ARRAY_WITH_BUFFER_OPCODE: u8 = 7;
+    const NEW_OBJECT_OPCODE: u8 = 4;
+    const NEW_ARRAY_WITH_BUFFER_OPCODE: u8 = 6;
+    const NEW_ARRAY_WITH_BUFFER_LONG_OPCODE: u8 = 7;
+    const NEW_ARRAY_OPCODE: u8 = 8;
+    const MOV_OPCODE: u8 = 16;
+    const TYPE_OF_IS_OPCODE: u8 = 51;
+    const STORE_TO_ENVIRONMENT_OPCODE: u8 = 55;
+    const STORE_TO_ENVIRONMENT_L_OPCODE: u8 = 56;
+    const STORE_NP_TO_ENVIRONMENT_OPCODE: u8 = 57;
+    const LOAD_FROM_ENVIRONMENT_OPCODE: u8 = 59;
+    const LOAD_FROM_ENVIRONMENT_L_OPCODE: u8 = 60;
+    const GET_GLOBAL_OBJECT_OPCODE: u8 = 61;
+    const CREATE_FUNCTION_ENVIRONMENT_OPCODE: u8 = 64;
+    const CREATE_ENVIRONMENT_OPCODE: u8 = 66;
+    const DECLARE_GLOBAL_VAR_OPCODE: u8 = 67;
+    const GET_BY_ID_SHORT_OPCODE: u8 = 68;
+    const TRY_GET_BY_ID_OPCODE: u8 = 72;
+    const PUT_BY_ID_LOOSE_OPCODE: u8 = 74;
+    const PUT_OWN_BY_SLOT_IDX_OPCODE: u8 = 82;
+    const DEFINE_OWN_BY_ID_OPCODE: u8 = 86;
+    const PUT_BY_VAL_LOOSE_OPCODE: u8 = 96;
+    const PUT_BY_VAL_STRICT_OPCODE: u8 = 97;
+    const CONSTRUCT_OPCODE: u8 = 107;
+    const CALL1_OPCODE: u8 = 108;
+    const CALL2_OPCODE: u8 = 110;
+    const CALL3_OPCODE: u8 = 111;
+    const CALL4_OPCODE: u8 = 112;
+    const CALL_BUILTIN_OPCODE: u8 = 115;
+    const THROW_OPCODE: u8 = 121;
     const RET_OPCODE: u8 = 118;
+    const JMP_TRUE_OPCODE: u8 = 176;
+    const LOAD_CONST_UINT8_OPCODE: u8 = 139;
+    const LOAD_CONST_INT_OPCODE: u8 = 140;
     const LOAD_CONST_DOUBLE_OPCODE: u8 = 141;
     const LOAD_CONST_BIGINT_OPCODE: u8 = 142;
     const LOAD_CONST_STRING_OPCODE: u8 = 144;
+    const LOAD_CONST_EMPTY_OPCODE: u8 = 146;
+    const LOAD_CONST_UNDEFINED_OPCODE: u8 = 147;
+    const LOAD_CONST_NULL_OPCODE: u8 = 148;
+    const LOAD_CONST_TRUE_OPCODE: u8 = 149;
+    const LOAD_CONST_FALSE_OPCODE: u8 = 150;
+    const LOAD_CONST_ZERO_OPCODE: u8 = 151;
+    const LOAD_THIS_NS_OPCODE: u8 = 153;
     const CREATE_CLOSURE_OPCODE: u8 = 132;
-    const JMP_OPCODE: u8 = 175;
+    const CREATE_CLOSURE_LONG_INDEX_OPCODE: u8 = 133;
+    const CREATE_THIS_FOR_NEW_OPCODE: u8 = 134;
+    const SELECT_OBJECT_OPCODE: u8 = 136;
+    const JMP_OPCODE: u8 = 174;
+    const JMP_TYPE_OF_IS_OPCODE: u8 = 182;
+    const J_NOT_EQUAL_OPCODE: u8 = 209;
+    const J_STRICT_EQUAL_OPCODE: u8 = 211;
+    const J_STRICT_NOT_EQUAL_OPCODE: u8 = 213;
 
     fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
         bytes[offset..offset + size_of::<u32>()].copy_from_slice(&value.to_le_bytes());
@@ -3903,7 +8106,7 @@ mod tests {
         let mut bytes = vec![0; HERMES_BYTECODE_HEADER_SIZE];
         bytes[MAGIC_OFFSET..MAGIC_OFFSET + size_of::<u64>()]
             .copy_from_slice(&HERMES_BYTECODE_MAGIC.to_le_bytes());
-        write_u32(&mut bytes, VERSION_OFFSET, 99);
+        write_u32(&mut bytes, VERSION_OFFSET, 98);
         bytes[SOURCE_HASH_OFFSET..SOURCE_HASH_OFFSET + HERMES_SOURCE_HASH_SIZE]
             .copy_from_slice(&[7; HERMES_SOURCE_HASH_SIZE]);
         write_u32(
@@ -3938,7 +8141,7 @@ mod tests {
         let mut bytes = vec![0; HERMES_BYTECODE_HEADER_SIZE];
         bytes[MAGIC_OFFSET..MAGIC_OFFSET + size_of::<u64>()]
             .copy_from_slice(&HERMES_BYTECODE_MAGIC.to_le_bytes());
-        write_u32(&mut bytes, VERSION_OFFSET, 99);
+        write_u32(&mut bytes, VERSION_OFFSET, 98);
         bytes[SOURCE_HASH_OFFSET..SOURCE_HASH_OFFSET + HERMES_SOURCE_HASH_SIZE]
             .copy_from_slice(&[7; HERMES_SOURCE_HASH_SIZE]);
         write_u32(&mut bytes, GLOBAL_CODE_INDEX_OFFSET, 1);
@@ -4062,6 +8265,17 @@ mod tests {
 
     fn replace_global_body(bytes: &mut Vec<u8>, body: &[u8]) -> u32 {
         replace_global_body_with_payload(bytes, body, &[]).0
+    }
+
+    fn set_fixture_object_key_to_identifier(bytes: &mut [u8], string_id: u16) {
+        let key_buffer_offset = HermesBytecode::parse(bytes)
+            .expect("valid fixture")
+            .sections()
+            .obj_key_buffer()
+            .offset() as usize;
+        bytes[key_buffer_offset] = SERIALIZED_LITERAL_TAG_SHORT_STRING | 1;
+        bytes[key_buffer_offset + 1..key_buffer_offset + 3]
+            .copy_from_slice(&string_id.to_le_bytes());
     }
 
     fn replace_global_body_with_payload(
@@ -4343,7 +8557,7 @@ mod tests {
         let header = bytecode.header();
 
         assert!(std::ptr::eq(bytecode.bytes().as_ptr(), bytes.as_ptr()));
-        assert_eq!(header.version, 99);
+        assert_eq!(header.version, 98);
         assert_eq!(header.source_hash, [7; HERMES_SOURCE_HASH_SIZE]);
         assert_eq!(header.file_length, bytes.len() as u32);
         assert_eq!(header.global_code_index, 1);
@@ -4370,7 +8584,7 @@ mod tests {
         let bytes = fixture_bytecode();
         let metadata = parse_hbc_metadata(&bytes).expect("valid Hermes bytecode metadata");
 
-        assert_eq!(metadata.version, 99);
+        assert_eq!(metadata.version, 98);
         assert_eq!(metadata.file_length, bytes.len() as u32);
         assert_eq!(metadata.global_code_index, 1);
         assert_eq!(metadata.function_count, 2);
@@ -4392,6 +8606,1876 @@ mod tests {
         assert_eq!(metadata.global_function_frame_size, 5);
         assert_eq!(metadata.global_instruction_count, 1);
         assert_eq!(metadata.options, 0);
+    }
+
+    #[test]
+    fn describes_fully_supported_scalar_executor_gap() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(&mut bytes, &[LOAD_CONST_UNDEFINED_OPCODE, 0, RET_OPCODE, 0]);
+
+        let report = describe_hbc_execution_gap(&bytes).expect("valid execution gap report");
+
+        assert!(report.contains("supportedInstructions=2/2"));
+        assert!(report.contains("supportedUniqueOpcodes=2/2"));
+        assert!(report.contains("unsupportedUniqueOpcodes=0"));
+        assert!(report.contains("firstUnsupported=none"));
+    }
+
+    #[test]
+    fn describes_first_unsupported_global_opcode() {
+        let mut bytes = fixture_bytecode();
+        let body_offset = replace_global_body(
+            &mut bytes,
+            &[LOAD_CONST_BIGINT_OPCODE, 0, 0, 0, RET_OPCODE, 0],
+        );
+
+        let report = describe_hbc_execution_gap(&bytes).expect("valid execution gap report");
+
+        assert!(report.contains("supportedInstructions=1/2"));
+        assert!(report.contains("unsupportedUniqueOpcodes=1"));
+        assert!(report.contains(&format!(
+            "firstUnsupported=LoadConstBigInt(142)@{body_offset}",
+        )));
+        assert!(report.contains("topUnsupported=[LoadConstBigInt(142):1@"));
+    }
+
+    #[test]
+    fn describes_scalar_execution_completion_for_cxx_hosts() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(&mut bytes, &[LOAD_CONST_UNDEFINED_OPCODE, 0, RET_OPCODE, 0]);
+
+        let report = describe_hbc_scalar_execution(&bytes).expect("valid scalar execution report");
+
+        assert!(report.contains("status=completed"));
+        assert!(report.contains("value=Undefined"));
+    }
+
+    #[test]
+    fn describes_scalar_execution_frontier_for_cxx_hosts() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[LOAD_CONST_BIGINT_OPCODE, 0, 0, 0, RET_OPCODE, 0],
+        );
+
+        let report =
+            describe_hbc_scalar_execution(&bytes).expect("valid scalar execution frontier report");
+
+        assert!(report.contains("status=frontier"));
+        assert!(report.contains("LoadConstBigInt"));
+    }
+
+    #[test]
+    fn exposes_string_table_entries_without_copying() {
+        let bytes = fixture_bytecode();
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid Hermes bytecode");
+        let storage = bytecode.sections().string_storage().bytes();
+        let first = bytecode.string(0).expect("valid small string");
+        let second = bytecode.string(1).expect("valid overflow string");
+
+        assert_eq!(first.string_id(), 0);
+        assert_eq!(first.offset(), 0);
+        assert_eq!(first.bytes(), b"ab");
+        assert_eq!(first.len(), 2);
+        assert!(!first.is_empty());
+        assert!(!first.is_utf16());
+        assert!(std::ptr::eq(first.bytes().as_ptr(), storage.as_ptr()));
+
+        assert_eq!(second.string_id(), 1);
+        assert_eq!(second.offset(), 2);
+        assert_eq!(second.bytes(), b"cdef");
+        assert_eq!(second.len(), 4);
+        assert!(!second.is_utf16());
+        assert!(std::ptr::eq(second.bytes().as_ptr(), storage[2..].as_ptr()));
+    }
+
+    #[test]
+    fn rejects_invalid_string_id_lookup() {
+        let bytes = fixture_bytecode();
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid Hermes bytecode");
+
+        assert_eq!(
+            bytecode.string(2),
+            Err(ParseError::InvalidStringIndex {
+                string_id: 2,
+                string_count: 2,
+            }),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_returns_empty_from_fixture_global_function() {
+        let bytes = fixture_bytecode();
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Empty),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_loads_simple_constants() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(&mut bytes, &[LOAD_CONST_UINT8_OPCODE, 0, 7, RET_OPCODE, 0]);
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Number(7.0)),
+        );
+
+        let mut bytes = fixture_bytecode();
+        let mut body = vec![LOAD_CONST_INT_OPCODE, 0];
+        body.extend_from_slice(&(-11_i32).to_le_bytes());
+        body.extend_from_slice(&[RET_OPCODE, 0]);
+        replace_global_body(&mut bytes, &body);
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Number(-11.0)),
+        );
+
+        let mut bytes = fixture_bytecode();
+        let mut body = vec![LOAD_CONST_DOUBLE_OPCODE, 0];
+        body.extend_from_slice(&1.5_f64.to_le_bytes());
+        body.extend_from_slice(&[RET_OPCODE, 0]);
+        replace_global_body(&mut bytes, &body);
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Number(1.5)),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_loads_string_handle_without_copying_payload() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[LOAD_CONST_STRING_OPCODE, 0, 1, 0, RET_OPCODE, 0],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::String(ScalarStringHandle {
+                string_id: 1,
+                is_empty: false,
+            })),
+        );
+
+        let report = describe_hbc_execution_gap(&bytes).expect("valid execution gap report");
+        assert!(report.contains("supportedInstructions=2/2"));
+        assert!(report.contains("firstUnsupported=none"));
+    }
+
+    #[test]
+    fn scalar_executor_loads_non_strict_this_as_global_object() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(&mut bytes, &[LOAD_THIS_NS_OPCODE, 0, RET_OPCODE, 0]);
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Object(ScalarObjectHandle::Global)),
+        );
+
+        let report = describe_hbc_execution_gap(&bytes).expect("valid execution gap report");
+        assert!(report.contains("supportedInstructions=2/2"));
+        assert!(report.contains("firstUnsupported=none"));
+    }
+
+    #[test]
+    fn scalar_executor_matches_typeof_is_mask() {
+        assert!(scalar_typeof_is_matches(
+            ScalarValue::Undefined,
+            TYPEOF_IS_UNDEFINED,
+        ));
+        assert!(scalar_typeof_is_matches(
+            ScalarValue::Object(ScalarObjectHandle::Object(7)),
+            TYPEOF_IS_OBJECT,
+        ));
+        assert!(scalar_typeof_is_matches(
+            ScalarValue::Object(ScalarObjectHandle::Array(8)),
+            TYPEOF_IS_OBJECT,
+        ));
+        assert!(scalar_typeof_is_matches(
+            ScalarValue::String(ScalarStringHandle {
+                string_id: 1,
+                is_empty: false,
+            }),
+            TYPEOF_IS_STRING,
+        ));
+        assert!(scalar_typeof_is_matches(
+            ScalarValue::Boolean(false),
+            TYPEOF_IS_BOOLEAN,
+        ));
+        assert!(scalar_typeof_is_matches(
+            ScalarValue::Number(1.0),
+            TYPEOF_IS_NUMBER,
+        ));
+        assert!(scalar_typeof_is_matches(
+            ScalarValue::Function(ScalarFunctionHandle::NativePerformanceNow),
+            TYPEOF_IS_FUNCTION,
+        ));
+        assert!(scalar_typeof_is_matches(ScalarValue::Null, TYPEOF_IS_NULL));
+        assert!(!scalar_typeof_is_matches(
+            ScalarValue::String(ScalarStringHandle {
+                string_id: 1,
+                is_empty: false,
+            }),
+            TYPEOF_IS_NUMBER,
+        ));
+    }
+
+    #[test]
+    fn scalar_executor_writes_typeof_is_result() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                LOAD_CONST_STRING_OPCODE,
+                0,
+                1,
+                0,
+                TYPE_OF_IS_OPCODE,
+                1,
+                0,
+                TYPEOF_IS_STRING as u8,
+                0,
+                RET_OPCODE,
+                1,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Boolean(true)),
+        );
+
+        let report = describe_hbc_execution_gap(&bytes).expect("valid execution gap report");
+        assert!(report.contains("supportedInstructions=3/3"));
+        assert!(report.contains("firstUnsupported=none"));
+    }
+
+    #[test]
+    fn scalar_executor_loads_common_literals_and_moves_values() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[LOAD_CONST_TRUE_OPCODE, 1, MOV_OPCODE, 2, 1, RET_OPCODE, 2],
+        );
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Boolean(true)),
+        );
+
+        let mut bytes = fixture_bytecode();
+        replace_global_body(&mut bytes, &[LOAD_CONST_FALSE_OPCODE, 0, RET_OPCODE, 0]);
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Boolean(false)),
+        );
+
+        let mut bytes = fixture_bytecode();
+        replace_global_body(&mut bytes, &[LOAD_CONST_NULL_OPCODE, 0, RET_OPCODE, 0]);
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Null),
+        );
+
+        let mut bytes = fixture_bytecode();
+        replace_global_body(&mut bytes, &[LOAD_CONST_UNDEFINED_OPCODE, 0, RET_OPCODE, 0]);
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Undefined),
+        );
+
+        let mut bytes = fixture_bytecode();
+        replace_global_body(&mut bytes, &[LOAD_CONST_ZERO_OPCODE, 0, RET_OPCODE, 0]);
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Number(0.0)),
+        );
+
+        let mut bytes = fixture_bytecode();
+        replace_global_body(&mut bytes, &[LOAD_CONST_EMPTY_OPCODE, 0, RET_OPCODE, 0]);
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Empty),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_loads_global_object_handle() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[GET_GLOBAL_OBJECT_OPCODE, 0, MOV_OPCODE, 1, 0, RET_OPCODE, 1],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Object(ScalarObjectHandle::Global)),
+        );
+
+        let report = describe_hbc_execution_gap(&bytes).expect("valid execution gap report");
+        assert!(report.contains("supportedInstructions=3/3"));
+        assert!(report.contains("firstUnsupported=none"));
+    }
+
+    #[test]
+    fn scalar_executor_allocates_plain_object_handle() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(&mut bytes, &[NEW_OBJECT_OPCODE, 0, RET_OPCODE, 0]);
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Object(ScalarObjectHandle::Object(0))),
+        );
+
+        let report = describe_hbc_execution_gap(&bytes).expect("valid execution gap report");
+        assert!(report.contains("supportedInstructions=2/2"));
+        assert!(report.contains("firstUnsupported=none"));
+    }
+
+    #[test]
+    fn scalar_executor_allocates_object_from_literal_buffer() {
+        let mut bytes = fixture_bytecode();
+        set_fixture_object_key_to_identifier(&mut bytes, 1);
+        replace_global_body(
+            &mut bytes,
+            &[
+                NEW_OBJECT_WITH_BUFFER_OPCODE,
+                0,
+                0,
+                0,
+                0,
+                0,
+                TRY_GET_BY_ID_OPCODE,
+                1,
+                0,
+                0,
+                1,
+                0,
+                RET_OPCODE,
+                1,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Null)
+        );
+
+        let report = describe_hbc_execution_gap(&bytes).expect("valid execution gap report");
+        assert!(report.contains("supportedInstructions=3/3"));
+        assert!(report.contains("firstUnsupported=none"));
+    }
+
+    #[test]
+    fn scalar_executor_updates_object_literal_slot_by_index() {
+        let mut bytes = fixture_bytecode();
+        set_fixture_object_key_to_identifier(&mut bytes, 1);
+        replace_global_body(
+            &mut bytes,
+            &[
+                NEW_OBJECT_WITH_BUFFER_OPCODE,
+                0,
+                0,
+                0,
+                0,
+                0,
+                LOAD_CONST_UINT8_OPCODE,
+                1,
+                21,
+                PUT_OWN_BY_SLOT_IDX_OPCODE,
+                0,
+                1,
+                0,
+                TRY_GET_BY_ID_OPCODE,
+                2,
+                0,
+                0,
+                1,
+                0,
+                RET_OPCODE,
+                2,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Number(21.0)),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_defines_own_property_by_id() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                NEW_OBJECT_OPCODE,
+                0,
+                LOAD_CONST_UINT8_OPCODE,
+                1,
+                34,
+                DEFINE_OWN_BY_ID_OPCODE,
+                0,
+                1,
+                0,
+                1,
+                0,
+                TRY_GET_BY_ID_OPCODE,
+                2,
+                0,
+                0,
+                1,
+                0,
+                RET_OPCODE,
+                2,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Number(34.0)),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_allocates_array_handle() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(&mut bytes, &[NEW_ARRAY_OPCODE, 0, 3, 0, RET_OPCODE, 0]);
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Object(ScalarObjectHandle::Array(0))),
+        );
+
+        let report = describe_hbc_execution_gap(&bytes).expect("valid execution gap report");
+        assert!(report.contains("supportedInstructions=2/2"));
+        assert!(report.contains("firstUnsupported=none"));
+    }
+
+    #[test]
+    fn scalar_executor_allocates_array_from_literal_buffer() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                NEW_ARRAY_WITH_BUFFER_OPCODE,
+                0,
+                4,
+                0,
+                1,
+                0,
+                0,
+                0,
+                RET_OPCODE,
+                0,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Object(ScalarObjectHandle::Array(0))),
+        );
+
+        let report = describe_hbc_execution_gap(&bytes).expect("valid execution gap report");
+        assert!(report.contains("supportedInstructions=2/2"));
+        assert!(report.contains("firstUnsupported=none"));
+    }
+
+    #[test]
+    fn scalar_executor_allocates_array_from_long_literal_buffer_operand() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                NEW_ARRAY_WITH_BUFFER_LONG_OPCODE,
+                0,
+                1,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                RET_OPCODE,
+                0,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Object(ScalarObjectHandle::Array(0))),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_decodes_literal_buffer_values() {
+        let mut bytes = fixture_bytecode();
+        let literal_value_offset = HermesBytecode::parse(&bytes)
+            .expect("valid fixture")
+            .sections()
+            .literal_value_buffer()
+            .offset() as usize;
+        bytes[literal_value_offset] = SERIALIZED_LITERAL_TAG_SHORT_STRING | 1;
+        bytes[literal_value_offset + 1..literal_value_offset + 3]
+            .copy_from_slice(&1_u16.to_le_bytes());
+
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid literal fixture");
+        assert_eq!(
+            read_scalar_literal_values(&bytecode, 0, 1),
+            Ok(vec![ScalarValue::String(ScalarStringHandle {
+                string_id: 1,
+                is_empty: false,
+            })]),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_allocates_function_environment_handle() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[CREATE_FUNCTION_ENVIRONMENT_OPCODE, 0, 2, RET_OPCODE, 0],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Environment(ScalarEnvironmentHandle {
+                environment_id: 0,
+            })),
+        );
+
+        let report = describe_hbc_execution_gap(&bytes).expect("valid execution gap report");
+        assert!(report.contains("supportedInstructions=2/2"));
+        assert!(report.contains("firstUnsupported=none"));
+    }
+
+    #[test]
+    fn scalar_executor_allocates_environment_with_parent() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                CREATE_FUNCTION_ENVIRONMENT_OPCODE,
+                0,
+                1,
+                CREATE_ENVIRONMENT_OPCODE,
+                1,
+                0,
+                1,
+                0,
+                0,
+                0,
+                RET_OPCODE,
+                1,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Environment(ScalarEnvironmentHandle {
+                environment_id: 1,
+            })),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_writes_and_reads_environment_slot() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                CREATE_FUNCTION_ENVIRONMENT_OPCODE,
+                0,
+                2,
+                LOAD_CONST_UINT8_OPCODE,
+                1,
+                42,
+                STORE_TO_ENVIRONMENT_OPCODE,
+                0,
+                1,
+                1,
+                LOAD_FROM_ENVIRONMENT_OPCODE,
+                2,
+                0,
+                1,
+                RET_OPCODE,
+                2,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Number(42.0)),
+        );
+
+        let report = describe_hbc_execution_gap(&bytes).expect("valid execution gap report");
+        assert!(report.contains("supportedInstructions=5/5"));
+        assert!(report.contains("firstUnsupported=none"));
+    }
+
+    #[test]
+    fn scalar_executor_writes_and_reads_long_environment_slot() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                CREATE_FUNCTION_ENVIRONMENT_OPCODE,
+                0,
+                2,
+                LOAD_CONST_UINT8_OPCODE,
+                1,
+                7,
+                STORE_TO_ENVIRONMENT_L_OPCODE,
+                0,
+                44,
+                1,
+                1,
+                LOAD_FROM_ENVIRONMENT_L_OPCODE,
+                2,
+                0,
+                44,
+                1,
+                RET_OPCODE,
+                2,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Number(7.0)),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_writes_np_environment_slot() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                CREATE_FUNCTION_ENVIRONMENT_OPCODE,
+                0,
+                1,
+                LOAD_CONST_TRUE_OPCODE,
+                1,
+                STORE_NP_TO_ENVIRONMENT_OPCODE,
+                0,
+                0,
+                1,
+                LOAD_FROM_ENVIRONMENT_OPCODE,
+                2,
+                0,
+                0,
+                RET_OPCODE,
+                2,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Boolean(true)),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_creates_bytecode_closure_with_environment() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                CREATE_FUNCTION_ENVIRONMENT_OPCODE,
+                0,
+                1,
+                CREATE_CLOSURE_OPCODE,
+                1,
+                0,
+                0,
+                0,
+                RET_OPCODE,
+                1,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Function(ScalarFunctionHandle::Bytecode {
+                function_id: 0,
+                environment: Some(ScalarEnvironmentHandle { environment_id: 0 }),
+            })),
+        );
+
+        let report = describe_hbc_execution_gap(&bytes).expect("valid execution gap report");
+        assert!(report.contains("supportedInstructions=3/3"));
+        assert!(report.contains("firstUnsupported=none"));
+    }
+
+    #[test]
+    fn scalar_executor_creates_bytecode_closure_without_environment() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                LOAD_CONST_UNDEFINED_OPCODE,
+                0,
+                CREATE_CLOSURE_OPCODE,
+                1,
+                0,
+                0,
+                0,
+                RET_OPCODE,
+                1,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Function(ScalarFunctionHandle::Bytecode {
+                function_id: 0,
+                environment: None,
+            })),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_creates_bytecode_closure_with_long_function_id() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                LOAD_CONST_UNDEFINED_OPCODE,
+                0,
+                CREATE_CLOSURE_LONG_INDEX_OPCODE,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                RET_OPCODE,
+                1,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Function(ScalarFunctionHandle::Bytecode {
+                function_id: 0,
+                environment: None,
+            })),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_rejects_closure_parent_outside_environment_subset() {
+        let mut bytes = fixture_bytecode();
+        let body_offset = replace_global_body(
+            &mut bytes,
+            &[
+                NEW_OBJECT_OPCODE,
+                0,
+                CREATE_CLOSURE_OPCODE,
+                1,
+                0,
+                0,
+                0,
+                RET_OPCODE,
+                1,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Err(ScalarExecutionError::UnsupportedEnvironmentBase {
+                function_id: 1,
+                offset: body_offset + 2,
+                opcode: CREATE_CLOSURE_OPCODE,
+                register: 0,
+                value: ScalarValue::Object(ScalarObjectHandle::Object(0)),
+            }),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_creates_this_object_for_bytecode_constructor() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                LOAD_CONST_UNDEFINED_OPCODE,
+                0,
+                CREATE_CLOSURE_OPCODE,
+                1,
+                0,
+                0,
+                0,
+                CREATE_THIS_FOR_NEW_OPCODE,
+                2,
+                1,
+                0,
+                RET_OPCODE,
+                2,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Object(ScalarObjectHandle::Object(0))),
+        );
+
+        let report = describe_hbc_execution_gap(&bytes).expect("valid execution gap report");
+        assert!(report.contains("supportedInstructions=4/4"));
+        assert!(report.contains("firstUnsupported=none"));
+    }
+
+    #[test]
+    fn scalar_executor_rejects_this_allocation_for_non_constructor_subset_target() {
+        let mut bytes = fixture_bytecode();
+        let body_offset = replace_global_body(
+            &mut bytes,
+            &[
+                LOAD_CONST_UNDEFINED_OPCODE,
+                1,
+                CREATE_THIS_FOR_NEW_OPCODE,
+                2,
+                1,
+                0,
+                RET_OPCODE,
+                2,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Err(ScalarExecutionError::UnsupportedConstructorTarget {
+                function_id: 1,
+                offset: body_offset + 2,
+                opcode: CREATE_THIS_FOR_NEW_OPCODE,
+                register: 1,
+                value: ScalarValue::Undefined,
+            }),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_constructs_bytecode_constructor_as_undefined_subset_return() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                LOAD_CONST_UNDEFINED_OPCODE,
+                0,
+                CREATE_CLOSURE_OPCODE,
+                1,
+                0,
+                0,
+                0,
+                CONSTRUCT_OPCODE,
+                2,
+                1,
+                1,
+                RET_OPCODE,
+                2,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Undefined),
+        );
+
+        let report = describe_hbc_execution_gap(&bytes).expect("valid execution gap report");
+        assert!(report.contains("supportedInstructions=4/4"));
+        assert!(report.contains("firstUnsupported=none"));
+    }
+
+    #[test]
+    fn scalar_executor_selects_this_when_constructor_return_is_not_object() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                LOAD_CONST_UNDEFINED_OPCODE,
+                0,
+                CREATE_CLOSURE_OPCODE,
+                1,
+                0,
+                0,
+                0,
+                CREATE_THIS_FOR_NEW_OPCODE,
+                2,
+                1,
+                0,
+                CONSTRUCT_OPCODE,
+                3,
+                1,
+                1,
+                SELECT_OBJECT_OPCODE,
+                4,
+                2,
+                3,
+                RET_OPCODE,
+                4,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Object(ScalarObjectHandle::Object(0))),
+        );
+
+        let report = describe_hbc_execution_gap(&bytes).expect("valid execution gap report");
+        assert!(report.contains("supportedInstructions=6/6"));
+        assert!(report.contains("firstUnsupported=none"));
+    }
+
+    #[test]
+    fn scalar_executor_selects_constructor_object_return() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                NEW_OBJECT_OPCODE,
+                0,
+                NEW_OBJECT_OPCODE,
+                1,
+                SELECT_OBJECT_OPCODE,
+                2,
+                0,
+                1,
+                RET_OPCODE,
+                2,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Object(ScalarObjectHandle::Object(1))),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_rejects_construct_for_non_constructor_subset_target() {
+        let mut bytes = fixture_bytecode();
+        let body_offset = replace_global_body(
+            &mut bytes,
+            &[
+                LOAD_CONST_UNDEFINED_OPCODE,
+                1,
+                CONSTRUCT_OPCODE,
+                2,
+                1,
+                1,
+                RET_OPCODE,
+                2,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Err(ScalarExecutionError::UnsupportedConstructorTarget {
+                function_id: 1,
+                offset: body_offset + 2,
+                opcode: CONSTRUCT_OPCODE,
+                register: 1,
+                value: ScalarValue::Undefined,
+            }),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_rejects_select_object_when_this_is_not_object() {
+        let mut bytes = fixture_bytecode();
+        let body_offset = replace_global_body(
+            &mut bytes,
+            &[
+                LOAD_CONST_UNDEFINED_OPCODE,
+                0,
+                LOAD_CONST_UNDEFINED_OPCODE,
+                1,
+                SELECT_OBJECT_OPCODE,
+                2,
+                0,
+                1,
+                RET_OPCODE,
+                2,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Err(ScalarExecutionError::UnsupportedConstructorTarget {
+                function_id: 1,
+                offset: body_offset + 4,
+                opcode: SELECT_OBJECT_OPCODE,
+                register: 0,
+                value: ScalarValue::Undefined,
+            }),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_reports_thrown_value() {
+        let mut bytes = fixture_bytecode();
+        let body_offset = replace_global_body(
+            &mut bytes,
+            &[
+                LOAD_CONST_UINT8_OPCODE,
+                0,
+                7,
+                THROW_OPCODE,
+                0,
+                RET_OPCODE,
+                0,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Err(ScalarExecutionError::ThrownValue {
+                function_id: 1,
+                offset: body_offset + 3,
+                opcode: THROW_OPCODE,
+                register: 0,
+                value: ScalarValue::Number(7.0),
+            }),
+        );
+
+        let report = describe_hbc_execution_gap(&bytes).expect("valid execution gap report");
+        assert!(report.contains("supportedInstructions=3/3"));
+        assert!(report.contains("firstUnsupported=none"));
+    }
+
+    #[test]
+    fn scalar_executor_reads_declared_global_property() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                DECLARE_GLOBAL_VAR_OPCODE,
+                1,
+                0,
+                0,
+                0,
+                GET_GLOBAL_OBJECT_OPCODE,
+                0,
+                TRY_GET_BY_ID_OPCODE,
+                1,
+                0,
+                0,
+                1,
+                0,
+                RET_OPCODE,
+                1,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Undefined),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_reads_short_global_property_operand() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                DECLARE_GLOBAL_VAR_OPCODE,
+                1,
+                0,
+                0,
+                0,
+                GET_GLOBAL_OBJECT_OPCODE,
+                0,
+                GET_BY_ID_SHORT_OPCODE,
+                1,
+                0,
+                0,
+                1,
+                RET_OPCODE,
+                1,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Undefined),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_writes_and_reads_global_property() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                GET_GLOBAL_OBJECT_OPCODE,
+                0,
+                LOAD_CONST_UINT8_OPCODE,
+                1,
+                7,
+                PUT_BY_ID_LOOSE_OPCODE,
+                0,
+                1,
+                0,
+                1,
+                0,
+                TRY_GET_BY_ID_OPCODE,
+                2,
+                0,
+                0,
+                1,
+                0,
+                RET_OPCODE,
+                2,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Number(7.0)),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_writes_and_reads_plain_object_property() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                NEW_OBJECT_OPCODE,
+                0,
+                LOAD_CONST_UINT8_OPCODE,
+                1,
+                9,
+                PUT_BY_ID_LOOSE_OPCODE,
+                0,
+                1,
+                0,
+                1,
+                0,
+                TRY_GET_BY_ID_OPCODE,
+                2,
+                0,
+                0,
+                1,
+                0,
+                RET_OPCODE,
+                2,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Number(9.0)),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_writes_computed_string_property() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                NEW_OBJECT_OPCODE,
+                0,
+                LOAD_CONST_STRING_OPCODE,
+                1,
+                1,
+                0,
+                LOAD_CONST_UINT8_OPCODE,
+                2,
+                13,
+                PUT_BY_VAL_STRICT_OPCODE,
+                0,
+                1,
+                2,
+                TRY_GET_BY_ID_OPCODE,
+                3,
+                0,
+                0,
+                1,
+                0,
+                RET_OPCODE,
+                3,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Number(13.0)),
+        );
+
+        let report = describe_hbc_execution_gap(&bytes).expect("valid execution gap report");
+        assert!(report.contains("supportedInstructions=6/6"));
+        assert!(report.contains("firstUnsupported=none"));
+    }
+
+    #[test]
+    fn scalar_executor_rejects_computed_property_key_outside_string_subset() {
+        let mut bytes = fixture_bytecode();
+        let body_offset = replace_global_body(
+            &mut bytes,
+            &[
+                NEW_OBJECT_OPCODE,
+                0,
+                LOAD_CONST_UINT8_OPCODE,
+                1,
+                7,
+                LOAD_CONST_TRUE_OPCODE,
+                2,
+                PUT_BY_VAL_LOOSE_OPCODE,
+                0,
+                1,
+                2,
+                RET_OPCODE,
+                2,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Err(ScalarExecutionError::UnsupportedPropertyKey {
+                function_id: 1,
+                offset: body_offset + 7,
+                opcode: PUT_BY_VAL_LOOSE_OPCODE,
+                register: 1,
+                value: ScalarValue::Number(7.0),
+            }),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_maps_builtin_global_properties() {
+        let state = ScalarExecutorState::default();
+
+        assert_eq!(
+            read_scalar_global_property(&state, "globalThis"),
+            ScalarValue::Object(ScalarObjectHandle::Global),
+        );
+        assert_eq!(
+            read_scalar_global_property(&state, "nativePerformanceNow"),
+            ScalarValue::Function(ScalarFunctionHandle::NativePerformanceNow),
+        );
+        assert_eq!(
+            read_scalar_global_property(&state, "HermesInternal"),
+            ScalarValue::Object(ScalarObjectHandle::HermesInternal),
+        );
+        assert_eq!(
+            read_scalar_global_property(&state, "Map"),
+            ScalarValue::Function(ScalarFunctionHandle::NativeMapConstructor),
+        );
+        assert_eq!(
+            read_scalar_global_property(&state, "Object"),
+            ScalarValue::Function(ScalarFunctionHandle::NativeObjectConstructor),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_calls_native_performance_now_handle() {
+        let bytes = fixture_bytecode();
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid Hermes bytecode");
+        let mut state = ScalarExecutorState::default();
+
+        assert_eq!(scalar_direct_call_argument_count(CALL1_OPCODE), 1);
+        assert_eq!(scalar_direct_call_argument_count(CALL2_OPCODE), 2);
+        assert_eq!(scalar_direct_call_argument_count(CALL3_OPCODE), 3);
+        assert_eq!(scalar_direct_call_argument_count(CALL4_OPCODE), 4);
+
+        assert_eq!(
+            call_scalar_function(
+                &bytecode,
+                &mut state,
+                1,
+                HermesInstruction {
+                    offset: 123,
+                    opcode: CALL1_OPCODE,
+                    width: 4,
+                },
+                2,
+                ScalarValue::Function(ScalarFunctionHandle::NativePerformanceNow),
+                &[ScalarValue::Undefined, ScalarValue::Number(1.0)],
+            ),
+            Ok(ScalarValue::Number(0.0)),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_calls_copy_data_properties_builtin() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                NEW_OBJECT_OPCODE,
+                0,
+                LOAD_CONST_UINT8_OPCODE,
+                1,
+                55,
+                PUT_BY_ID_LOOSE_OPCODE,
+                0,
+                1,
+                0,
+                1,
+                0,
+                NEW_OBJECT_OPCODE,
+                2,
+                MOV_OPCODE,
+                4,
+                2,
+                MOV_OPCODE,
+                3,
+                0,
+                CALL_BUILTIN_OPCODE,
+                2,
+                HERMES_BUILTIN_COPY_DATA_PROPERTIES as u8,
+                3,
+                TRY_GET_BY_ID_OPCODE,
+                1,
+                2,
+                0,
+                1,
+                0,
+                RET_OPCODE,
+                1,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Number(55.0)),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_rejects_non_function_call_target() {
+        let bytes = fixture_bytecode();
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid Hermes bytecode");
+        let mut state = ScalarExecutorState::default();
+
+        assert_eq!(
+            call_scalar_function(
+                &bytecode,
+                &mut state,
+                1,
+                HermesInstruction {
+                    offset: 123,
+                    opcode: CALL1_OPCODE,
+                    width: 4,
+                },
+                2,
+                ScalarValue::Undefined,
+                &[],
+            ),
+            Err(ScalarExecutionError::UnsupportedCallTarget {
+                function_id: 1,
+                offset: 123,
+                opcode: CALL1_OPCODE,
+                register: 2,
+                value: ScalarValue::Undefined,
+            }),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_rejects_call3_non_function_target_after_decoding_arguments() {
+        let mut bytes = fixture_bytecode();
+        let body_offset = replace_global_body(
+            &mut bytes,
+            &[
+                LOAD_CONST_UNDEFINED_OPCODE,
+                0,
+                CALL3_OPCODE,
+                1,
+                0,
+                0,
+                0,
+                0,
+                RET_OPCODE,
+                1,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Err(ScalarExecutionError::UnsupportedCallTarget {
+                function_id: 1,
+                offset: body_offset + 2,
+                opcode: CALL3_OPCODE,
+                register: 0,
+                value: ScalarValue::Undefined,
+            }),
+        );
+
+        let report = describe_hbc_execution_gap(&bytes).expect("valid execution gap report");
+        assert!(report.contains("supportedInstructions=3/3"));
+        assert!(report.contains("firstUnsupported=none"));
+    }
+
+    #[test]
+    fn scalar_executor_jumps_when_condition_is_truthy() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                LOAD_CONST_TRUE_OPCODE,
+                0,
+                JMP_TRUE_OPCODE,
+                7,
+                0,
+                LOAD_CONST_FALSE_OPCODE,
+                1,
+                RET_OPCODE,
+                1,
+                LOAD_CONST_TRUE_OPCODE,
+                1,
+                RET_OPCODE,
+                1,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Boolean(true)),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_jumps_when_typeof_is_matches() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                NEW_OBJECT_OPCODE,
+                0,
+                JMP_TYPE_OF_IS_OPCODE,
+                12,
+                0,
+                0,
+                0,
+                0,
+                TYPEOF_IS_OBJECT as u8,
+                0,
+                LOAD_CONST_FALSE_OPCODE,
+                1,
+                RET_OPCODE,
+                1,
+                LOAD_CONST_TRUE_OPCODE,
+                1,
+                RET_OPCODE,
+                1,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Boolean(true)),
+        );
+
+        let report = describe_hbc_execution_gap(&bytes).expect("valid execution gap report");
+        assert!(report.contains("supportedInstructions=6/6"));
+        assert!(report.contains("firstUnsupported=none"));
+    }
+
+    #[test]
+    fn scalar_executor_jumps_when_loose_not_equal_matches() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                LOAD_CONST_UINT8_OPCODE,
+                0,
+                1,
+                LOAD_CONST_UINT8_OPCODE,
+                1,
+                2,
+                J_NOT_EQUAL_OPCODE,
+                8,
+                0,
+                1,
+                LOAD_CONST_FALSE_OPCODE,
+                2,
+                RET_OPCODE,
+                2,
+                LOAD_CONST_TRUE_OPCODE,
+                2,
+                RET_OPCODE,
+                2,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Boolean(true)),
+        );
+
+        let report = describe_hbc_execution_gap(&bytes).expect("valid execution gap report");
+        assert!(report.contains("supportedInstructions=7/7"));
+        assert!(report.contains("firstUnsupported=none"));
+    }
+
+    #[test]
+    fn scalar_executor_does_not_jump_when_loose_null_equals_undefined() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                LOAD_CONST_NULL_OPCODE,
+                0,
+                LOAD_CONST_UNDEFINED_OPCODE,
+                1,
+                J_NOT_EQUAL_OPCODE,
+                8,
+                0,
+                1,
+                LOAD_CONST_FALSE_OPCODE,
+                2,
+                RET_OPCODE,
+                2,
+                LOAD_CONST_TRUE_OPCODE,
+                2,
+                RET_OPCODE,
+                2,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Boolean(false)),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_jumps_when_strict_equal_matches() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                LOAD_CONST_UINT8_OPCODE,
+                0,
+                3,
+                LOAD_CONST_UINT8_OPCODE,
+                1,
+                3,
+                J_STRICT_EQUAL_OPCODE,
+                8,
+                0,
+                1,
+                LOAD_CONST_FALSE_OPCODE,
+                2,
+                RET_OPCODE,
+                2,
+                LOAD_CONST_TRUE_OPCODE,
+                2,
+                RET_OPCODE,
+                2,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Boolean(true)),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_jumps_when_strict_not_equal_matches() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                LOAD_CONST_NULL_OPCODE,
+                0,
+                LOAD_CONST_UNDEFINED_OPCODE,
+                1,
+                J_STRICT_NOT_EQUAL_OPCODE,
+                8,
+                0,
+                1,
+                LOAD_CONST_FALSE_OPCODE,
+                2,
+                RET_OPCODE,
+                2,
+                LOAD_CONST_TRUE_OPCODE,
+                2,
+                RET_OPCODE,
+                2,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Boolean(true)),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_does_not_jump_when_typeof_is_misses() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                NEW_OBJECT_OPCODE,
+                0,
+                JMP_TYPE_OF_IS_OPCODE,
+                12,
+                0,
+                0,
+                0,
+                0,
+                TYPEOF_IS_NUMBER as u8,
+                0,
+                LOAD_CONST_FALSE_OPCODE,
+                1,
+                RET_OPCODE,
+                1,
+                LOAD_CONST_TRUE_OPCODE,
+                1,
+                RET_OPCODE,
+                1,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Boolean(false)),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_does_not_jump_when_condition_is_falsy() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                LOAD_CONST_FALSE_OPCODE,
+                0,
+                JMP_TRUE_OPCODE,
+                7,
+                0,
+                LOAD_CONST_FALSE_OPCODE,
+                1,
+                RET_OPCODE,
+                1,
+                LOAD_CONST_TRUE_OPCODE,
+                1,
+                RET_OPCODE,
+                1,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Boolean(false)),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_rejects_property_access_on_non_object_subset_value() {
+        let mut bytes = fixture_bytecode();
+        let body_offset = replace_global_body(
+            &mut bytes,
+            &[
+                LOAD_CONST_UNDEFINED_OPCODE,
+                0,
+                TRY_GET_BY_ID_OPCODE,
+                1,
+                0,
+                0,
+                1,
+                0,
+                RET_OPCODE,
+                1,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Err(ScalarExecutionError::UnsupportedPropertyBase {
+                function_id: 1,
+                offset: body_offset + 2,
+                opcode: TRY_GET_BY_ID_OPCODE,
+                register: 0,
+                value: ScalarValue::Undefined,
+            }),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_rejects_environment_access_on_non_environment_subset_value() {
+        let mut bytes = fixture_bytecode();
+        let body_offset = replace_global_body(
+            &mut bytes,
+            &[
+                LOAD_CONST_UNDEFINED_OPCODE,
+                0,
+                LOAD_FROM_ENVIRONMENT_OPCODE,
+                1,
+                0,
+                0,
+                RET_OPCODE,
+                1,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Err(ScalarExecutionError::UnsupportedEnvironmentBase {
+                function_id: 1,
+                offset: body_offset + 2,
+                opcode: LOAD_FROM_ENVIRONMENT_OPCODE,
+                register: 0,
+                value: ScalarValue::Undefined,
+            }),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_declares_global_var() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                DECLARE_GLOBAL_VAR_OPCODE,
+                1,
+                0,
+                0,
+                0,
+                LOAD_CONST_UNDEFINED_OPCODE,
+                0,
+                RET_OPCODE,
+                0,
+            ],
+        );
+
+        let report =
+            execute_global_scalar_function_report(&bytes).expect("DeclareGlobalVar is supported");
+
+        assert_eq!(report.value, ScalarValue::Undefined);
+        assert_eq!(report.declared_globals, vec!["cdef"]);
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Undefined),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_reports_unsupported_utf16_global_var_name() {
+        let mut bytes = fixture_bytecode();
+        let body_offset = replace_global_body(
+            &mut bytes,
+            &[
+                DECLARE_GLOBAL_VAR_OPCODE,
+                0,
+                0,
+                0,
+                0,
+                LOAD_CONST_UNDEFINED_OPCODE,
+                0,
+                RET_OPCODE,
+                0,
+            ],
+        );
+        let small_string_offset = HermesBytecode::parse(&bytes)
+            .expect("valid Hermes bytecode")
+            .sections()
+            .small_string_table()
+            .offset() as usize;
+        bytes[small_string_offset] |=
+            u8::try_from(SMALL_STRING_UTF16_FLAG).expect("UTF-16 flag fits in u8");
+
+        assert_eq!(
+            execute_global_scalar_function_report(&bytes),
+            Err(ScalarExecutionError::UnsupportedStringEncoding {
+                function_id: 1,
+                offset: body_offset,
+                opcode: DECLARE_GLOBAL_VAR_OPCODE,
+                string_id: 0,
+                encoding: "UTF-16",
+            }),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_reports_first_unsupported_opcode() {
+        let mut bytes = fixture_bytecode();
+        let body_offset = replace_global_body(
+            &mut bytes,
+            &[LOAD_CONST_BIGINT_OPCODE, 0, 0, 0, RET_OPCODE, 0],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Err(ScalarExecutionError::UnsupportedOpcode {
+                function_id: 1,
+                offset: body_offset,
+                opcode: LOAD_CONST_BIGINT_OPCODE,
+                opcode_name: "LoadConstBigInt",
+            }),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_validates_register_bounds() {
+        let mut bytes = fixture_bytecode();
+        let body_offset = replace_global_body(&mut bytes, &[RET_OPCODE, 99]);
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Err(ScalarExecutionError::RegisterOutOfBounds {
+                function_id: 1,
+                offset: body_offset,
+                opcode: RET_OPCODE,
+                register: 99,
+                frame_size: 5,
+            }),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_requires_return_instruction() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(&mut bytes, &[LOAD_CONST_UNDEFINED_OPCODE, 0]);
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Err(ScalarExecutionError::MissingReturn { function_id: 1 }),
+        );
+    }
+
+    #[test]
+    fn parses_external_hbc_bundle_when_configured() {
+        let Ok(path) = std::env::var("IRIS_HBC_BUNDLE") else {
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("configured Hermes bytecode bundle is readable");
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid Hermes bytecode bundle");
+        let header = bytecode.header();
+
+        assert_eq!(header.version, 98);
+        assert_eq!(header.file_length as usize, bytes.len());
+        assert!(
+            bytecode
+                .global_instruction_count()
+                .expect("valid global function instruction stream")
+                > 0
+        );
+    }
+
+    #[test]
+    fn describes_external_hbc_bundle_execution_gap_when_configured() {
+        let Ok(path) = std::env::var("IRIS_HBC_BUNDLE") else {
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("configured Hermes bytecode bundle is readable");
+
+        let report = describe_hbc_execution_gap(&bytes).expect("valid execution gap report");
+
+        assert!(report.contains("supportedInstructions="));
+        assert!(!report.contains("firstUnsupported=DeclareGlobalVar(67)"));
+        assert!(!report.contains("firstUnsupported=CreateClosure(132)"));
+        assert!(report.contains("topUnsupported=[Call4(112):"));
     }
 
     #[test]
@@ -4633,7 +10717,7 @@ mod tests {
             .obj_key_buffer()
             .offset() as usize;
         bytes[key_buffer_offset] = SERIALIZED_LITERAL_TAG_SHORT_STRING | 1;
-        bytes[key_buffer_offset + 1..key_buffer_offset + 3].copy_from_slice(&1_u16.to_le_bytes());
+        bytes[key_buffer_offset + 1..key_buffer_offset + 3].copy_from_slice(&0_u16.to_le_bytes());
 
         let error = HermesBytecode::parse(&bytes).expect_err("non-identifier object key must fail");
         assert_eq!(
@@ -4641,8 +10725,8 @@ mod tests {
             ParseError::InvalidSerializedLiteralStringReference {
                 buffer: "obj_key_buffer",
                 offset: 1,
-                string_id: 1,
-                string_count: 1,
+                string_id: 0,
+                string_count: 2,
             },
         );
     }

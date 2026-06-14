@@ -157,6 +157,7 @@ class IrisRuntime final : public jsi::Runtime {
     uint32_t globalFunctionParamCount;
     uint32_t globalFunctionFrameSize;
     uint32_t globalInstructionCount;
+    std::string executionGap;
   };
 
   struct IrisPreparedJavaScript final : public jsi::PreparedJavaScript {
@@ -212,8 +213,13 @@ class IrisRuntime final : public jsi::Runtime {
       const HermesBytecodeMetadata&,
       const std::string&) const;
   [[noreturn]] void abortBundleContractViolation(const std::string&) const;
+  void emitBootstrapBenchmarkArtifact(
+      const std::shared_ptr<const jsi::Buffer>&,
+      const HermesBytecodeMetadata&,
+      const std::string&);
 
   std::shared_ptr<ObjectState> globalObject_;
+  bool emittedBootstrapBenchmarkArtifact_{false};
 };
 
 } // namespace iris::runtime

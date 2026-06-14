@@ -3,6 +3,7 @@ import { dirname, resolve } from "node:path";
 import type { BenchmarkSuiteReport } from "../../apps/rn-bench/src/benchmarks/types";
 
 const marker = "IRIS_BENCHMARK_ARTIFACT";
+const chunkMarker = "IRIS_BENCHMARK_ARTIFACT_CHUNK";
 const root = resolve(import.meta.dir, "../..");
 
 function readArg(name: string) {
@@ -21,7 +22,16 @@ function readArgs(name: string) {
     .map((arg) => arg.slice(prefix.length));
 }
 
+function readOptionalArgs(name: string, fallback: string[]) {
+  const values = readArgs(name);
+  return values.length > 0 ? values : fallback;
+}
+
 function extractJsonPayload(line: string) {
+  if (line.includes(chunkMarker)) {
+    return null;
+  }
+
   const markerIndex = line.indexOf(marker);
   if (markerIndex === -1) {
     return null;
@@ -38,18 +48,94 @@ function extractJsonPayload(line: string) {
   return payload.slice(jsonStart, jsonEnd + 1);
 }
 
-function parseReport(logText: string): BenchmarkSuiteReport {
-  const candidates = logText
-    .split(/\r?\n/)
-    .map((line) => extractJsonPayload(line))
-    .filter((payload): payload is string => payload != null);
+function extractJsonPayloadChunk(line: string) {
+  const markerIndex = line.indexOf(chunkMarker);
 
-  if (candidates.length === 0) {
+  if (markerIndex === -1) {
+    return null;
+  }
+
+  const payload = line.slice(markerIndex + chunkMarker.length).trimStart();
+  const match = payload.match(/^(\d+)\/(\d+) (.*)$/);
+
+  if (!match) {
+    return null;
+  }
+
+  return {
+    chunk: match[3],
+    index: Number(match[1]),
+    total: Number(match[2]),
+  };
+}
+
+function collectJsonPayloads(logText: string) {
+  const payloads: string[] = [];
+  let chunks: string[] = [];
+  let expectedTotal = 0;
+
+  for (const line of logText.split(/\r?\n/)) {
+    const chunk = extractJsonPayloadChunk(line);
+
+    if (chunk != null) {
+      if (chunk.index === 1) {
+        chunks = [];
+        expectedTotal = chunk.total;
+      }
+
+      if (chunk.total === expectedTotal && chunk.index === chunks.length + 1) {
+        chunks.push(chunk.chunk);
+      } else {
+        chunks = [];
+        expectedTotal = 0;
+      }
+
+      if (expectedTotal > 0 && chunks.length === expectedTotal) {
+        payloads.push(chunks.join(""));
+        chunks = [];
+        expectedTotal = 0;
+      }
+
+      continue;
+    }
+
+    const payload = extractJsonPayload(line);
+
+    if (payload != null) {
+      payloads.push(payload);
+    }
+  }
+
+  return payloads;
+}
+
+function parseReport(logText: string, suiteIds: string[]): BenchmarkSuiteReport {
+  const payloads = collectJsonPayloads(logText);
+
+  if (payloads.length === 0) {
     throw new Error(`No ${marker} JSON payload was found.`);
   }
 
-  const latest = candidates[candidates.length - 1];
-  return JSON.parse(latest) as BenchmarkSuiteReport;
+  const reports = payloads
+    .map((payload) => {
+      try {
+        return JSON.parse(payload) as BenchmarkSuiteReport;
+      } catch {
+        return null;
+      }
+    })
+    .filter((report): report is BenchmarkSuiteReport => report != null);
+  const matchingReports = reports.filter((report) => suiteIds.includes(report.suite.id));
+
+  if (matchingReports.length === 0) {
+    const availableSuiteIds = reports.map((report) => report.suite.id).join(", ");
+
+    throw new Error(
+      `No ${marker} payload matched suite ${suiteIds.join(", ")}. Available suites: ${availableSuiteIds}`,
+    );
+  }
+
+  return matchingReports[matchingReports.length - 1];
 }
 
 function assertNumber(value: unknown, fieldName: string) {
@@ -64,6 +150,7 @@ type ValidationOptions = {
   requireNewArchitecture: boolean;
   requireRelease: boolean;
   requireTurboModuleProxy: boolean;
+  suiteIds: string[];
 };
 
 function validateReport(report: BenchmarkSuiteReport, options: ValidationOptions) {
@@ -71,8 +158,10 @@ function validateReport(report: BenchmarkSuiteReport, options: ValidationOptions
     throw new Error(`Unexpected benchmark schema: ${report.schemaVersion}`);
   }
 
-  if (report.suite.id !== "rn-hermes-js-baseline") {
-    throw new Error(`Unexpected benchmark suite: ${report.suite.id}`);
+  if (!options.suiteIds.includes(report.suite.id)) {
+    throw new Error(
+      `Unexpected benchmark suite: ${report.suite.id}. Expected one of: ${options.suiteIds.join(", ")}`,
+    );
   }
 
   if (!options.allowNonHermes && !report.metadata.runtime.hermes) {
@@ -127,8 +216,9 @@ const validationOptions: ValidationOptions = {
   requireNewArchitecture: hasArg("--require-new-architecture"),
   requireRelease: hasArg("--require-release"),
   requireTurboModuleProxy: hasArg("--require-turbo-module-proxy"),
+  suiteIds: readOptionalArgs("--suite-id", ["rn-hermes-js-baseline"]),
 };
-const report = parseReport(readFileSync(inputPath, "utf8"));
+const report = parseReport(readFileSync(inputPath, "utf8"), validationOptions.suiteIds);
 
 validateReport(report, validationOptions);
 
@@ -144,7 +234,7 @@ const outputReport: BenchmarkSuiteReport = {
 mkdirSync(dirname(outputPath), { recursive: true });
 writeFileSync(outputPath, `${JSON.stringify(outputReport, null, 2)}\n`);
 
-console.log(`Hermes benchmark artifact: ${outputPath}`);
+console.log(`Benchmark artifact: ${outputPath}`);
 for (const result of outputReport.cases) {
   console.log(
     `${result.id}: p50=${result.stats.p50}${result.unit} p95=${result.stats.p95}${result.unit}`,

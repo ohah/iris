@@ -91,6 +91,16 @@ description = "Build irisRelease with the local Iris Android engine AAR skeleton
 depends = ["rn-android-build-iris-engine"]
 run = "cd apps/rn-bench/android && ./gradlew :app:assembleIrisRelease -PirisEngineAar=\"$(pwd)/iris-engine/build/outputs/aar/iris-engine-release.aar\" -x lint -x test"
 
+[tasks.rn-android-build-engine-comparison]
+description = "Build both Android release APKs for Hermes/Iris engine comparison"
+depends = ["rn-android-build-release"]
+run = "mise run rn-android-build-iris-release"
+
+[tasks.rn-android-build-engine-comparison-local]
+description = "Build Hermes release and local skeleton Iris release APKs for comparison preflight"
+depends = ["rn-android-build-release"]
+run = "mise run rn-android-build-iris-release-local"
+
 [tasks.rn-ios-pods]
 description = "Install CocoaPods dependencies for the React Native benchmark app"
 run = "cd apps/rn-bench/ios && bundle install && bundle exec pod install"
@@ -135,8 +145,46 @@ run = "bun run bench:android-release:repeat"
 
 [tasks.bench-android-engine-compare]
 description = "Run Android physical release benchmarks for Hermes and Iris engine APKs"
-depends = ["rn-android-build-release"]
+depends = ["rn-android-build-engine-comparison"]
 run = "bun run bench:android-engine-compare"
+
+[tasks.bench-android-engine-compare-check]
+description = "Validate Android Hermes/Iris comparison APKs use byte-identical HBC inputs"
+run = "bun run bench:android-engine-compare:check"
+
+[tasks.bench-android-engine-compare-local-check]
+description = "Build local skeleton APKs and validate Android engine comparison inputs without running benchmarks"
+depends = ["rn-android-build-engine-comparison-local"]
+run = "bun run bench:android-engine-compare:check"
+
+[tasks.bench-android-iris-hbc-gap-local]
+description = "Print Iris scalar executor coverage for the local Iris release HBC bundle"
+depends = ["rn-android-build-iris-release-local"]
+run = "cargo run -p iris-hbc --bin hbc-gap -- apps/rn-bench/android/app/build/generated/assets/react/irisRelease/index.android.bundle"
+
+[tasks.bench-android-iris-hbc-exec-local]
+description = "Execute the local Iris release HBC bundle with the current Rust scalar executor subset"
+depends = ["rn-android-build-iris-release-local"]
+run = "cargo run -p iris-hbc --bin hbc-exec -- apps/rn-bench/android/app/build/generated/assets/react/irisRelease/index.android.bundle"
+
+[tasks.bench-android-iris-hbc-trace-local]
+description = "Trace the local Iris release HBC bundle to completion or the current scalar executor frontier"
+depends = ["rn-android-build-iris-release-local"]
+run = "cargo run -p iris-hbc --bin hbc-trace -- apps/rn-bench/android/app/build/generated/assets/react/irisRelease/index.android.bundle"
+
+[tasks.bench-android-iris-bootstrap-local]
+description = "Build, install, run, and extract the Android physical Iris HBC bootstrap benchmark"
+depends = ["rn-android-build-iris-release-local"]
+run = "bun run bench:android-iris-bootstrap"
+
+[tasks.bench-android-local-performance]
+description = "Build local Android release variants, measure Hermes release and Iris bootstrap, and write a combined no-ratio report"
+depends = ["rn-android-build-engine-comparison-local"]
+run = "bun run bench:android-local-performance"
+
+[tasks.bench-android-local-performance-report]
+description = "Write a combined Android local performance report from existing Hermes and Iris summaries"
+run = "bun run bench:android-local-performance-report"
 
 [tasks.bench-extract-hermes]
 description = "Extract a Hermes app benchmark report from artifacts/bench/metro-hermes.log"

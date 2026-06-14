@@ -38,8 +38,11 @@ mise run rn-ios-pods
 mise run rn-ios-build-debug
 mise run rn-android-build-release
 mise run rn-android-build-iris-release
+mise run rn-android-build-engine-comparison
+mise run rn-android-build-engine-comparison-local
 mise run rn-ios-build-release
 mise run bench-android-release-repeat
+mise run bench-android-engine-compare-local-check
 mise run bench-android-engine-compare
 mise run bench-extract-release-fixture
 mise run bench-extract-android-release-fixture
@@ -68,7 +71,14 @@ Iris 엔진 artifact가 준비되면 Android 엔진 비교는 같은 앱 소스�
 
 ```sh
 IRIS_ENGINE_AAR=/absolute/path/to/iris-engine.aar mise run rn-android-build-iris-release
+mise run bench-android-engine-compare-check
 mise run bench-android-engine-compare
+```
+
+로컬 skeleton AAR은 엔진 AAR/패키징/HBC preflight까지만 검증한다.
+
+```sh
+mise run bench-android-engine-compare-local-check
 ```
 
 iOS는 물리 기기의 Release configuration을 기준으로 실행한다. `rn-ios-build-release`는 simulator release build 확인용이며 최종 성능 기준선으로 쓰지 않는다.

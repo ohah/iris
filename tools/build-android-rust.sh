@@ -53,6 +53,15 @@ TOOLCHAIN_BIN="$TOOLCHAIN_ROOT/$HOST_TAG/bin"
 LLVM_AR="$TOOLCHAIN_BIN/llvm-ar"
 LLVM_RANLIB="$TOOLCHAIN_BIN/llvm-ranlib"
 
+if command -v rustup >/dev/null 2>&1; then
+  RUSTUP=rustup
+elif [ -n "${HOME:-}" ] && [ -x "$HOME/.cargo/bin/rustup" ]; then
+  RUSTUP="$HOME/.cargo/bin/rustup"
+else
+  echo "rustup not found. Install Rust through mise or rustup before building Iris Android." >&2
+  exit 1
+fi
+
 CXXBRIDGE=${CXXBRIDGE:-"$REPO_ROOT/target/cargo-tools/bin/cxxbridge"}
 if ! command -v "$CXXBRIDGE" >/dev/null 2>&1; then
   cargo install --locked cxxbridge-cmd --version 1.0.194 --root "$REPO_ROOT/target/cargo-tools"
@@ -67,7 +76,7 @@ mkdir -p "$GENERATED_CXX_DIR" "$GENERATED_INCLUDE_DIR"
 "$CXXBRIDGE" "$REPO_ROOT/crates/iris-hbc/src/lib.rs" --header -o "$GENERATED_CXX_DIR/iris_hbc.h"
 "$CXXBRIDGE" --header -o "$GENERATED_INCLUDE_DIR/cxx.h"
 
-installed_targets=$(rustup target list --installed)
+installed_targets=$("$RUSTUP" target list --installed)
 for target in \
   aarch64-linux-android \
   armv7-linux-androideabi \
@@ -75,7 +84,7 @@ for target in \
   x86_64-linux-android
 do
   if ! printf '%s\n' "$installed_targets" | grep -qx "$target"; then
-    rustup target add "$target"
+    "$RUSTUP" target add "$target"
   fi
 done
 

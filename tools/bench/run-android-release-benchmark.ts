@@ -6,6 +6,7 @@ import type {
   BenchmarkMetadata,
   BenchmarkSuiteReport,
 } from "../../apps/rn-bench/src/benchmarks/types";
+import { strictRnBenchmarkCaseIds, strictRnBenchmarkSuite } from "./strict-rn-benchmark-contract";
 
 const root = resolve(import.meta.dir, "../..");
 const defaultApkPath =
@@ -86,6 +87,7 @@ type CaseMetricSummary = {
 };
 
 type RepeatedCaseSummary = {
+  checksum: BenchmarkCaseReport["checksum"];
   id: string;
   label: string;
   p50: CaseMetricSummary;
@@ -244,13 +246,17 @@ function summarizeMetric(samples: number[]): CaseMetricSummary {
   };
 }
 
+function checksumKey(checksum: BenchmarkCaseReport["checksum"]) {
+  return `${typeof checksum}:${JSON.stringify(checksum)}`;
+}
+
 function extractBenchmarkReport(inputLogPath: string, outputReportPath: string) {
   const selectedSuiteIds =
     suiteIds.length > 0
       ? suiteIds
       : nativeBootstrapArtifact
         ? ["iris-engine-bootstrap"]
-        : ["rn-hermes-js-baseline"];
+        : [strictRnBenchmarkSuite.id];
   const selectedRequiredCases =
     requiredCases.length > 0
       ? requiredCases
@@ -260,11 +266,7 @@ function extractBenchmarkReport(inputLogPath: string, outputReportPath: string) 
             "iris-hbc-static-coverage-scan",
             "iris-hbc-scalar-execution-frontier",
           ]
-        : [
-            "iris-module-native-compute",
-            "turbomodule-number-round-trip",
-            "turbomodule-string-round-trip",
-          ];
+        : [...strictRnBenchmarkCaseIds];
   const extractionArgs = [
     "run",
     "tools/bench/extract-hermes-report.ts",
@@ -293,6 +295,16 @@ function summarizeReports(reports: BenchmarkSuiteReport[], sourceReports: string
   const firstReport = reports[0];
   const caseIds = firstReport.cases.map((benchmarkCase) => benchmarkCase.id);
 
+  for (const report of reports) {
+    if (report.suite.id !== firstReport.suite.id || report.suite.name !== firstReport.suite.name) {
+      throw new Error(
+        "Repeated Android benchmark reports came from different suites.\n" +
+          `first=${firstReport.suite.id} (${firstReport.suite.name})\n` +
+          `next=${report.suite.id} (${report.suite.name})`,
+      );
+    }
+  }
+
   const cases = caseIds.map((caseId): RepeatedCaseSummary => {
     const matchingCases = reports.map((report) => {
       const benchmarkCase = report.cases.find((candidate) => candidate.id === caseId);
@@ -304,8 +316,22 @@ function summarizeReports(reports: BenchmarkSuiteReport[], sourceReports: string
       return benchmarkCase;
     });
     const [firstCase] = matchingCases as [BenchmarkCaseReport, ...BenchmarkCaseReport[]];
+    const firstChecksumKey = checksumKey(firstCase.checksum);
+    const mismatchedChecksum = matchingCases.find(
+      (benchmarkCase) => checksumKey(benchmarkCase.checksum) !== firstChecksumKey,
+    );
+
+    if (mismatchedChecksum != null) {
+      throw new Error(
+        `${caseId} checksum changed across repeated Android benchmark runs: ` +
+          `first=${JSON.stringify(firstCase.checksum)} next=${JSON.stringify(
+            mismatchedChecksum.checksum,
+          )}`,
+      );
+    }
 
     return {
+      checksum: firstCase.checksum,
       id: caseId,
       label: firstCase.label,
       p50: summarizeMetric(matchingCases.map((benchmarkCase) => benchmarkCase.stats.p50)),

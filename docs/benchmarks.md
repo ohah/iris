@@ -111,6 +111,7 @@ artifacts/bench/rn-release-iris-bootstrap-run-*.log
 Iris가 Hermes를 대체하는 엔진으로 들어가는 비교는 독립 앱 두 개가 아니라 같은 `apps/rn-bench` 소스의 엔진별 release variant 두 개로 수행한다. 제품 목표는 Hermes HBC 형식 호환이 아니라 React Native/Hermes 관측 가능 동작 호환과 기존 앱 코드 마이그레이션 0이다. 기준은 다음과 같다.
 
 - `Hermes release`와 `Iris release`는 같은 benchmark JS, 같은 RN 버전, 같은 native module surface를 사용한다.
+- strict RN 엔진 비교 case 계약은 `tools/bench/strict-rn-benchmark-contract.ts`에 고정한다. 두 엔진 summary는 이 case set을 정확히 포함해야 하며 case별 checksum이 같아야 한다.
 - Iris 전용 bundle pipeline을 사용해도 앱 소스는 Hermes 기준선과 같아야 하며 compiler, source hash, transform option, runtime backend를 artifact에 기록해야 한다.
 - HBC 비교 모드에서는 두 release variant의 generated `index.android.bundle`과 APK 내부 `assets/index.android.bundle`이 Hermes bytecode magic, bytecode version, source hash, file length, SHA-256까지 같아야 한다.
 - Hermes APK에는 `libhermesvm.so`가 있어야 하고 `libirisengine.so`/`libjsc.so`가 없어야 한다.
@@ -269,7 +270,7 @@ mise run bench-android-engine-compare-local-check
 
 `bench-android-engine-compare`는 측정 전에 APK/runtime/bundle preflight를 먼저 수행한다. 현재 구현은 HBC 비교 모드 preflight이므로 HBC parity를 검사한다. Iris 전용 bundle pipeline이 들어오면 source manifest와 Iris artifact parity를 검사해야 한다. preflight가 통과해도 Iris runtime이 bundle 실행 단계에서 실패하면 비교 artifact를 쓰지 않는다. 그 경우는 성능 열위가 아니라 호환성 차단으로 분류한다.
 
-비교 artifact는 두 summary의 반복 횟수, suite id/name, benchmark case set, 단위가 모두 같을 때만 생성한다. 이 조건이 깨지면 ratio를 계산하지 않고 실패시킨다.
+비교 artifact는 두 summary의 반복 횟수, suite id/name, strict RN benchmark case 계약, 단위, checksum이 모두 같을 때만 생성한다. 이 조건이 깨지면 ratio를 계산하지 않고 실패시킨다. checksum이 빠진 예전 summary는 strict 비교 입력으로 쓰지 않고 현재 runner로 다시 측정한다.
 
 Metro 로그를 파일로 남긴 뒤 Hermes baseline artifact로 추출한다.
 
@@ -291,7 +292,7 @@ mise run rn-android
 mise run bench-extract-hermes
 ```
 
-추출 도구는 `iris.benchmark.v1` schema, `rn-hermes-js-baseline` suite, Hermes runtime 여부, case별 sample/p50/p95 값을 검증한다.
+추출 도구는 `iris.benchmark.v1` schema, `rn-hermes-js-baseline` suite, Hermes runtime 여부, case별 sample/p50/p95 값을 검증한다. Android repeated summary는 case checksum을 보존하고 반복 실행 간 checksum이 달라지면 summary 생성을 실패시킨다.
 
 이 값은 개발 중 빠른 기준선 확인용이다. 성능 주장은 release build, 동일 물리 기기, 반복 측정, p50/p95, 기기 metadata가 모두 갖춰진 산출물에서만 한다. release 로그는 `artifacts/bench/rn-release-hermes.log`에 남긴 뒤 다음 명령으로 검증한다.
 

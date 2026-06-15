@@ -16,6 +16,7 @@ type CaseMetricSummary = {
 };
 
 type RepeatedCaseSummary = {
+  checksum?: number | string;
   id: string;
   label: string;
   p50: CaseMetricSummary;
@@ -41,6 +42,7 @@ type BridgeComparisonClass = "format-shift-diagnostic" | "same-method-surface" |
 
 type LaneMeasurement = {
   cases: Array<{
+    checksum?: number | string;
     id: string;
     label: string;
     p50Mean: number;
@@ -166,6 +168,7 @@ function measurementFromSummary(
 ): LaneMeasurement {
   return {
     cases: summary.cases.map((benchmarkCase) => ({
+      checksum: benchmarkCase.checksum,
       id: benchmarkCase.id,
       label: benchmarkCase.label,
       p50Mean: benchmarkCase.p50.mean,
@@ -226,11 +229,32 @@ function compareLane(
   }
 
   const sameSuite = baseline.measurement.suite.id === candidate.measurement.suite.id;
+  const baselineCaseIds = baseline.measurement.cases
+    .map((benchmarkCase) => benchmarkCase.id)
+    .sort();
+  const candidateCaseIds = candidate.measurement.cases
+    .map((benchmarkCase) => benchmarkCase.id)
+    .sort();
+  const sameCaseSet = baselineCaseIds.join("\n") === candidateCaseIds.join("\n");
+  const sameChecksums =
+    sameCaseSet &&
+    candidate.measurement.cases.every((candidateCase) => {
+      const baselineCase = baselineCases.get(candidateCase.id);
+
+      return (
+        baselineCase != null &&
+        baselineCase.checksum != null &&
+        candidateCase.checksum != null &&
+        `${typeof baselineCase.checksum}:${JSON.stringify(baselineCase.checksum)}` ===
+          `${typeof candidateCase.checksum}:${JSON.stringify(candidateCase.checksum)}`
+      );
+    });
   const candidateLane = benchmarkLane(candidate.id);
-  const strictComparable = candidateLane.strictComparableWithBaseline && sameSuite;
+  const strictComparable =
+    candidateLane.strictComparableWithBaseline && sameSuite && sameCaseSet && sameChecksums;
   const ratioAllowed = strictComparable;
   const reason = ratioAllowed
-    ? "Same RN suite and case set on a strict comparison lane."
+    ? "Same RN suite, case set, checksum, and units on a strict comparison lane."
     : candidateLane.comparisonReason;
 
   return {

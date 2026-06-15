@@ -1,4 +1,8 @@
 import type { IrisBridgeTurboModule } from "../native/IrisBridgeTurboModule";
+import {
+  createNativeModuleBoundaryBenchmarkCases,
+  type NativeModuleBoundaryTarget,
+} from "./turboModuleCases";
 import type { BenchmarkCase } from "./types";
 
 const numberRoundTripsPerSample = 1_000;
@@ -31,7 +35,7 @@ function getFastPath(module: IrisBridgeTurboModule | null): IrisBridgeFastPath |
   return globalThis.__irisBridgeFastPath ?? null;
 }
 
-function createFacade(fastPath: IrisBridgeFastPath) {
+function createFacade(fastPath: IrisBridgeFastPath): NativeModuleBoundaryTarget {
   return {
     echoNumber: (value: number) => fastPath.echoNumber(value),
     roundTripString: (value: string) => fastPath.roundTripString(value),
@@ -103,60 +107,31 @@ export function createIrisBridgeBenchmarkCases(
       unit: "ms",
       warmupIterations: 3,
     },
-    {
-      description:
-        "Synchronous JS facade to Iris JSI host function number round trips with the TurboModule method shape.",
-      id: "iris-jsi-facade-number-round-trip",
-      label: "Iris facade number",
-      measuredIterations: 20,
-      run: () => {
-        let checksum = 0;
-
-        for (let index = 0; index < numberRoundTripsPerSample; index += 1) {
-          checksum += facade.echoNumber(index);
-        }
-
-        return {
-          checksum,
-          detail: `${numberRoundTripsPerSample} sync JSI facade number round trips`,
-        };
+    ...createNativeModuleBoundaryBenchmarkCases(facade, {
+      descriptions: {
+        nativeCompute:
+          "Single synchronous JS facade call into the Iris JSI native compute workload.",
+        numberRoundTrip:
+          "Synchronous JS facade to Iris JSI host function number round trips with the TurboModule method shape.",
+        stringRoundTrip:
+          "Synchronous JS facade to Iris JSI host function string round trips with the TurboModule method shape.",
       },
-      unit: "ms",
-      warmupIterations: 5,
-    },
-    {
-      description:
-        "Synchronous JS facade to Iris JSI host function string round trips with the TurboModule method shape.",
-      id: "iris-jsi-facade-string-round-trip",
-      label: "Iris facade string",
-      measuredIterations: 20,
-      run: () => {
-        let checksum = 0;
-
-        for (let index = 0; index < stringRoundTripsPerSample; index += 1) {
-          checksum += facade.roundTripString(`iris-${index}`).length;
-        }
-
-        return {
-          checksum,
-          detail: `${stringRoundTripsPerSample} sync JSI facade string round trips`,
-        };
+      details: {
+        nativeCompute: "JSI facade native math operations",
+        numberRoundTrip: "sync JSI facade number round trips",
+        stringRoundTrip: "sync JSI facade string round trips",
       },
-      unit: "ms",
-      warmupIterations: 5,
-    },
-    {
-      description: "Single synchronous JS facade call into the Iris JSI native compute workload.",
-      id: "iris-jsi-facade-native-compute",
-      label: "Iris facade compute",
-      measuredIterations: 15,
-      run: () => ({
-        checksum: facade.runIrisNumericWorkload(irisNumericWorkloadIterations),
-        detail: `${irisNumericWorkloadIterations} JSI facade native math operations`,
-      }),
-      unit: "ms",
-      warmupIterations: 3,
-    },
+      ids: {
+        nativeCompute: "iris-jsi-facade-native-compute",
+        numberRoundTrip: "iris-jsi-facade-number-round-trip",
+        stringRoundTrip: "iris-jsi-facade-string-round-trip",
+      },
+      labels: {
+        nativeCompute: "Iris facade compute",
+        numberRoundTrip: "Iris facade number",
+        stringRoundTrip: "Iris facade string",
+      },
+    }),
     {
       description:
         "Native-owned columnar object payload traversal through an Iris JSI ArrayBuffer.",

@@ -217,9 +217,11 @@ class IrisRuntime final : public jsi::Runtime {
       const std::shared_ptr<const jsi::Buffer>&,
       const HermesBytecodeMetadata&,
       const std::string&);
+  void emitQuickJsBenchmarkArtifact();
 
   std::shared_ptr<ObjectState> globalObject_;
   bool emittedBootstrapBenchmarkArtifact_{false};
+  bool emittedQuickJsBenchmarkArtifact_{false};
 };
 
 } // namespace iris::runtime

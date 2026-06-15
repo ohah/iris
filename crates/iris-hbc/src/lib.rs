@@ -1178,6 +1178,21 @@ pub struct ScalarExecutionReport<'a> {
     pub declared_globals: Vec<&'a str>,
 }
 
+/// In-process benchmark report for Iris' scalar Hermes bytecode executor.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScalarBenchmarkReport {
+    /// Value returned by the last measured execution.
+    pub value: ScalarValue,
+    /// Number of global `var` names declared by the last measured execution.
+    pub declared_global_count: usize,
+    /// Warmup executions run before samples were collected.
+    pub warmup_iterations: u32,
+    /// Measured executions included in [`Self::samples_ms`].
+    pub measured_iterations: u32,
+    /// Per-execution elapsed time in milliseconds.
+    pub samples_ms: Vec<f64>,
+}
+
 /// Error returned by Iris' first Hermes bytecode executor subset.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScalarExecutionError {
@@ -2665,6 +2680,55 @@ pub fn execute_hbc_global_scalar_function(bytes: &[u8]) -> Result<String, Scalar
     ))
 }
 
+/// Benchmarks the global function against a parsed Hermes bytecode bundle.
+///
+/// The bytecode is parsed once. Each execution gets a fresh scalar executor
+/// state, so global object mutations from one sample do not affect the next
+/// sample. The parser cost is intentionally excluded to match a prepared Hermes
+/// bytecode benchmark.
+///
+/// # Errors
+///
+/// Returns [`ScalarExecutionError`] if the bytecode is invalid or if any
+/// execution reaches an opcode outside the scalar subset.
+pub fn benchmark_global_scalar_function(
+    bytes: &[u8],
+    warmup_iterations: u32,
+    measured_iterations: u32,
+) -> Result<ScalarBenchmarkReport, ScalarExecutionError> {
+    let bytecode = HermesBytecode::parse(bytes)?;
+    let function_id = bytecode.header().global_code_index;
+    let mut last_report = None;
+
+    for _ in 0..warmup_iterations {
+        last_report = Some(execute_scalar_function_unbounded(&bytecode, function_id)?);
+    }
+
+    let mut samples_ms = Vec::with_capacity(
+        usize::try_from(measured_iterations)
+            .expect("measured iteration count fits in usize on supported targets"),
+    );
+    for _ in 0..measured_iterations {
+        let start = std::time::Instant::now();
+        let report = execute_scalar_function_unbounded(&bytecode, function_id)?;
+        samples_ms.push(start.elapsed().as_secs_f64() * 1_000.0);
+        last_report = Some(report);
+    }
+
+    let report = last_report.unwrap_or_else(|| ScalarExecutionReport {
+        value: ScalarValue::Undefined,
+        declared_globals: Vec::new(),
+    });
+
+    Ok(ScalarBenchmarkReport {
+        value: report.value,
+        declared_global_count: report.declared_globals.len(),
+        warmup_iterations,
+        measured_iterations,
+        samples_ms,
+    })
+}
+
 /// Executes the global function and reports either completion or the current
 /// scalar execution frontier.
 ///
@@ -2779,6 +2843,17 @@ fn execute_scalar_function_relaxed<'a>(
     execute_scalar_function_with_state(bytecode, &mut state, function_id, &[])
 }
 
+fn execute_scalar_function_unbounded<'a>(
+    bytecode: &HermesBytecode<'a>,
+    function_id: u32,
+) -> Result<ScalarExecutionReport<'a>, ScalarExecutionError> {
+    let mut state = ScalarExecutorState {
+        remaining_steps: None,
+        ..ScalarExecutorState::default()
+    };
+    execute_scalar_function_with_state(bytecode, &mut state, function_id, &[])
+}
+
 fn execute_scalar_function_with_state<'a>(
     bytecode: &HermesBytecode<'a>,
     state: &mut ScalarExecutorState<'a>,
@@ -2809,10 +2884,12 @@ fn execute_scalar_function_with_state_and_environment<'a>(
     let instructions = bytecode
         .function_instructions(function_id)?
         .collect::<Result<Vec<_>, _>>()?;
-    let step_limit = instructions
-        .len()
-        .saturating_mul(SCALAR_EXECUTION_STEP_MULTIPLIER)
-        .max(1);
+    let step_limit = state.remaining_steps.map(|_| {
+        instructions
+            .len()
+            .saturating_mul(SCALAR_EXECUTION_STEP_MULTIPLIER)
+            .max(1)
+    });
     let mut instruction_index = 0_usize;
     let mut step_count = 0_usize;
 
@@ -2826,10 +2903,10 @@ fn execute_scalar_function_with_state_and_environment<'a>(
             }
             *remaining_steps -= 1;
         }
-        if step_count >= step_limit {
+        if step_limit.is_some_and(|step_limit| step_count >= step_limit) {
             return Err(ScalarExecutionError::StepLimitExceeded {
                 function_id,
-                step_limit,
+                step_limit: step_limit.expect("checked local step limit"),
             });
         }
         step_count += 1;
@@ -3958,6 +4035,34 @@ fn execute_scalar_instruction<'a>(
                 Ok(ScalarInstructionResult::Continue)
             }
         }
+        183..=206 => {
+            let delta_width = scalar_jump_delta_width(instruction.opcode);
+            let left_register = read_unsigned_operand(instruction_bytes, 1 + delta_width, 1);
+            let right_register = read_unsigned_operand(instruction_bytes, 2 + delta_width, 1);
+            let left = scalar_to_number(read_scalar_register(
+                registers,
+                function_id,
+                instruction,
+                left_register,
+            )?);
+            let right = scalar_to_number(read_scalar_register(
+                registers,
+                function_id,
+                instruction,
+                right_register,
+            )?);
+
+            if scalar_relational_jump_matches(instruction.opcode, left, right) {
+                Ok(ScalarInstructionResult::Jump(read_scalar_jump_target(
+                    instruction,
+                    instruction_bytes,
+                    1,
+                    delta_width,
+                )))
+            } else {
+                Ok(ScalarInstructionResult::Continue)
+            }
+        }
         207..=214 => {
             let delta_width = if matches!(instruction.opcode, 208 | 210 | 212 | 214) {
                 4
@@ -4139,7 +4244,8 @@ fn read_scalar_string_operand<'a>(
 
 fn scalar_jump_delta_width(opcode: u8) -> usize {
     match opcode {
-        175 | 177 | 179 | 181 | 208 | 216 | 218 => 4,
+        175 | 177 | 179 | 181 | 184 | 186 | 188 | 190 | 192 | 194 | 196 | 198 | 200 | 202 | 204
+        | 206 | 208 | 210 | 212 | 214 | 216 | 218 => 4,
         _ => 1,
     }
 }
@@ -4193,6 +4299,36 @@ fn scalar_to_number(value: ScalarValue) -> f64 {
         ScalarValue::Empty | ScalarValue::Undefined => f64::NAN,
         ScalarValue::String(_) => f64::NAN,
         ScalarValue::Environment(_) | ScalarValue::Object(_) | ScalarValue::Function(_) => f64::NAN,
+    }
+}
+
+fn scalar_relational_jump_matches(opcode: u8, left: f64, right: f64) -> bool {
+    let relation = if left.is_nan() || right.is_nan() {
+        false
+    } else {
+        match opcode {
+            183 | 184 | 187 | 188 => left < right,
+            191 | 192 | 195 | 196 => left <= right,
+            199 | 200 => left > right,
+            203 | 204 => left >= right,
+            185 | 186 | 189 | 190 | 193 | 194 | 197 | 198 | 201 | 202 | 205 | 206 => match opcode {
+                185 | 186 | 189 | 190 => left < right,
+                193 | 194 | 197 | 198 => left <= right,
+                201 | 202 => left > right,
+                205 | 206 => left >= right,
+                _ => unreachable!("matched relational jump negation opcodes"),
+            },
+            _ => unreachable!("matched relational jump opcodes"),
+        }
+    };
+
+    if matches!(
+        opcode,
+        185 | 186 | 189 | 190 | 193 | 194 | 197 | 198 | 201 | 202 | 205 | 206
+    ) {
+        !relation
+    } else {
+        relation
     }
 }
 
@@ -5884,8 +6020,10 @@ fn iris_scalar_executor_supports_opcode(opcode: u8) -> bool {
             | 177
             | 178
             | 179
+            | 180
+            | 181
             | 182
-            | 209..=214
+            | 183..=214
     ) || scalar_common_constant(opcode).is_some()
 }
 
@@ -7983,6 +8121,9 @@ mod tests {
     const THROW_OPCODE: u8 = 121;
     const RET_OPCODE: u8 = 118;
     const JMP_TRUE_OPCODE: u8 = 176;
+    const J_LESS_OPCODE: u8 = 183;
+    const J_NOT_LESS_OPCODE: u8 = 185;
+    const J_GREATER_EQUAL_LONG_OPCODE: u8 = 204;
     const LOAD_CONST_UINT8_OPCODE: u8 = 139;
     const LOAD_CONST_INT_OPCODE: u8 = 140;
     const LOAD_CONST_DOUBLE_OPCODE: u8 = 141;
@@ -10034,6 +10175,108 @@ mod tests {
                 1,
             ],
         );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Boolean(true)),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_jumps_when_relational_less_matches() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                LOAD_CONST_UINT8_OPCODE,
+                0,
+                1,
+                LOAD_CONST_UINT8_OPCODE,
+                1,
+                2,
+                J_LESS_OPCODE,
+                8,
+                0,
+                1,
+                LOAD_CONST_FALSE_OPCODE,
+                2,
+                RET_OPCODE,
+                2,
+                LOAD_CONST_TRUE_OPCODE,
+                2,
+                RET_OPCODE,
+                2,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Boolean(true)),
+        );
+
+        let report = describe_hbc_execution_gap(&bytes).expect("valid execution gap report");
+        assert!(report.contains("supportedInstructions=7/7"));
+        assert!(report.contains("firstUnsupported=none"));
+    }
+
+    #[test]
+    fn scalar_executor_jumps_when_relational_not_less_matches_nan() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                LOAD_CONST_UNDEFINED_OPCODE,
+                0,
+                LOAD_CONST_UINT8_OPCODE,
+                1,
+                2,
+                J_NOT_LESS_OPCODE,
+                8,
+                0,
+                1,
+                LOAD_CONST_FALSE_OPCODE,
+                2,
+                RET_OPCODE,
+                2,
+                LOAD_CONST_TRUE_OPCODE,
+                2,
+                RET_OPCODE,
+                2,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Boolean(true)),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_jumps_when_relational_long_greater_equal_matches() {
+        let mut bytes = fixture_bytecode();
+        let mut body = vec![
+            LOAD_CONST_UINT8_OPCODE,
+            0,
+            2,
+            LOAD_CONST_UINT8_OPCODE,
+            1,
+            2,
+            J_GREATER_EQUAL_LONG_OPCODE,
+        ];
+        body.extend_from_slice(&11_i32.to_le_bytes());
+        body.extend_from_slice(&[
+            0,
+            1,
+            LOAD_CONST_FALSE_OPCODE,
+            2,
+            RET_OPCODE,
+            2,
+            LOAD_CONST_TRUE_OPCODE,
+            2,
+            RET_OPCODE,
+            2,
+        ]);
+        replace_global_body(&mut bytes, &body);
 
         assert_eq!(
             execute_global_scalar_function(&bytes),

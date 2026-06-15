@@ -42,9 +42,12 @@ export type BenchmarkMetadata = {
     version: string;
   };
   build: {
+    compiler?: string;
     commit: string;
     mode: "development" | "release" | "unknown";
     source: string;
+    sourceHash?: string;
+    transform?: string;
   };
   platform: {
     device: string;
@@ -58,7 +61,8 @@ export type BenchmarkMetadata = {
     fabric: boolean;
     hermes: boolean;
     hermesVersion: string;
-    jsEngine: "hermes" | "unknown";
+    jsEngine: "hermes" | "iris-qjs" | "quickjs" | "unknown";
+    runtimeBackend?: string;
     newArchitecture: boolean;
     turboModuleProxy: boolean;
   };

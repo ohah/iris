@@ -14,9 +14,11 @@ type RuntimeGlobals = typeof globalThis & {
 type RuntimeMetadataInput = {
   appVersion: string;
   device: string;
+  engineFlavor?: string;
   os: string;
   platformVersion: string;
   reactNativeVersion: string;
+  runtimeBackend?: string;
 };
 
 const runtime = globalThis as RuntimeGlobals;
@@ -35,7 +37,7 @@ export function createRuntimeMetadata(input: RuntimeMetadataInput): BenchmarkMet
     build: {
       commit: "unknown",
       mode: runtime.__DEV__ === true ? "development" : "release",
-      source: "runtime-not-embedded",
+      source: input.engineFlavor ?? "runtime-not-embedded",
     },
     platform: {
       device: input.device,
@@ -51,6 +53,7 @@ export function createRuntimeMetadata(input: RuntimeMetadataInput): BenchmarkMet
       hermesVersion,
       jsEngine: runtime.HermesInternal ? "hermes" : "unknown",
       newArchitecture: turboModuleProxy || fabric,
+      runtimeBackend: input.runtimeBackend,
       turboModuleProxy,
     },
   };

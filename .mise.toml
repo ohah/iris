@@ -78,6 +78,10 @@ run = "cd apps/rn-bench/android && ./gradlew :app:assembleHermesDebug -x lint -x
 description = "Build the React Native benchmark Android Hermes release APK locally"
 run = "cd apps/rn-bench/android && ./gradlew :app:assembleHermesRelease -x lint -x test"
 
+[tasks.rn-android-build-hermes-bridge-release]
+description = "Build the React Native benchmark Android Hermes plus Iris bridge release APK locally"
+run = "cd apps/rn-bench/android && ./gradlew :app:assembleHermesBridgeRelease -x lint -x test"
+
 [tasks.rn-android-build-iris-release]
 description = "Build the React Native benchmark Android Iris release APK with a real Iris engine artifact"
 run = "test -n \"$IRIS_ENGINE_AAR\" || { echo 'Set IRIS_ENGINE_AAR to a real Iris engine AAR before building irisRelease.' >&2; exit 1; }; cd apps/rn-bench/android && ./gradlew :app:assembleIrisRelease -PirisEngineAar=\"$IRIS_ENGINE_AAR\" -x lint -x test"
@@ -133,6 +137,22 @@ run = "bun run bench:js"
 description = "Run a short benchmark harness smoke test and write artifacts/bench/js-baseline-smoke.json"
 run = "bun run bench:smoke"
 
+[tasks.bench-qjs]
+description = "Run the host-side Iris QuickJS backend microbenchmark"
+run = "bun run bench:qjs"
+
+[tasks.bench-qjs-smoke]
+description = "Run a short host-side Iris QuickJS backend microbenchmark"
+run = "bun run bench:qjs:smoke"
+
+[tasks.bench-strict-hbc-engine-compare]
+description = "Run host-side strict Hermes bytecode engine comparison for Hermes and Iris"
+run = "bun run bench:strict-hbc-engine-compare"
+
+[tasks.bench-strict-hbc-engine-compare-smoke]
+description = "Run a short host-side strict Hermes bytecode engine comparison smoke test"
+run = "bun run bench:strict-hbc-engine-compare:smoke"
+
 [tasks.bench-android-release]
 description = "Build, install, run, and extract the Android physical release Hermes benchmark"
 depends = ["rn-android-build-release"]
@@ -142,6 +162,11 @@ run = "bun run bench:android-release"
 description = "Run three Android physical release Hermes benchmark iterations and write a summary"
 depends = ["rn-android-build-release"]
 run = "bun run bench:android-release:repeat"
+
+[tasks.bench-android-hermes-iris-bridge-local]
+description = "Build, install, run, and extract the Android physical Hermes plus Iris bridge benchmark"
+depends = ["rn-android-build-hermes-bridge-release"]
+run = "bun run bench:android-hermes-iris-bridge"
 
 [tasks.bench-android-engine-compare]
 description = "Run Android physical release benchmarks for Hermes and Iris engine APKs"
@@ -177,6 +202,11 @@ description = "Build, install, run, and extract the Android physical Iris HBC bo
 depends = ["rn-android-build-iris-release-local"]
 run = "bun run bench:android-iris-bootstrap"
 
+[tasks.bench-android-iris-qjs-local]
+description = "Build, install, run, and extract the Android physical Iris QuickJS backend microbenchmark"
+depends = ["rn-android-build-iris-release-local"]
+run = "bun run bench:android-iris-qjs"
+
 [tasks.bench-android-local-performance]
 description = "Build local Android release variants, measure Hermes release and Iris bootstrap, and write a combined no-ratio report"
 depends = ["rn-android-build-engine-comparison-local"]
@@ -185,6 +215,19 @@ run = "bun run bench:android-local-performance"
 [tasks.bench-android-local-performance-report]
 description = "Write a combined Android local performance report from existing Hermes and Iris summaries"
 run = "bun run bench:android-local-performance-report"
+
+[tasks.bench-android-runtime-lanes-local]
+description = "Measure current Android runtime comparison lanes and write the three-lane report"
+depends = [
+  "rn-android-build-release",
+  "rn-android-build-hermes-bridge-release",
+  "rn-android-build-iris-release-local",
+]
+run = "bun run bench:android-runtime-lanes-local"
+
+[tasks.bench-android-runtime-lanes-report]
+description = "Write the Android three-lane runtime comparison report from existing summaries"
+run = "bun run bench:android-runtime-lanes-report"
 
 [tasks.bench-extract-hermes]
 description = "Extract a Hermes app benchmark report from artifacts/bench/metro-hermes.log"

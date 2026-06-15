@@ -50,6 +50,7 @@ else
 fi
 
 TOOLCHAIN_BIN="$TOOLCHAIN_ROOT/$HOST_TAG/bin"
+TOOLCHAIN_SYSROOT="$TOOLCHAIN_ROOT/$HOST_TAG/sysroot"
 LLVM_AR="$TOOLCHAIN_BIN/llvm-ar"
 LLVM_RANLIB="$TOOLCHAIN_BIN/llvm-ranlib"
 
@@ -72,8 +73,8 @@ GENERATED_CXX_DIR="$GENERATED_DIR/cxxbridge"
 GENERATED_INCLUDE_DIR="$GENERATED_DIR/include/rust"
 mkdir -p "$GENERATED_CXX_DIR" "$GENERATED_INCLUDE_DIR"
 
-"$CXXBRIDGE" "$REPO_ROOT/crates/iris-hbc/src/lib.rs" -i iris_hbc.h -o "$GENERATED_CXX_DIR/iris_hbc.cc"
-"$CXXBRIDGE" "$REPO_ROOT/crates/iris-hbc/src/lib.rs" --header -o "$GENERATED_CXX_DIR/iris_hbc.h"
+"$CXXBRIDGE" "$REPO_ROOT/crates/iris-android/src/lib.rs" -i iris_android.h -o "$GENERATED_CXX_DIR/iris_android.cc"
+"$CXXBRIDGE" "$REPO_ROOT/crates/iris-android/src/lib.rs" --header -o "$GENERATED_CXX_DIR/iris_android.h"
 "$CXXBRIDGE" --header -o "$GENERATED_INCLUDE_DIR/cxx.h"
 
 installed_targets=$("$RUSTUP" target list --installed)
@@ -96,6 +97,7 @@ build_abi() {
   rust_target_env_lower=$(printf '%s' "$target" | tr '-' '_')
   cc="$TOOLCHAIN_BIN/${clang_prefix}${MIN_SDK}-clang"
   cxx="$TOOLCHAIN_BIN/${clang_prefix}${MIN_SDK}-clang++"
+  bindgen_clang_args="--target=${clang_prefix}${MIN_SDK} --sysroot=$TOOLCHAIN_SYSROOT"
 
   env \
     "AR_$rust_target_env=$LLVM_AR" \
@@ -104,13 +106,14 @@ build_abi() {
     "CC_$rust_target_env_lower=$cc" \
     "CXX_$rust_target_env=$cxx" \
     "CXX_$rust_target_env_lower=$cxx" \
+    "BINDGEN_EXTRA_CLANG_ARGS=$bindgen_clang_args" \
     "RANLIB_$rust_target_env=$LLVM_RANLIB" \
     "RANLIB_$rust_target_env_lower=$LLVM_RANLIB" \
     "CARGO_TARGET_${rust_target_env}_LINKER=$cc" \
-    cargo build --manifest-path "$REPO_ROOT/Cargo.toml" --package iris-hbc --release --target "$target"
+    cargo build --manifest-path "$REPO_ROOT/Cargo.toml" --package iris-android --release --target "$target"
 
   mkdir -p "$ANDROID_BUILD_DIR/rust/$abi"
-  cp "$REPO_ROOT/target/$target/release/libiris_hbc.a" "$ANDROID_BUILD_DIR/rust/$abi/libiris_hbc.a"
+  cp "$REPO_ROOT/target/$target/release/libiris_android.a" "$ANDROID_BUILD_DIR/rust/$abi/libiris_android.a"
 }
 
 build_abi arm64-v8a aarch64-linux-android aarch64-linux-android

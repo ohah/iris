@@ -5,8 +5,37 @@ const numberRoundTripsPerSample = 1_000;
 const irisNumericWorkloadIterations = 600_000;
 const stringRoundTripsPerSample = 500;
 
-export function createTurboModuleBenchmarkCases(
-  module: IrisBenchTurboModule | null,
+export type NativeModuleBoundaryTarget = Pick<
+  IrisBenchTurboModule,
+  "echoNumber" | "roundTripString" | "runIrisNumericWorkload"
+>;
+
+type NativeModuleBoundaryCaseOptions = {
+  descriptions: {
+    nativeCompute: string;
+    numberRoundTrip: string;
+    stringRoundTrip: string;
+  };
+  details: {
+    nativeCompute: string;
+    numberRoundTrip: string;
+    stringRoundTrip: string;
+  };
+  ids: {
+    nativeCompute: string;
+    numberRoundTrip: string;
+    stringRoundTrip: string;
+  };
+  labels: {
+    nativeCompute: string;
+    numberRoundTrip: string;
+    stringRoundTrip: string;
+  };
+};
+
+export function createNativeModuleBoundaryBenchmarkCases(
+  module: NativeModuleBoundaryTarget | null,
+  options: NativeModuleBoundaryCaseOptions,
 ): BenchmarkCase[] {
   if (!module) {
     return [];
@@ -14,9 +43,9 @@ export function createTurboModuleBenchmarkCases(
 
   return [
     {
-      description: "Synchronous JS to TurboModule number round trips on the Hermes baseline.",
-      id: "turbomodule-number-round-trip",
-      label: "TurboModule number",
+      description: options.descriptions.numberRoundTrip,
+      id: options.ids.numberRoundTrip,
+      label: options.labels.numberRoundTrip,
       measuredIterations: 20,
       run: () => {
         let checksum = 0;
@@ -27,16 +56,16 @@ export function createTurboModuleBenchmarkCases(
 
         return {
           checksum,
-          detail: `${numberRoundTripsPerSample} sync number round trips`,
+          detail: `${numberRoundTripsPerSample} ${options.details.numberRoundTrip}`,
         };
       },
       unit: "ms",
       warmupIterations: 5,
     },
     {
-      description: "Synchronous JS to TurboModule string round trips on the Hermes baseline.",
-      id: "turbomodule-string-round-trip",
-      label: "TurboModule string",
+      description: options.descriptions.stringRoundTrip,
+      id: options.ids.stringRoundTrip,
+      label: options.labels.stringRoundTrip,
       measuredIterations: 20,
       run: () => {
         let checksum = 0;
@@ -47,23 +76,50 @@ export function createTurboModuleBenchmarkCases(
 
         return {
           checksum,
-          detail: `${stringRoundTripsPerSample} sync string round trips`,
+          detail: `${stringRoundTripsPerSample} ${options.details.stringRoundTrip}`,
         };
       },
       unit: "ms",
       warmupIterations: 5,
     },
     {
-      description: "Single synchronous call into the Iris native module probe workload.",
-      id: "iris-module-native-compute",
-      label: "Iris module compute",
+      description: options.descriptions.nativeCompute,
+      id: options.ids.nativeCompute,
+      label: options.labels.nativeCompute,
       measuredIterations: 15,
       run: () => ({
         checksum: module.runIrisNumericWorkload(irisNumericWorkloadIterations),
-        detail: `${irisNumericWorkloadIterations} native math operations`,
+        detail: `${irisNumericWorkloadIterations} ${options.details.nativeCompute}`,
       }),
       unit: "ms",
       warmupIterations: 3,
     },
   ];
+}
+
+export function createTurboModuleBenchmarkCases(
+  module: IrisBenchTurboModule | null,
+): BenchmarkCase[] {
+  return createNativeModuleBoundaryBenchmarkCases(module, {
+    descriptions: {
+      nativeCompute: "Single synchronous call into the Iris native module probe workload.",
+      numberRoundTrip: "Synchronous JS to TurboModule number round trips on the Hermes baseline.",
+      stringRoundTrip: "Synchronous JS to TurboModule string round trips on the Hermes baseline.",
+    },
+    details: {
+      nativeCompute: "native math operations",
+      numberRoundTrip: "sync number round trips",
+      stringRoundTrip: "sync string round trips",
+    },
+    ids: {
+      nativeCompute: "iris-module-native-compute",
+      numberRoundTrip: "turbomodule-number-round-trip",
+      stringRoundTrip: "turbomodule-string-round-trip",
+    },
+    labels: {
+      nativeCompute: "Iris module compute",
+      numberRoundTrip: "TurboModule number",
+      stringRoundTrip: "TurboModule string",
+    },
+  });
 }

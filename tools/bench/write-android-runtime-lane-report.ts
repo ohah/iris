@@ -37,6 +37,8 @@ type RepeatedBenchmarkSummary = {
   };
 };
 
+type BridgeComparisonClass = "format-shift-diagnostic" | "same-method-surface" | "same-payload";
+
 type LaneMeasurement = {
   cases: Array<{
     id: string;
@@ -57,6 +59,7 @@ type RuntimeLaneReport = {
   bridgeComparisons: Array<{
     cases: Array<{
       candidateId: string;
+      comparisonClass: BridgeComparisonClass;
       label: string;
       p50: {
         candidate: number;
@@ -278,45 +281,58 @@ function compareBridgeFastPath(
   const casePairs = [
     {
       candidateId: "iris-jsi-number-round-trip",
+      comparisonClass: "same-payload",
       label: "number round trip",
       referenceId: "turbomodule-number-round-trip",
     },
     {
       candidateId: "iris-jsi-string-round-trip",
+      comparisonClass: "same-payload",
       label: "string round trip",
       referenceId: "turbomodule-string-round-trip",
     },
     {
       candidateId: "iris-jsi-native-compute",
+      comparisonClass: "same-payload",
       label: "native compute",
       referenceId: "iris-module-native-compute",
     },
     {
       candidateId: "iris-jsi-facade-number-round-trip",
+      comparisonClass: "same-method-surface",
       label: "same method facade number",
       referenceId: "turbomodule-number-round-trip",
     },
     {
       candidateId: "iris-jsi-facade-string-round-trip",
+      comparisonClass: "same-method-surface",
       label: "same method facade string",
       referenceId: "turbomodule-string-round-trip",
     },
     {
       candidateId: "iris-jsi-facade-native-compute",
+      comparisonClass: "same-method-surface",
       label: "same method facade compute",
       referenceId: "iris-module-native-compute",
     },
     {
       candidateId: "iris-jsi-columnar-object-traversal",
+      comparisonClass: "format-shift-diagnostic",
       label: "columnar object traversal",
       referenceId: "object-traversal",
     },
     {
       candidateId: "iris-jsi-native-buffer-read",
+      comparisonClass: "format-shift-diagnostic",
       label: "native buffer handoff",
       referenceId: "typed-array-copy",
     },
-  ];
+  ] satisfies Array<{
+    candidateId: string;
+    comparisonClass: BridgeComparisonClass;
+    label: string;
+    referenceId: string;
+  }>;
   const casesById = new Map(
     lane.measurement.cases.map((benchmarkCase) => [benchmarkCase.id, benchmarkCase]),
   );
@@ -337,6 +353,7 @@ function compareBridgeFastPath(
     return [
       {
         candidateId: casePair.candidateId,
+        comparisonClass: casePair.comparisonClass,
         label: casePair.label,
         p50: {
           candidate: candidateCase.p50Mean,
@@ -425,7 +442,7 @@ for (const comparison of report.bridgeComparisons) {
   console.log(`${comparison.laneId}: JSI fast path over reference`);
   for (const benchmarkCase of comparison.cases) {
     console.log(
-      `${benchmarkCase.label}: p50=${benchmarkCase.p50.candidateOverReference}x p95=${benchmarkCase.p95.candidateOverReference}x`,
+      `${benchmarkCase.label} [${benchmarkCase.comparisonClass}]: p50=${benchmarkCase.p50.candidateOverReference}x p95=${benchmarkCase.p95.candidateOverReference}x`,
     );
   }
 }

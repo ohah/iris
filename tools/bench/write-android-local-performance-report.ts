@@ -213,7 +213,7 @@ const report: LocalPerformanceReport = {
   comparability: {
     ratioAllowed: false,
     reason:
-      "Hermes release measures the RN JS benchmark suite; local Iris currently measures native HBC bootstrap/frontier plus native mirror probes. Strict engine ratios are allowed only after both engines emit the same suite and case set from JavaScript execution.",
+      "Hermes release measures the RN JS benchmark suite; local Iris currently measures native HBC bootstrap/scalar execution plus native mirror probes. Strict engine ratios are allowed only after both engines emit the same suite and case set from JavaScript execution.",
   },
   createdAt: new Date().toISOString(),
   generatedBy: "tools/bench/write-android-local-performance-report.ts",

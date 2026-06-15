@@ -79,8 +79,8 @@ mise run check
 - `bench-android-iris-hbc-gap-local`은 로컬 skeleton Iris release HBC bundle을 빌드한 뒤 현재 Iris scalar executor coverage와 첫 미지원 opcode를 출력한다.
 - `bench-android-iris-hbc-exec-local`은 같은 HBC bundle을 Rust scalar executor subset으로 실행해 완료 여부를 출력한다.
 - `bench-android-iris-hbc-trace-local`은 같은 HBC bundle을 실행하며 완료 trace 또는 첫 semantic frontier trace를 출력한다.
-- `bench-android-iris-bootstrap-local`은 로컬 skeleton Iris release APK를 물리 기기에서 실행하고 Iris native bootstrap artifact를 추출한다. 현재 측정 범위는 HBC metadata parse, static coverage scan, scalar execution frontier이며 RN JS workload 비교값은 아니다.
-- `bench-android-local-performance`는 로컬 skeleton 기준 Hermes release JS 기준선과 Iris native bootstrap/frontier/native mirror 측정을 연속 실행하고 `android-local-performance-report.json`을 생성한다. strict engine ratio는 기록하지 않고, case별 native mirror ratio만 `strictComparable=false`로 기록한다.
+- `bench-android-iris-bootstrap-local`은 로컬 skeleton Iris release APK를 물리 기기에서 실행하고 Iris native bootstrap artifact를 추출한다. 현재 측정 범위는 HBC metadata parse, static coverage scan, relaxed scalar execution이며 RN JS workload 비교값은 아니다.
+- `bench-android-local-performance`는 로컬 skeleton 기준 Hermes release JS 기준선과 Iris native bootstrap/scalar execution/native mirror 측정을 연속 실행하고 `android-local-performance-report.json`을 생성한다. strict engine ratio는 기록하지 않고, case별 native mirror ratio만 `strictComparable=false`로 기록한다.
 - `bench-android-local-performance-report`는 이미 생성된 Hermes/Iris summary에서 같은 리포트만 다시 생성한다.
 - `bench-extract-hermes-release`는 release, Hermes, New Architecture, Iris module compute, TurboModule 경계 case를 모두 요구한다.
 - 벤치마크 하네스는 `mise run bench-*` 명령으로 로컬에서만 실행한다. 아직 CI 필수 체크에는 넣지 않는다.

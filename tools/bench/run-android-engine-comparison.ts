@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
+import { strictRnBenchmarkCaseIds, strictRnBenchmarkSuite } from "./strict-rn-benchmark-contract";
 
 const root = resolve(import.meta.dir, "../..");
 const defaultRuns = 3;
@@ -35,6 +36,7 @@ type HbcBundleInput = {
 
 type RepeatedBenchmarkSummary = {
   cases: Array<{
+    checksum: number | string;
     id: string;
     label: string;
     p50: {
@@ -57,6 +59,11 @@ type RepeatedBenchmarkSummary = {
 
 type EngineComparison = {
   cases: Array<{
+    checksum: {
+      hermes: number | string;
+      iris: number | string;
+      matches: true;
+    };
     id: string;
     label: string;
     p50: {
@@ -413,6 +420,8 @@ function runEngineBenchmark(engine: EngineConfig, runs: number, waitMs: number, 
     `--session=${engine.session}`,
     `--runs=${runs}`,
     `--wait-ms=${waitMs}`,
+    `--suite-id=${strictRnBenchmarkSuite.id}`,
+    ...strictRnBenchmarkCaseIds.map((caseId) => `--require-case=${caseId}`),
   ];
 
   if (engine.allowNonHermes) {
@@ -435,6 +444,37 @@ function caseList(cases: Array<{ id: string }>) {
     .map((benchmarkCase) => benchmarkCase.id)
     .sort()
     .join(", ");
+}
+
+function checksumKey(checksum: number | string) {
+  return `${typeof checksum}:${JSON.stringify(checksum)}`;
+}
+
+function assertChecksumPresent(
+  engine: EngineConfig,
+  benchmarkCase: { checksum: unknown; id: string },
+) {
+  if (typeof benchmarkCase.checksum !== "number" && typeof benchmarkCase.checksum !== "string") {
+    throw new Error(
+      `${engine.label} summary case ${benchmarkCase.id} is missing a checksum. ` +
+        "Regenerate it with the current Android benchmark runner before strict engine comparison.",
+    );
+  }
+}
+
+function assertStrictRnCaseSet(summary: RepeatedBenchmarkSummary) {
+  const actualCaseIds = summary.cases.map((benchmarkCase) => benchmarkCase.id).sort();
+  const expectedCaseIds = [...strictRnBenchmarkCaseIds].sort();
+  const missingCases = expectedCaseIds.filter((caseId) => !actualCaseIds.includes(caseId));
+  const extraCases = actualCaseIds.filter((caseId) => !expectedCaseIds.includes(caseId));
+
+  if (missingCases.length > 0 || extraCases.length > 0) {
+    throw new Error(
+      "Strict RN engine comparison requires the exact benchmark case contract.\n" +
+        `expected: ${expectedCaseIds.join(", ")}\n` +
+        `actual: ${actualCaseIds.join(", ")}`,
+    );
+  }
 }
 
 function assertComparableSummaries(
@@ -468,6 +508,19 @@ function assertComparableSummaries(
     );
   }
 
+  if (
+    hermesSummary.suite.id !== strictRnBenchmarkSuite.id ||
+    irisSummary.suite.id !== strictRnBenchmarkSuite.id
+  ) {
+    throw new Error(
+      `Strict RN engine comparison requires ${strictRnBenchmarkSuite.id}; ` +
+        `hermes=${hermesSummary.suite.id} iris=${irisSummary.suite.id}`,
+    );
+  }
+
+  assertStrictRnCaseSet(hermesSummary);
+  assertStrictRnCaseSet(irisSummary);
+
   const hermesCases = new Map(
     hermesSummary.cases.map((benchmarkCase) => [benchmarkCase.id, benchmarkCase]),
   );
@@ -496,9 +549,19 @@ function assertComparableSummaries(
       throw new Error(`Iris summary is missing case ${hermesCase.id}.`);
     }
 
+    assertChecksumPresent(engines[0], hermesCase);
+    assertChecksumPresent(engines[1], irisCase);
+
     if (hermesCase.unit !== irisCase.unit) {
       throw new Error(
         `Hermes/Iris units differ for ${hermesCase.id}: hermes=${hermesCase.unit} iris=${irisCase.unit}`,
+      );
+    }
+
+    if (checksumKey(hermesCase.checksum) !== checksumKey(irisCase.checksum)) {
+      throw new Error(
+        `Hermes/Iris checksums differ for ${hermesCase.id}: ` +
+          `hermes=${JSON.stringify(hermesCase.checksum)} iris=${JSON.stringify(irisCase.checksum)}`,
       );
     }
   }
@@ -524,6 +587,11 @@ function compareSummaries(
     }
 
     return {
+      checksum: {
+        hermes: hermesCase.checksum,
+        iris: irisCase.checksum,
+        matches: true,
+      },
       id: hermesCase.id,
       label: hermesCase.label,
       p50: {

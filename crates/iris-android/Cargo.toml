@@ -1,0 +1,24 @@
+[package]
+name = "iris-android"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+cxx.workspace = true
+iris-hbc.workspace = true
+iris-qjs.workspace = true
+
+[lints.rust]
+missing_docs = "warn"
+# cxx::bridge generates the unsafe FFI glue; handwritten wrapper code stays safe.
+unsafe_code = "allow"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

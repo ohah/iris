@@ -20,6 +20,13 @@ function readArg(name: string) {
   return process.argv.find((arg) => arg.startsWith(prefix))?.slice(prefix.length);
 }
 
+function readArgs(name: string) {
+  const prefix = `${name}=`;
+  return process.argv
+    .filter((arg) => arg.startsWith(prefix))
+    .map((arg) => arg.slice(prefix.length));
+}
+
 function readNumberArg(name: string, fallback: number) {
   const rawValue = readArg(name);
   if (rawValue == null) {
@@ -50,6 +57,8 @@ const runs = readNumberArg("--runs", 1);
 const allowNonHermes = hasArg("--allow-non-hermes");
 const keepSession = hasArg("--keep-session");
 const nativeBootstrapArtifact = hasArg("--native-bootstrap-artifact");
+const suiteIds = readArgs("--suite-id");
+const requiredCases = readArgs("--require-case");
 
 type AgentJson<T> = {
   data: T;
@@ -236,6 +245,26 @@ function summarizeMetric(samples: number[]): CaseMetricSummary {
 }
 
 function extractBenchmarkReport(inputLogPath: string, outputReportPath: string) {
+  const selectedSuiteIds =
+    suiteIds.length > 0
+      ? suiteIds
+      : nativeBootstrapArtifact
+        ? ["iris-engine-bootstrap"]
+        : ["rn-hermes-js-baseline"];
+  const selectedRequiredCases =
+    requiredCases.length > 0
+      ? requiredCases
+      : nativeBootstrapArtifact
+        ? [
+            "iris-hbc-metadata-parse",
+            "iris-hbc-static-coverage-scan",
+            "iris-hbc-scalar-execution-frontier",
+          ]
+        : [
+            "iris-module-native-compute",
+            "turbomodule-number-round-trip",
+            "turbomodule-string-round-trip",
+          ];
   const extractionArgs = [
     "run",
     "tools/bench/extract-hermes-report.ts",
@@ -243,23 +272,12 @@ function extractBenchmarkReport(inputLogPath: string, outputReportPath: string) 
     `--output=${outputReportPath}`,
     ...(allowNonHermes ? ["--allow-non-hermes"] : []),
     "--require-release",
+    ...selectedSuiteIds.map((suiteId) => `--suite-id=${suiteId}`),
+    ...selectedRequiredCases.map((caseId) => `--require-case=${caseId}`),
   ];
 
-  if (nativeBootstrapArtifact) {
-    extractionArgs.push(
-      "--suite-id=iris-engine-bootstrap",
-      "--require-case=iris-hbc-metadata-parse",
-      "--require-case=iris-hbc-static-coverage-scan",
-      "--require-case=iris-hbc-scalar-execution-frontier",
-    );
-  } else {
-    extractionArgs.push(
-      "--suite-id=rn-hermes-js-baseline",
-      "--require-new-architecture",
-      "--require-case=iris-module-native-compute",
-      "--require-case=turbomodule-number-round-trip",
-      "--require-case=turbomodule-string-round-trip",
-    );
+  if (!nativeBootstrapArtifact) {
+    extractionArgs.push("--require-new-architecture");
   }
 
   runPassthrough("bun", extractionArgs);

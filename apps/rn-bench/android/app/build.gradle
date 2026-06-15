@@ -46,7 +46,7 @@ react {
     /* Hermes Commands */
     //   The hermes compiler command to run. By default it is 'hermesc'
     hermesCommand = file("../../node_modules/hermes-compiler/hermesc/%OS-BIN%/hermesc").absolutePath
-    enableHermesOnlyInVariants = ["hermesDebug", "hermesDebugOptimized", "hermesRelease", "irisRelease"]
+    enableHermesOnlyInVariants = ["hermesDebug", "hermesDebugOptimized", "hermesRelease", "hermesBridgeDebug", "hermesBridgeDebugOptimized", "hermesBridgeRelease", "irisRelease"]
     //
     //   The list of flags to pass to the Hermes compiler. By default is "-O", "-output-source-map"
     // hermesFlags = ["-O", "-output-source-map"]
@@ -99,6 +99,16 @@ android {
             manifestPlaceholders["mainApplicationName"] = "com.iris.bench.hermes.MainApplication"
             manifestPlaceholders["mainActivityName"] = "com.iris.bench.hermes.MainActivity"
             buildConfigField "String", "IRIS_ENGINE_FLAVOR", "\"hermes\""
+            buildConfigField "String", "IRIS_RUNTIME_BACKEND", "\"rn-hermes\""
+        }
+        hermesBridge {
+            dimension "engine"
+            applicationId "com.iris.bench.hermesbridge"
+            manifestPlaceholders["appLabel"] = "IrisBench Hermes Bridge"
+            manifestPlaceholders["mainApplicationName"] = "com.iris.bench.hermesbridge.MainApplication"
+            manifestPlaceholders["mainActivityName"] = "com.iris.bench.hermesbridge.MainActivity"
+            buildConfigField "String", "IRIS_ENGINE_FLAVOR", "\"hermes-iris-bridge\""
+            buildConfigField "String", "IRIS_RUNTIME_BACKEND", "\"iris-hermes-jsi-bridge\""
         }
         iris {
             dimension "engine"
@@ -107,6 +117,7 @@ android {
             manifestPlaceholders["mainApplicationName"] = "com.iris.bench.iris.MainApplication"
             manifestPlaceholders["mainActivityName"] = "com.iris.bench.iris.MainActivity"
             buildConfigField "String", "IRIS_ENGINE_FLAVOR", "\"iris\""
+            buildConfigField "String", "IRIS_RUNTIME_BACKEND", "\"iris-qjs\""
         }
     }
     signingConfigs {
@@ -135,6 +146,8 @@ dependencies {
     // The version of react-native is set by the React Native Gradle Plugin
     implementation("com.facebook.react:react-android")
     hermesImplementation("com.facebook.react:hermes-android")
+    hermesBridgeImplementation("com.facebook.react:hermes-android")
+    hermesBridgeImplementation(project(":iris-bridge"))
 
     if (irisEngineAar.isPresent()) {
         def irisEngineAarFile = file(irisEngineAar.get())

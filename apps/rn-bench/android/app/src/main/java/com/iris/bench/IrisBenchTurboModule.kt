@@ -14,7 +14,11 @@ class IrisBenchTurboModule(reactContext: ReactApplicationContext) :
 
   @DoNotStrip override fun echoNumber(value: Double): Double = value
 
+  @DoNotStrip override fun getEngineFlavor(): String = BuildConfig.IRIS_ENGINE_FLAVOR
+
   @DoNotStrip override fun getIrisRuntimeLabel(): String = "iris-android-module"
+
+  @DoNotStrip override fun getRuntimeBackend(): String = BuildConfig.IRIS_RUNTIME_BACKEND
 
   @DoNotStrip override fun getRuntimeLabel(): String = "android-turbomodule"
 

@@ -1,6 +1,6 @@
 #include "IrisRuntime.h"
 #include "rust/cxx.h"
-#include "iris_hbc.h"
+#include "iris_android.h"
 
 #include <android/log.h>
 
@@ -346,6 +346,23 @@ NativeMeasuredCase measureNativeMirrorCase(
       std::accumulate(samples.begin(), samples.end(), 0.0)};
 }
 
+void emitBenchmarkArtifactChunks(const std::string& artifactText) {
+  constexpr size_t logChunkSize = 800;
+  const auto chunkCount =
+      (artifactText.size() + logChunkSize - 1) / logChunkSize;
+  for (size_t index = 0; index < chunkCount; ++index) {
+    const auto offset = index * logChunkSize;
+    const auto chunk = artifactText.substr(offset, logChunkSize);
+    __android_log_print(
+        ANDROID_LOG_INFO,
+        "IrisEngine",
+        "IRIS_BENCHMARK_ARTIFACT_CHUNK %zu/%zu %s",
+        index + 1,
+        chunkCount,
+        chunk.c_str());
+  }
+}
+
 } // namespace
 
 IrisRuntime::IrisPreparedJavaScript::IrisPreparedJavaScript(
@@ -484,7 +501,7 @@ IrisRuntime::HermesBytecodeMetadata IrisRuntime::validateHermesBytecodeBuffer(
 
   try {
     const auto hbcBytes = rust::Slice<const uint8_t>(data, size);
-    const auto metadata = iris::hbc::parse_hbc_metadata(hbcBytes);
+    const auto metadata = iris::android::parse_hbc_metadata(hbcBytes);
     return HermesBytecodeMetadata{
         metadata.version,
         metadata.file_length,
@@ -583,31 +600,31 @@ void IrisRuntime::emitBootstrapBenchmarkArtifact(
 
   try {
     for (size_t index = 0; index < warmupIterations; ++index) {
-      (void)iris::hbc::parse_hbc_metadata(hbcBytes);
+      (void)iris::android::parse_hbc_metadata(hbcBytes);
     }
     for (size_t index = 0; index < metadataIterations; ++index) {
       const auto start = std::chrono::steady_clock::now();
-      (void)iris::hbc::parse_hbc_metadata(hbcBytes);
+      (void)iris::android::parse_hbc_metadata(hbcBytes);
       metadataSamples.push_back(elapsedMilliseconds(start));
     }
 
     for (size_t index = 0; index < coverageWarmupIterations; ++index) {
-      (void)iris::hbc::describe_hbc_execution_gap(hbcBytes);
+      (void)iris::android::describe_hbc_execution_gap(hbcBytes);
     }
     for (size_t index = 0; index < coverageIterations; ++index) {
       const auto start = std::chrono::steady_clock::now();
       coverageDetail =
-          std::string(iris::hbc::describe_hbc_execution_gap(hbcBytes));
+          std::string(iris::android::describe_hbc_execution_gap(hbcBytes));
       coverageSamples.push_back(elapsedMilliseconds(start));
     }
 
     for (size_t index = 0; index < executionWarmupIterations; ++index) {
-      (void)iris::hbc::describe_hbc_scalar_execution(hbcBytes);
+      (void)iris::android::describe_hbc_scalar_execution(hbcBytes);
     }
     for (size_t index = 0; index < executionIterations; ++index) {
       const auto start = std::chrono::steady_clock::now();
       executionDetail =
-          std::string(iris::hbc::describe_hbc_scalar_execution(hbcBytes));
+          std::string(iris::android::describe_hbc_scalar_execution(hbcBytes));
       executionSamples.push_back(elapsedMilliseconds(start));
     }
   } catch (const rust::Error& error) {
@@ -748,21 +765,7 @@ void IrisRuntime::emitBootstrapBenchmarkArtifact(
            << ",\"measuredIterations\":" << totalMeasuredIterations
            << ",\"totalElapsedMs\":" << formatDouble(totalElapsedMs) << "}}";
 
-  const auto artifactText = artifact.str();
-  constexpr size_t logChunkSize = 800;
-  const auto chunkCount =
-      (artifactText.size() + logChunkSize - 1) / logChunkSize;
-  for (size_t index = 0; index < chunkCount; ++index) {
-    const auto offset = index * logChunkSize;
-    const auto chunk = artifactText.substr(offset, logChunkSize);
-    __android_log_print(
-        ANDROID_LOG_INFO,
-        "IrisEngine",
-        "IRIS_BENCHMARK_ARTIFACT_CHUNK %zu/%zu %s",
-        index + 1,
-        chunkCount,
-        chunk.c_str());
-  }
+  emitBenchmarkArtifactChunks(artifact.str());
   __android_log_print(
       ANDROID_LOG_WARN,
       "IrisEngine",
@@ -771,11 +774,39 @@ void IrisRuntime::emitBootstrapBenchmarkArtifact(
       sourceURL.c_str());
 }
 
+void IrisRuntime::emitQuickJsBenchmarkArtifact() {
+  if (emittedQuickJsBenchmarkArtifact_) {
+    return;
+  }
+  emittedQuickJsBenchmarkArtifact_ = true;
+
+  try {
+    const auto artifactText = std::string(iris::android::run_quickjs_benchmark_json(
+        "logcat:IrisEngine",
+        "unknown",
+        "android-physical",
+        "release",
+        "native-iris-qjs-runtime",
+        1,
+        3));
+    emitBenchmarkArtifactChunks(artifactText);
+    __android_log_print(
+        ANDROID_LOG_WARN,
+        "IrisEngine",
+        "Iris emitted QuickJS backend microbenchmark. This is not yet an RN strict engine comparison because JSI/Fabric/TurboModule execution still does not run through QuickJS.");
+  } catch (const rust::Error& error) {
+    abortBundleContractViolation(
+        std::string("Iris QuickJS backend benchmark failed: ") +
+        error.what());
+  }
+}
+
 jsi::Value IrisRuntime::evaluateJavaScript(
     const std::shared_ptr<const jsi::Buffer>& buffer,
     const std::string& sourceURL) {
   auto metadata = validateHermesBytecodeBuffer(buffer, sourceURL);
   emitBootstrapBenchmarkArtifact(buffer, metadata, sourceURL);
+  emitQuickJsBenchmarkArtifact();
   return jsi::Value::undefined();
 }
 
@@ -797,6 +828,7 @@ jsi::Value IrisRuntime::evaluatePreparedJavaScript(
   }
   emitBootstrapBenchmarkArtifact(
       prepared->buffer, prepared->metadata, prepared->sourceURL);
+  emitQuickJsBenchmarkArtifact();
   return jsi::Value::undefined();
 }
 

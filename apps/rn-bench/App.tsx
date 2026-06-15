@@ -16,9 +16,11 @@ import {
   type RenderStressRow,
 } from "./src/benchmarks/cases";
 import { runBenchmarkSuite } from "./src/benchmarks/harness";
+import { createIrisBridgeBenchmarkCases } from "./src/benchmarks/irisBridgeCases";
 import { createRuntimeMetadata } from "./src/benchmarks/metadata";
 import { createTurboModuleBenchmarkCases } from "./src/benchmarks/turboModuleCases";
 import type { BenchmarkCaseReport, BenchmarkSuiteReport } from "./src/benchmarks/types";
+import { getIrisBridgeTurboModule } from "./src/native/IrisBridgeTurboModule";
 import {
   getIrisBenchTurboModule,
   isIrisBenchTurboModuleAvailable,
@@ -37,6 +39,9 @@ type PlatformConstants = typeof Platform.constants & {
 };
 
 const platformConstants = Platform.constants as PlatformConstants;
+const benchmarkArtifactMarker = "IRIS_BENCHMARK_ARTIFACT";
+const benchmarkArtifactChunkMarker = "IRIS_BENCHMARK_ARTIFACT_CHUNK";
+const benchmarkArtifactChunkSize = 900;
 
 function formatReactNativeVersion() {
   const version = platformConstants.reactNativeVersion;
@@ -58,6 +63,24 @@ function readDeviceName() {
   );
 }
 
+function logBenchmarkArtifact(report: BenchmarkSuiteReport) {
+  const payload = JSON.stringify(report);
+
+  if (payload.length <= benchmarkArtifactChunkSize) {
+    console.log(`${benchmarkArtifactMarker} ${payload}`);
+    return;
+  }
+
+  const chunks = [];
+  for (let index = 0; index < payload.length; index += benchmarkArtifactChunkSize) {
+    chunks.push(payload.slice(index, index + benchmarkArtifactChunkSize));
+  }
+
+  chunks.forEach((chunk, index) => {
+    console.log(`${benchmarkArtifactChunkMarker} ${index + 1}/${chunks.length} ${chunk}`);
+  });
+}
+
 function App() {
   const isDarkMode = useColorScheme() === "dark";
 
@@ -75,20 +98,27 @@ function BenchmarkScreen() {
   const [isRunning, setIsRunning] = useState(false);
   const rows = useMemo(() => createRenderStressRows(itemCount), [itemCount]);
   const nativeModule = useMemo(() => getIrisBenchTurboModule(), []);
+  const bridgeModule = useMemo(() => getIrisBridgeTurboModule(), []);
   const appBenchmarkCases = useMemo(
-    () => [...benchmarkCases, ...createTurboModuleBenchmarkCases(nativeModule)],
-    [nativeModule],
+    () => [
+      ...benchmarkCases,
+      ...createTurboModuleBenchmarkCases(nativeModule),
+      ...createIrisBridgeBenchmarkCases(bridgeModule),
+    ],
+    [bridgeModule, nativeModule],
   );
   const metadata = useMemo(
     () =>
       createRuntimeMetadata({
         appVersion: "0.0.1",
         device: readDeviceName(),
+        engineFlavor: nativeModule?.getEngineFlavor(),
         os: Platform.OS,
         platformVersion: String(Platform.Version),
         reactNativeVersion: formatReactNativeVersion(),
+        runtimeBackend: nativeModule?.getRuntimeBackend(),
       }),
-    [],
+    [nativeModule],
   );
   const runtimeCards = [
     {
@@ -111,6 +141,14 @@ function BenchmarkScreen() {
           : "not detected",
     },
     {
+      label: "Backend",
+      value: metadata.runtime.runtimeBackend ?? "unknown",
+    },
+    {
+      label: "Iris bridge",
+      value: bridgeModule?.getRuntimeLabel() ?? "not installed",
+    },
+    {
       label: "Rows",
       value: itemCount.toLocaleString(),
     },
@@ -127,7 +165,7 @@ function BenchmarkScreen() {
       const nextReport = await runBenchmarkSuite(appBenchmarkCases, metadata, {
         yieldBetweenCases: true,
       });
-      console.log("IRIS_BENCHMARK_ARTIFACT", JSON.stringify(nextReport));
+      logBenchmarkArtifact(nextReport);
       setReport(nextReport);
     } finally {
       setIsRunning(false);

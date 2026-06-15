@@ -1,5 +1,11 @@
 [workspace]
-members = ["crates/iris-core", "crates/iris-hbc", "crates/iris-jsi", "crates/iris-qjs"]
+members = [
+  "crates/iris-android",
+  "crates/iris-core",
+  "crates/iris-hbc",
+  "crates/iris-jsi",
+  "crates/iris-qjs",
+]
 resolver = "3"
 
 [workspace.package]
@@ -20,4 +26,9 @@ pedantic = "warn"
 [workspace.dependencies]
 cxx = "1.0.194"
 iris-core = { path = "crates/iris-core" }
+iris-android = { path = "crates/iris-android" }
 iris-hbc = { path = "crates/iris-hbc" }
+iris-qjs = { path = "crates/iris-qjs" }
+rquickjs = { version = "0.12.0", features = ["bindgen"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"

@@ -398,6 +398,28 @@ function openApp() {
   }
 }
 
+function copySessionLog(outputPath: string) {
+  try {
+    const logPathOutput = runAgent([
+      "logs",
+      "path",
+      "--session",
+      session,
+      "--platform",
+      "android",
+      "--json",
+    ]);
+    const logPathResult = parseJsonOutput<AgentJson<LogPathInfo>>(logPathOutput);
+    copyFileSync(logPathResult.data.path, outputPath);
+    return;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`Falling back to adb logcat dump because session log copy failed: ${message}`);
+  }
+
+  writeFileSync(outputPath, readCommand("adb", ["logcat", "-d", "-v", "time"]));
+}
+
 function runBenchmarkIteration(runIndex: number) {
   const nextLogPath = runs === 1 ? logPath : pathWithRunIndex(logPath, runIndex);
   const nextReportPath = runs === 1 ? reportPath : pathWithRunIndex(reportPath, runIndex);
@@ -416,7 +438,23 @@ function runBenchmarkIteration(runIndex: number) {
     };
   }
 
-  runAgent(["wait", 'label="Run suite"', "10000", "--session", session, "--platform", "android"]);
+  try {
+    runAgent(["wait", 'label="Run suite"', "10000", "--session", session, "--platform", "android"]);
+  } catch (error) {
+    try {
+      copySessionLog(nextLogPath);
+      console.warn(`Copied startup failure log to ${nextLogPath}`);
+    } catch (copyError) {
+      const message = copyError instanceof Error ? copyError.message : String(copyError);
+      console.warn(`Unable to copy startup failure log: ${message}`);
+    }
+
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `Benchmark app did not expose the Run suite control before measurement. ` +
+        `This usually means the runtime did not finish RN JS startup. ${message}`,
+    );
+  }
   runAgent(["logs", "clear", "--restart", "--session", session, "--platform", "android"]);
   runAgent([
     "logs",
@@ -429,19 +467,8 @@ function runBenchmarkIteration(runIndex: number) {
   ]);
   runAgent(["press", 'label="Run suite"', "--session", session, "--platform", "android"]);
   sleep(waitMs);
-  runAgent(["wait", 'label="Run suite"', "10000", "--session", session, "--platform", "android"]);
 
-  const logPathOutput = runAgent([
-    "logs",
-    "path",
-    "--session",
-    session,
-    "--platform",
-    "android",
-    "--json",
-  ]);
-  const logPathResult = parseJsonOutput<AgentJson<LogPathInfo>>(logPathOutput);
-  copyFileSync(logPathResult.data.path, nextLogPath);
+  copySessionLog(nextLogPath);
 
   return {
     report: extractBenchmarkReport(nextLogPath, nextReportPath),

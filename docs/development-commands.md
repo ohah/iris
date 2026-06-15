@@ -75,6 +75,7 @@ mise run check
 - `bench-android-engine-compare-check`는 측정 전 Hermes/Iris APK 존재, APK runtime boundary, generated-vs-packaged HBC 일치, Hermes/Iris packaged HBC bytecode parity를 확인한다.
 - `bench-android-engine-compare-local-check`는 로컬 skeleton APK까지 빌드한 뒤 같은 preflight만 실행한다.
 - `bench-android-engine-compare`는 Hermes/Iris release APK를 같은 물리 기기에서 순서대로 측정한다.
+- Android strict 측정에서 앱이 `Run suite` UI까지 도달하지 못하면 runner는 실패시키되 지정된 `--log-output`에 startup log를 남긴다. 이 실패는 성능 열위가 아니라 RN JS startup/runtime compatibility blocker다.
 - `bench-android-iris-hbc-gap-local`은 로컬 skeleton Iris release HBC bundle을 빌드한 뒤 현재 Iris scalar executor coverage와 첫 미지원 opcode를 출력한다.
 - `bench-android-iris-hbc-exec-local`은 같은 HBC bundle을 Rust scalar executor subset으로 실행해 완료 여부를 출력한다.
 - `bench-android-iris-hbc-trace-local`은 같은 HBC bundle을 실행하며 완료 trace 또는 첫 semantic frontier trace를 출력한다.

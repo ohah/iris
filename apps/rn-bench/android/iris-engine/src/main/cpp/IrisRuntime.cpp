@@ -384,6 +384,7 @@ void IrisRuntime::PointerState::invalidate() noexcept {
 }
 
 IrisRuntime::IrisRuntime() : globalObject_(std::make_shared<ObjectState>()) {
+  __android_log_print(ANDROID_LOG_WARN, "IrisEngine", "IrisRuntime constructed");
   installBootstrapGlobals();
 }
 
@@ -493,6 +494,13 @@ IrisRuntime::HermesBytecodeMetadata IrisRuntime::validateHermesBytecodeBuffer(
 
   const size_t size = buffer->size();
   const uint8_t* data = buffer->data();
+  __android_log_print(
+      ANDROID_LOG_WARN,
+      "IrisEngine",
+      "Iris validateHermesBytecodeBuffer source=%s size=%zu data=%p",
+      sourceURL.c_str(),
+      size,
+      data);
   if (data == nullptr) {
     abortBundleContractViolation(
         "Iris expected Hermes bytecode for " + sourceURL +
@@ -501,7 +509,16 @@ IrisRuntime::HermesBytecodeMetadata IrisRuntime::validateHermesBytecodeBuffer(
 
   try {
     const auto hbcBytes = rust::Slice<const uint8_t>(data, size);
+    const auto start = std::chrono::steady_clock::now();
     const auto metadata = iris::android::parse_hbc_metadata(hbcBytes);
+    __android_log_print(
+        ANDROID_LOG_WARN,
+        "IrisEngine",
+        "Iris parsed HBC metadata source=%s version=%u fileLength=%u elapsedMs=%.3f",
+        sourceURL.c_str(),
+        metadata.version,
+        metadata.file_length,
+        elapsedMilliseconds(start));
     return HermesBytecodeMetadata{
         metadata.version,
         metadata.file_length,
@@ -804,6 +821,11 @@ void IrisRuntime::emitQuickJsBenchmarkArtifact() {
 jsi::Value IrisRuntime::evaluateJavaScript(
     const std::shared_ptr<const jsi::Buffer>& buffer,
     const std::string& sourceURL) {
+  __android_log_print(
+      ANDROID_LOG_WARN,
+      "IrisEngine",
+      "Iris evaluateJavaScript source=%s",
+      sourceURL.c_str());
   auto metadata = validateHermesBytecodeBuffer(buffer, sourceURL);
   emitBootstrapBenchmarkArtifact(buffer, metadata, sourceURL);
   emitQuickJsBenchmarkArtifact();
@@ -813,6 +835,11 @@ jsi::Value IrisRuntime::evaluateJavaScript(
 std::shared_ptr<const jsi::PreparedJavaScript> IrisRuntime::prepareJavaScript(
     const std::shared_ptr<const jsi::Buffer>& buffer,
     std::string sourceURL) {
+  __android_log_print(
+      ANDROID_LOG_WARN,
+      "IrisEngine",
+      "Iris prepareJavaScript source=%s",
+      sourceURL.c_str());
   auto metadata = validateHermesBytecodeBuffer(buffer, sourceURL);
   return std::make_shared<IrisPreparedJavaScript>(
       buffer, std::move(sourceURL), metadata);
@@ -820,6 +847,8 @@ std::shared_ptr<const jsi::PreparedJavaScript> IrisRuntime::prepareJavaScript(
 
 jsi::Value IrisRuntime::evaluatePreparedJavaScript(
     const std::shared_ptr<const jsi::PreparedJavaScript>& js) {
+  __android_log_print(
+      ANDROID_LOG_WARN, "IrisEngine", "Iris evaluatePreparedJavaScript");
   auto prepared = dynamic_cast<const IrisPreparedJavaScript*>(js.get());
   if (prepared == nullptr) {
     abortBundleContractViolation(

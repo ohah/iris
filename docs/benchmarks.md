@@ -195,7 +195,7 @@ Iris AAR은 `docs/iris-android-engine-contract.md`의 `IrisJSRuntimeFactoryProvi
 mise run rn-android-build-iris-release-local
 ```
 
-이 APK는 `libirisengine.so`와 현재 skeleton의 HBC bootstrap artifact가 같이 패키징되고 RN이 Iris-owned JSI runtime 객체와 초기화용 host surface를 받는지 확인하기 위한 것이다. 아직 Iris runtime의 JS 실행 기능이 구현되지 않았으므로 Hermes와의 RN JS workload 비교값으로 쓰지 않는다. RN 0.85 기준 local skeleton HBC gap의 현재 coverage는 `supportedInstructions=2888/2888`, `supportedUniqueOpcodes=46/46`, `unsupportedUniqueOpcodes=0`, `firstUnsupported=none`이다. 현재 Rust scalar executor는 같은 bundle에서 bounded scalar execution을 시도하고, `SCALAR_EXECUTION_GLOBAL_STEP_LIMIT`에 도달하면 `status=frontier`와 차단 함수를 detail에 남긴다. 이는 module factory와 React 앱 실행 완료, Hermes/RN 실행 호환성 완료, 성능 우위를 의미하지 않는다.
+이 APK는 `libirisengine.so`와 현재 skeleton의 HBC bootstrap artifact가 같이 패키징되고 RN이 Iris-owned JSI runtime 객체와 초기화용 host surface를 받는지 확인하기 위한 것이다. 아직 Iris runtime의 JS 실행 기능이 구현되지 않았으므로 Hermes와의 RN JS workload 비교값으로 쓰지 않는다. RN 0.85 기준 local skeleton HBC gap의 현재 coverage는 `supportedInstructions=2903/2903`, `supportedUniqueOpcodes=46/46`, `unsupportedUniqueOpcodes=0`, `firstUnsupported=none`이다. 현재 Rust scalar executor는 같은 bundle에서 bounded scalar execution을 시도하고, `SCALAR_EXECUTION_GLOBAL_STEP_LIMIT`에 도달하면 `status=frontier`와 차단 함수를 detail에 남긴다. 이는 module factory와 React 앱 실행 완료, Hermes/RN 실행 호환성 완료, 성능 우위를 의미하지 않는다.
 
 로컬에서 APK 실행 없이 같은 report를 확인할 때는 다음 명령을 사용한다.
 
@@ -212,6 +212,8 @@ mise run bench-android-iris-bootstrap-local
 ```
 
 이 명령은 `irisRelease` APK를 설치하고 앱 시작 중 `IRIS_BENCHMARK_ARTIFACT_CHUNK` logcat payload를 모아 `iris-engine-bootstrap` report를 만든다. 현재 bootstrap case는 `iris-hbc-metadata-parse`, `iris-hbc-static-coverage-scan`, `iris-hbc-scalar-execution-frontier`다. frontier case는 Rust scalar executor가 실제로 실행을 시도해 완료하거나 첫 의미론 차단점까지 간 시간을 측정한다. 현재 RN 0.85 local skeleton bundle에서는 `detail=status=frontier, error=Iris scalar executor function 3 exceeded step limit 50000`처럼 bounded execution frontier를 남긴다. RN JS bundle의 module factory와 React 앱을 끝까지 실행하는 단계는 아니므로 Hermes release의 `rn-hermes-js-baseline`과 strict ratio를 계산하지 않는다.
+
+2026-06-15 물리 Android 기기 `ITAB X40L Plus` 기준 최신 local skeleton bootstrap 3회 평균 p50은 HBC metadata parse `281.483ms`, static coverage scan `283.099ms`, scalar execution frontier `689.895ms`다. 이 값은 bootstrap/frontier 비용이며 RN strict engine comparison 값이 아니다.
 
 Android 기기 위 QuickJS backend microbenchmark는 다음 명령으로 측정한다.
 

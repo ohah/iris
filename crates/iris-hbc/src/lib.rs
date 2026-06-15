@@ -110,7 +110,7 @@ const SMALL_STRING_OFFSET_MASK: u32 = 0x7f_ffff;
 const SMALL_STRING_LENGTH_SHIFT: u32 = 24;
 const SMALL_STRING_OVERFLOW_LENGTH: u32 = 0xff;
 const SCALAR_EXECUTION_STEP_MULTIPLIER: usize = 64;
-const SCALAR_EXECUTION_GLOBAL_STEP_LIMIT: usize = 50_000;
+const SCALAR_EXECUTION_GLOBAL_STEP_LIMIT: usize = 500_000;
 const TYPEOF_IS_UNDEFINED: u16 = 1 << 0;
 const TYPEOF_IS_OBJECT: u16 = 1 << 1;
 const TYPEOF_IS_STRING: u16 = 1 << 2;
@@ -4785,6 +4785,7 @@ fn call_scalar_metro_require<'a>(
     let module_value = ScalarValue::Object(module);
     let exports_value = ScalarValue::Object(exports);
     write_scalar_named_object_property(state, module, "exports", exports_value);
+    state.metro_module_exports.push((module_id, exports_value));
 
     let require = ScalarValue::Function(ScalarFunctionHandle::NativeMetroRequire);
     let import_default = read_scalar_function_property(
@@ -4806,7 +4807,14 @@ fn call_scalar_metro_require<'a>(
     ];
     let _ = execute_scalar_function_with_state(bytecode, state, function_id, &factory_arguments)?;
     let module_exports = read_scalar_object_property(state, module, "exports");
-    state.metro_module_exports.push((module_id, module_exports));
+    if let Some((_, stored_exports)) = state
+        .metro_module_exports
+        .iter_mut()
+        .rev()
+        .find(|(stored_module_id, _)| *stored_module_id == module_id)
+    {
+        *stored_exports = module_exports;
+    }
 
     Ok(module_exports)
 }
@@ -8136,6 +8144,7 @@ mod tests {
     const LOAD_CONST_FALSE_OPCODE: u8 = 150;
     const LOAD_CONST_ZERO_OPCODE: u8 = 151;
     const LOAD_THIS_NS_OPCODE: u8 = 153;
+    const LOAD_PARAM_OPCODE: u8 = 137;
     const CREATE_CLOSURE_OPCODE: u8 = 132;
     const CREATE_CLOSURE_LONG_INDEX_OPCODE: u8 = 133;
     const CREATE_THIS_FOR_NEW_OPCODE: u8 = 134;
@@ -10041,6 +10050,54 @@ mod tests {
             ),
             Ok(ScalarValue::Number(0.0)),
         );
+    }
+
+    #[test]
+    fn scalar_executor_caches_metro_exports_before_factory_for_cycles() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                LOAD_PARAM_OPCODE,
+                0,
+                2,
+                LOAD_CONST_UINT8_OPCODE,
+                1,
+                7,
+                LOAD_CONST_UNDEFINED_OPCODE,
+                3,
+                CALL2_OPCODE,
+                2,
+                0,
+                3,
+                1,
+                RET_OPCODE,
+                2,
+            ],
+        );
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid Hermes bytecode");
+        let mut state = ScalarExecutorState {
+            remaining_steps: Some(64),
+            ..ScalarExecutorState::default()
+        };
+        state.metro_modules.push((
+            7,
+            ScalarFunctionHandle::Bytecode {
+                function_id: 1,
+                environment: None,
+            },
+            ScalarValue::Undefined,
+        ));
+
+        let result = call_scalar_metro_require(
+            &bytecode,
+            &mut state,
+            &[ScalarValue::Undefined, ScalarValue::Number(7.0)],
+        );
+
+        assert_eq!(state.metro_module_exports.len(), 1);
+        assert_eq!(state.metro_module_exports[0].0, 7);
+        assert_eq!(result, Ok(state.metro_module_exports[0].1));
     }
 
     #[test]

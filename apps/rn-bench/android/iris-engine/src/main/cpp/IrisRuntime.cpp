@@ -674,7 +674,7 @@ void IrisRuntime::emitBootstrapBenchmarkArtifact(
       coverageWarmupIterations);
   const auto executionCase = benchmarkCaseJson(
       "iris-hbc-scalar-execution-frontier",
-      "Iris HBC scalar execution frontier",
+      "Iris HBC scalar execution",
       "Execute the current Rust scalar subset until completion or the first semantic frontier.",
       executionDetail,
       static_cast<uint64_t>(metadata.globalInstructionCount),

@@ -5,6 +5,8 @@
 //! used to make Iris bytecode runtime work measurable before the full JavaScript
 //! object model is available.
 
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Write as _;
 
@@ -111,6 +113,9 @@ const SMALL_STRING_LENGTH_SHIFT: u32 = 24;
 const SMALL_STRING_OVERFLOW_LENGTH: u32 = 0xff;
 const SCALAR_EXECUTION_STEP_MULTIPLIER: usize = 64;
 const SCALAR_EXECUTION_GLOBAL_STEP_LIMIT: usize = 500_000;
+const SCALAR_LINEAR_OBJECT_PROPERTY_LIMIT: usize = 16;
+const SCALAR_PROTOTYPE_LOOKUP_DEPTH_LIMIT: u8 = 16;
+const SCALAR_STRING_OPERAND_CACHE_SLOTS: usize = 32;
 const TYPEOF_IS_UNDEFINED: u16 = 1 << 0;
 const TYPEOF_IS_OBJECT: u16 = 1 << 1;
 const TYPEOF_IS_STRING: u16 = 1 << 2;
@@ -1058,20 +1063,67 @@ pub struct HermesInstruction {
 }
 
 /// Opaque object handle supported by Iris' first execution subset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ScalarObjectHandle {
     /// JavaScript global object.
     Global,
+    /// React Native console host object.
+    Console,
     /// Hermes-specific global object exposed by Hermes runtimes.
     HermesInternal,
+    /// Native `Math` object exposed on the global object.
+    Math,
+    /// Native `JSON` object exposed on the global object.
+    Json,
     /// Plain JavaScript object allocated by `NewObject`.
     Object(u32),
+    /// Singleton prototype object for a native constructor.
+    NativePrototype(ScalarNativePrototype),
     /// JavaScript array object allocated by `NewArray*`.
     Array(u32),
+    /// JavaScript `Uint8Array` object allocated by `new Uint8Array()`.
+    Uint8Array(u32),
+    /// JavaScript `Map` object allocated by `new Map()`.
+    Map(u32),
+    /// JavaScript `Set` object allocated by `new Set()`.
+    Set(u32),
     /// JavaScript `WeakMap` object allocated by `new WeakMap()`.
     WeakMap(u32),
+    /// JavaScript `WeakSet` object allocated by `new WeakSet()`.
+    WeakSet(u32),
     /// React Native native module stub returned by `__turboModuleProxy`.
     NativeModule(u32),
+}
+
+/// Singleton native prototype objects used by the scalar bootstrap subset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScalarNativePrototype {
+    /// `Array.prototype`.
+    Array,
+    /// `Uint8Array.prototype`.
+    Uint8Array,
+    /// `Boolean.prototype`.
+    Boolean,
+    /// `Date.prototype`.
+    Date,
+    /// `Function.prototype`.
+    Function,
+    /// `Map.prototype`.
+    Map,
+    /// `Number.prototype`.
+    Number,
+    /// `Object.prototype`.
+    Object,
+    /// `Promise.prototype`.
+    Promise,
+    /// `Set.prototype`.
+    Set,
+    /// `String.prototype`.
+    String,
+    /// `WeakMap.prototype`.
+    WeakMap,
+    /// `WeakSet.prototype`.
+    WeakSet,
 }
 
 /// Opaque environment handle supported by Iris' first execution subset.
@@ -1090,12 +1142,58 @@ pub enum ScalarFunctionHandle {
     NativeDateConstructor,
     /// Native `Date.now` function.
     NativeDateNow,
+    /// Native global `isNaN` function.
+    NativeIsNaN,
+    /// Native `Math.round` function.
+    NativeMathRound,
+    /// Native `Math.sin` function.
+    NativeMathSin,
+    /// Native `Math.sqrt` function.
+    NativeMathSqrt,
+    /// Native `JSON.stringify` function.
+    NativeJsonStringify,
+    /// Native `JSON.parse` function.
+    NativeJsonParse,
+    /// Native `Boolean` constructor exposed on the global object.
+    NativeBooleanConstructor,
     /// Native `Error` constructor exposed on the global object.
     NativeErrorConstructor,
+    /// Native `Function` constructor exposed on the global object.
+    NativeFunctionConstructor,
+    /// Native `Function.prototype.toString` function.
+    NativeFunctionToString,
+    /// Native `Function.prototype.toString.call` function.
+    NativeFunctionToStringCall,
+    /// Native `Function.prototype.bind` function.
+    NativeFunctionBind,
+    /// Native `Function.prototype.call` function.
+    NativeFunctionCall,
+    /// Native `Array` constructor exposed on the global object.
+    NativeArrayConstructor,
+    /// Native `Array.isArray` function.
+    NativeArrayIsArray,
+    /// Native `Array.prototype.map` function.
+    NativeArrayMap,
+    /// Native `Array.prototype.forEach` function.
+    NativeArrayForEach,
+    /// Native `Uint8Array` constructor exposed on the global object.
+    NativeUint8ArrayConstructor,
+    /// Native `Uint8Array.prototype.set` function.
+    NativeUint8ArraySet,
     /// Native `Map` constructor exposed on the global object.
     NativeMapConstructor,
+    /// Native `Number` constructor exposed on the global object.
+    NativeNumberConstructor,
+    /// Native `Promise` constructor exposed on the global object.
+    NativePromiseConstructor,
+    /// Native `Set` constructor exposed on the global object.
+    NativeSetConstructor,
+    /// Native `String` constructor exposed on the global object.
+    NativeStringConstructor,
     /// Native `WeakMap` constructor exposed on the global object.
     NativeWeakMapConstructor,
+    /// Native `WeakSet` constructor exposed on the global object.
+    NativeWeakSetConstructor,
     /// Native `WeakMap.prototype.get` function.
     NativeWeakMapGet,
     /// Native `WeakMap.prototype.has` function.
@@ -1104,18 +1202,42 @@ pub enum ScalarFunctionHandle {
     NativeWeakMapSet,
     /// Native `String.prototype.replace` function.
     NativeStringReplace,
+    /// Native `String.prototype.indexOf` function.
+    NativeStringIndexOf,
+    /// Native `String.prototype.charCodeAt` function.
+    NativeStringCharCodeAt,
+    /// Native `Symbol` constructor exposed on the global object.
+    NativeSymbolConstructor,
+    /// Native `Symbol.for` function.
+    NativeSymbolFor,
     /// React Native `global.__turboModuleProxy` host function.
     NativeTurboModuleProxy,
     /// React Native native module `getConstants` host function.
     NativeModuleGetConstants,
+    /// React Native native performance module supported-entry-types host function.
+    NativePerformanceGetSupportedEntryTypes,
     /// Generic no-op host function used by native module stubs.
     NativeNoopFunction,
     /// Native `Object` constructor exposed on the global object.
     NativeObjectConstructor,
+    /// Native `Object.create` function.
+    NativeObjectCreate,
     /// Native `Object.defineProperty` function.
     NativeObjectDefineProperty,
+    /// Native `Object.defineProperties` function.
+    NativeObjectDefineProperties,
+    /// Native `Object.assign` function.
+    NativeObjectAssign,
+    /// Native `Object.freeze` function.
+    NativeObjectFreeze,
+    /// Native `Object.getPrototypeOf` function.
+    NativeObjectGetPrototypeOf,
     /// Native `Object.getOwnPropertyDescriptor` function.
     NativeObjectGetOwnPropertyDescriptor,
+    /// Native `Object.keys` function.
+    NativeObjectKeys,
+    /// Native `Object.preventExtensions` function.
+    NativeObjectPreventExtensions,
     /// Native `Object.prototype.hasOwnProperty` function.
     NativeObjectHasOwnProperty,
     /// Native `Object.prototype.hasOwnProperty.call` function.
@@ -1126,6 +1248,10 @@ pub enum ScalarFunctionHandle {
     NativeMetroDefine,
     /// Metro's global module require helper.
     NativeMetroRequire,
+    /// Metro's default import helper.
+    NativeMetroImportDefault,
+    /// Metro's namespace import helper.
+    NativeMetroImportAll,
     /// Metro's global segment registration helper.
     NativeMetroRegisterSegment,
     /// Hermes bytecode function allocated by `CreateClosure`.
@@ -1146,6 +1272,15 @@ pub struct ScalarStringHandle {
     pub is_empty: bool,
 }
 
+/// Opaque dynamic string handle allocated by the scalar executor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScalarDynamicStringHandle {
+    /// Executor-local dynamic string id.
+    pub dynamic_id: u32,
+    /// Whether the referenced JavaScript string is empty.
+    pub is_empty: bool,
+}
+
 /// Value type supported by Iris' first Hermes bytecode executor subset.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ScalarValue {
@@ -1159,6 +1294,10 @@ pub enum ScalarValue {
     Function(ScalarFunctionHandle),
     /// Opaque JavaScript string reference.
     String(ScalarStringHandle),
+    /// Opaque executor-owned dynamic JavaScript string reference.
+    DynamicString(ScalarDynamicStringHandle),
+    /// Opaque JavaScript symbol reference.
+    Symbol(ScalarStringHandle),
     /// JavaScript `undefined`.
     Undefined,
     /// JavaScript `null`.
@@ -2749,6 +2888,26 @@ pub fn describe_hbc_scalar_execution(bytes: &[u8]) -> Result<String, ParseError>
     }
 }
 
+/// Executes the global function with strict scalar semantics and reports either
+/// completion or the current scalar execution frontier.
+///
+/// # Errors
+///
+/// Returns [`ParseError`] if the bytecode is structurally invalid. Execution
+/// subset errors are encoded in the returned report so benchmark callers can
+/// still measure the current frontier without pretending it completed.
+pub fn describe_hbc_strict_scalar_execution(bytes: &[u8]) -> Result<String, ParseError> {
+    let bytecode = HermesBytecode::parse(bytes)?;
+    match execute_scalar_function(&bytecode, bytecode.header().global_code_index) {
+        Ok(report) => Ok(format!(
+            "status=completed, value={:?}, declaredGlobals={}",
+            report.value,
+            report.declared_globals.len()
+        )),
+        Err(error) => Ok(format!("status=frontier, error={error}")),
+    }
+}
+
 /// Executes the global function and returns a compact trace ending at the first
 /// scalar execution frontier.
 ///
@@ -2758,7 +2917,29 @@ pub fn describe_hbc_scalar_execution(bytes: &[u8]) -> Result<String, ParseError>
 /// scalar execution begins.
 pub fn describe_hbc_scalar_frontier_trace(bytes: &[u8]) -> Result<String, ParseError> {
     let bytecode = HermesBytecode::parse(bytes)?;
-    describe_scalar_frontier_trace(&bytecode, bytecode.header().global_code_index, 24)
+    describe_scalar_frontier_trace(
+        &bytecode,
+        bytecode.header().global_code_index,
+        24,
+        ScalarTraceMode::Relaxed,
+    )
+}
+
+/// Executes the global function with strict scalar semantics and returns a
+/// compact trace ending at the first execution frontier.
+///
+/// # Errors
+///
+/// Returns [`ParseError`] when the bytecode is structurally invalid before
+/// scalar execution begins.
+pub fn describe_hbc_strict_scalar_frontier_trace(bytes: &[u8]) -> Result<String, ParseError> {
+    let bytecode = HermesBytecode::parse(bytes)?;
+    describe_scalar_frontier_trace(
+        &bytecode,
+        bytecode.header().global_code_index,
+        24,
+        ScalarTraceMode::Strict,
+    )
 }
 
 /// Describes the instructions around a bytecode offset in one function.
@@ -2792,25 +2973,81 @@ pub fn describe_hbc_instruction_window(
     Ok(lines.join(" | "))
 }
 
+/// Profiles the global function with strict scalar semantics and reports the
+/// dynamic instruction/property hot paths.
+///
+/// This is a diagnostic path for optimizer work. It executes the same scalar
+/// instruction semantics as `hbc-bench`, but it keeps the counters outside the
+/// normal benchmark loop so benchmark hot paths do not pay profiling overhead.
+///
+/// # Errors
+///
+/// Returns [`ParseError`] if the bytecode is structurally invalid before
+/// scalar execution begins.
+pub fn profile_hbc_global_scalar_execution(bytes: &[u8]) -> Result<String, ParseError> {
+    let bytecode = HermesBytecode::parse(bytes)?;
+    let report = profile_scalar_function(&bytecode, bytecode.header().global_code_index)?;
+    Ok(format_scalar_profile_execution_report(&report))
+}
+
 #[derive(Debug, Default)]
 struct ScalarExecutorState<'a> {
+    array_element_indices: HashMap<(ScalarObjectHandle, u32), usize>,
     array_elements: Vec<(ScalarObjectHandle, u32, ScalarValue)>,
-    array_lengths: Vec<(ScalarObjectHandle, u32)>,
+    array_lengths: Vec<Option<u32>>,
+    array_storage: Vec<Option<Vec<ScalarValue>>>,
     declared_globals: Vec<&'a str>,
+    dynamic_string_json_values: Vec<Option<serde_json::Value>>,
+    dynamic_strings: Vec<String>,
     environment_parents: Vec<(ScalarEnvironmentHandle, Option<ScalarEnvironmentHandle>)>,
     environment_slots: Vec<(ScalarEnvironmentHandle, u32, ScalarValue)>,
     function_properties: Vec<(ScalarFunctionHandle, &'a str, ScalarValue)>,
     global_properties: Vec<(&'a str, ScalarValue)>,
+    json_property_name_cache: HashMap<String, Option<&'a str>>,
     metro_module_exports: Vec<(u32, ScalarValue)>,
     metro_modules: Vec<(u32, ScalarFunctionHandle, ScalarValue)>,
     next_environment_id: u32,
     next_object_id: u32,
+    object_getters: Vec<(ScalarObjectHandle, &'a str, ScalarValue)>,
+    object_property_indices: HashMap<(ScalarObjectHandle, &'a str), usize>,
+    object_property_names: HashMap<ScalarObjectHandle, Vec<&'a str>>,
+    object_prototypes: Vec<(ScalarObjectHandle, ScalarValue)>,
     object_properties: Vec<(ScalarObjectHandle, &'a str, ScalarValue)>,
     object_slot_names: Vec<(ScalarObjectHandle, u32, &'a str)>,
     object_slots: Vec<(ScalarObjectHandle, u32, ScalarValue)>,
+    pending_constructor_this_values: Vec<(ScalarFunctionHandle, ScalarValue)>,
+    recent_bytecode_calls: Vec<ScalarCallFrame>,
     relaxed_host_stubs: bool,
     remaining_steps: Option<usize>,
+    uint8_array_storage: Vec<Option<Vec<u8>>>,
     weak_map_entries: Vec<(ScalarObjectHandle, ScalarValue, ScalarValue)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ScalarCallFrame {
+    caller_function_id: u32,
+    caller_offset: u32,
+    function_id: u32,
+    arguments: Vec<ScalarValue>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScalarPropertyKey<'a> {
+    Name(&'a str),
+    Index(u32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ScalarDescriptorProperty {
+    Value(ScalarValue),
+    Getter(ScalarValue),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ScalarObjectGetterLookup {
+    Getter(ScalarValue),
+    DataProperty(ScalarValue),
+    Missing,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2818,6 +3055,64 @@ enum ScalarInstructionResult {
     Continue,
     Jump(u32),
     Return(ScalarValue),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScalarTraceMode {
+    Relaxed,
+    Strict,
+}
+
+#[derive(Debug)]
+struct ScalarStringOperandCache<'a> {
+    entries: [Option<(u32, &'a str)>; SCALAR_STRING_OPERAND_CACHE_SLOTS],
+}
+
+impl Default for ScalarStringOperandCache<'_> {
+    fn default() -> Self {
+        Self {
+            entries: [None; SCALAR_STRING_OPERAND_CACHE_SLOTS],
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ScalarProfileExecutionReport<'a> {
+    declared_global_count: usize,
+    error: Option<String>,
+    function_id: u32,
+    profile: ScalarInstructionProfile<'a>,
+    value: Option<ScalarValue>,
+}
+
+#[derive(Debug)]
+struct ScalarInstructionProfile<'a> {
+    call_argument_kind_counts:
+        HashMap<(&'static str, &'static str, &'static str, &'static str), u64>,
+    call_target_counts: HashMap<(&'static str, &'static str), u64>,
+    indexed_access_counts: HashMap<(&'static str, &'static str, &'static str), u64>,
+    instruction_offset_counts: HashMap<(u32, u8), u64>,
+    jumps_taken: u64,
+    opcode_counts: [u64; HERMES_OPCODE_COUNT],
+    property_access_counts: HashMap<(&'static str, &'static str, &'a str), u64>,
+    string_operand_counts: HashMap<(&'static str, &'a str), u64>,
+    total_instructions: u64,
+}
+
+impl Default for ScalarInstructionProfile<'_> {
+    fn default() -> Self {
+        Self {
+            call_argument_kind_counts: HashMap::new(),
+            call_target_counts: HashMap::new(),
+            indexed_access_counts: HashMap::new(),
+            instruction_offset_counts: HashMap::new(),
+            jumps_taken: 0,
+            opcode_counts: [0; HERMES_OPCODE_COUNT],
+            property_access_counts: HashMap::new(),
+            string_operand_counts: HashMap::new(),
+            total_instructions: 0,
+        }
+    }
 }
 
 fn execute_scalar_function<'a>(
@@ -2884,17 +3179,30 @@ fn execute_scalar_function_with_state_and_environment<'a>(
     let instructions = bytecode
         .function_instructions(function_id)?
         .collect::<Result<Vec<_>, _>>()?;
-    let step_limit = state.remaining_steps.map(|_| {
+    let instruction_bytes = instructions
+        .iter()
+        .map(|instruction| instruction_bytes(body, *instruction))
+        .collect::<Vec<_>>();
+    let mut string_operand_cache = ScalarStringOperandCache::default();
+    let enforce_step_limits = state.remaining_steps.is_some();
+    let step_limit = if enforce_step_limits {
         instructions
             .len()
             .saturating_mul(SCALAR_EXECUTION_STEP_MULTIPLIER)
             .max(1)
-    });
+    } else {
+        0
+    };
     let mut instruction_index = 0_usize;
     let mut step_count = 0_usize;
+    let mut jump_index_cache = vec![None; instructions.len()];
 
     while instruction_index < instructions.len() {
-        if let Some(remaining_steps) = state.remaining_steps.as_mut() {
+        if enforce_step_limits {
+            let remaining_steps = state
+                .remaining_steps
+                .as_mut()
+                .expect("step limits are enabled");
             if *remaining_steps == 0 {
                 return Err(ScalarExecutionError::StepLimitExceeded {
                     function_id,
@@ -2902,23 +3210,25 @@ fn execute_scalar_function_with_state_and_environment<'a>(
                 });
             }
             *remaining_steps -= 1;
+            if step_count >= step_limit {
+                return Err(ScalarExecutionError::StepLimitExceeded {
+                    function_id,
+                    step_limit,
+                });
+            }
+            step_count += 1;
         }
-        if step_limit.is_some_and(|step_limit| step_count >= step_limit) {
-            return Err(ScalarExecutionError::StepLimitExceeded {
-                function_id,
-                step_limit: step_limit.expect("checked local step limit"),
-            });
-        }
-        step_count += 1;
 
         let instruction = instructions[instruction_index];
+        let current_instruction_bytes = instruction_bytes[instruction_index];
         match execute_scalar_instruction(
             bytecode,
             state,
             &mut registers,
             arguments,
             function_id,
-            body,
+            current_instruction_bytes,
+            &mut string_operand_cache,
             instruction,
             closure_environment,
         )? {
@@ -2926,16 +3236,22 @@ fn execute_scalar_function_with_state_and_environment<'a>(
                 instruction_index += 1;
             }
             ScalarInstructionResult::Jump(target) => {
-                instruction_index = instructions
-                    .binary_search_by_key(&target, |instruction| instruction.offset)
-                    .map_err(|_| ParseError::InvalidJumpTarget {
-                        function_id,
-                        offset: instruction.offset,
-                        opcode: instruction.opcode,
-                        target: i64::from(target),
-                        body_start: body.offset,
-                        body_end: body.offset + body.len(),
-                    })?;
+                if let Some(target_index) = jump_index_cache[instruction_index] {
+                    instruction_index = target_index;
+                } else {
+                    let target_index = instructions
+                        .binary_search_by_key(&target, |instruction| instruction.offset)
+                        .map_err(|_| ParseError::InvalidJumpTarget {
+                            function_id,
+                            offset: instruction.offset,
+                            opcode: instruction.opcode,
+                            target: i64::from(target),
+                            body_start: body.offset,
+                            body_end: body.offset + body.len(),
+                        })?;
+                    jump_index_cache[instruction_index] = Some(target_index);
+                    instruction_index = target_index;
+                }
             }
             ScalarInstructionResult::Return(value) => {
                 return Ok(ScalarExecutionReport {
@@ -2949,10 +3265,1038 @@ fn execute_scalar_function_with_state_and_environment<'a>(
     Err(ScalarExecutionError::MissingReturn { function_id })
 }
 
+fn profile_scalar_function<'a>(
+    bytecode: &HermesBytecode<'a>,
+    function_id: u32,
+) -> Result<ScalarProfileExecutionReport<'a>, ParseError> {
+    let mut state = ScalarExecutorState {
+        remaining_steps: None,
+        ..ScalarExecutorState::default()
+    };
+    execute_scalar_function_profiled(bytecode, &mut state, function_id, &[])
+}
+
+fn execute_scalar_function_profiled<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
+    function_id: u32,
+    arguments: &[ScalarValue],
+) -> Result<ScalarProfileExecutionReport<'a>, ParseError> {
+    let body = bytecode.function_body(function_id)?;
+    let function_header = bytecode.function_header(function_id)?;
+    let frame_size = usize::try_from(function_header.frame_size)
+        .expect("Hermes function frame size fits in usize on supported targets");
+    let mut registers = vec![ScalarValue::Empty; frame_size];
+    let instructions = bytecode
+        .function_instructions(function_id)?
+        .collect::<Result<Vec<_>, _>>()?;
+    let instruction_bytes = instructions
+        .iter()
+        .map(|instruction| instruction_bytes(body, *instruction))
+        .collect::<Vec<_>>();
+    let mut string_operand_cache = ScalarStringOperandCache::default();
+    let mut instruction_index = 0_usize;
+    let mut jump_index_cache = vec![None; instructions.len()];
+    let mut profile = ScalarInstructionProfile::default();
+
+    while instruction_index < instructions.len() {
+        let instruction = instructions[instruction_index];
+        let current_instruction_bytes = instruction_bytes[instruction_index];
+        record_scalar_instruction_profile(
+            bytecode,
+            &mut profile,
+            function_id,
+            instruction,
+            current_instruction_bytes,
+        );
+        record_scalar_property_access_profile(
+            bytecode,
+            &mut profile,
+            &registers,
+            function_id,
+            instruction,
+            current_instruction_bytes,
+        );
+        record_scalar_indexed_access_profile(
+            &mut profile,
+            &registers,
+            instruction,
+            current_instruction_bytes,
+        );
+        record_scalar_call_target_profile(
+            &mut profile,
+            &registers,
+            instruction,
+            current_instruction_bytes,
+        );
+
+        let result = match execute_scalar_instruction(
+            bytecode,
+            state,
+            &mut registers,
+            arguments,
+            function_id,
+            current_instruction_bytes,
+            &mut string_operand_cache,
+            instruction,
+            None,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                return Ok(ScalarProfileExecutionReport {
+                    declared_global_count: state.declared_globals.len(),
+                    error: Some(error.to_string()),
+                    function_id,
+                    profile,
+                    value: None,
+                });
+            }
+        };
+
+        match result {
+            ScalarInstructionResult::Continue => {
+                instruction_index += 1;
+            }
+            ScalarInstructionResult::Jump(target) => {
+                profile.jumps_taken = profile.jumps_taken.saturating_add(1);
+                if let Some(target_index) = jump_index_cache[instruction_index] {
+                    instruction_index = target_index;
+                } else {
+                    let target_index = match instructions
+                        .binary_search_by_key(&target, |instruction| instruction.offset)
+                    {
+                        Ok(target_index) => target_index,
+                        Err(_) => {
+                            return Ok(ScalarProfileExecutionReport {
+                                declared_global_count: state.declared_globals.len(),
+                                error: Some(
+                                    ParseError::InvalidJumpTarget {
+                                        function_id,
+                                        offset: instruction.offset,
+                                        opcode: instruction.opcode,
+                                        target: i64::from(target),
+                                        body_start: body.offset,
+                                        body_end: body.offset + body.len(),
+                                    }
+                                    .to_string(),
+                                ),
+                                function_id,
+                                profile,
+                                value: None,
+                            });
+                        }
+                    };
+                    jump_index_cache[instruction_index] = Some(target_index);
+                    instruction_index = target_index;
+                }
+            }
+            ScalarInstructionResult::Return(value) => {
+                return Ok(ScalarProfileExecutionReport {
+                    declared_global_count: state.declared_globals.len(),
+                    error: None,
+                    function_id,
+                    profile,
+                    value: Some(value),
+                });
+            }
+        }
+    }
+
+    Ok(ScalarProfileExecutionReport {
+        declared_global_count: state.declared_globals.len(),
+        error: Some(ScalarExecutionError::MissingReturn { function_id }.to_string()),
+        function_id,
+        profile,
+        value: None,
+    })
+}
+
+fn record_scalar_instruction_profile<'a>(
+    bytecode: &HermesBytecode<'a>,
+    profile: &mut ScalarInstructionProfile<'a>,
+    function_id: u32,
+    instruction: HermesInstruction,
+    instruction_bytes: &[u8],
+) {
+    profile.total_instructions = profile.total_instructions.saturating_add(1);
+    *profile
+        .instruction_offset_counts
+        .entry((instruction.offset, instruction.opcode))
+        .or_insert(0) += 1;
+    if let Some(count) = profile
+        .opcode_counts
+        .get_mut(usize::from(instruction.opcode))
+    {
+        *count = count.saturating_add(1);
+    }
+
+    match instruction.opcode {
+        67 => record_scalar_profile_string_operand(
+            bytecode,
+            profile,
+            function_id,
+            instruction,
+            instruction_bytes,
+            1,
+            4,
+            "declare",
+        ),
+        68 => record_scalar_profile_string_operand(
+            bytecode,
+            profile,
+            function_id,
+            instruction,
+            instruction_bytes,
+            4,
+            1,
+            "get",
+        ),
+        69 | 72 => record_scalar_profile_string_operand(
+            bytecode,
+            profile,
+            function_id,
+            instruction,
+            instruction_bytes,
+            4,
+            2,
+            "get",
+        ),
+        70 | 71 | 73 => record_scalar_profile_string_operand(
+            bytecode,
+            profile,
+            function_id,
+            instruction,
+            instruction_bytes,
+            if instruction.opcode == 71 { 5 } else { 4 },
+            4,
+            "get",
+        ),
+        74 | 75 => record_scalar_profile_string_operand(
+            bytecode,
+            profile,
+            function_id,
+            instruction,
+            instruction_bytes,
+            4,
+            2,
+            "put",
+        ),
+        76 | 77 => record_scalar_profile_string_operand(
+            bytecode,
+            profile,
+            function_id,
+            instruction,
+            instruction_bytes,
+            4,
+            4,
+            "put",
+        ),
+        78 | 79 => record_scalar_profile_string_operand(
+            bytecode,
+            profile,
+            function_id,
+            instruction,
+            instruction_bytes,
+            4,
+            2,
+            "try-put",
+        ),
+        80 | 81 => record_scalar_profile_string_operand(
+            bytecode,
+            profile,
+            function_id,
+            instruction,
+            instruction_bytes,
+            4,
+            4,
+            "try-put",
+        ),
+        86 => record_scalar_profile_string_operand(
+            bytecode,
+            profile,
+            function_id,
+            instruction,
+            instruction_bytes,
+            4,
+            2,
+            "define",
+        ),
+        87 => record_scalar_profile_string_operand(
+            bytecode,
+            profile,
+            function_id,
+            instruction,
+            instruction_bytes,
+            4,
+            4,
+            "define",
+        ),
+        144 => record_scalar_profile_string_operand(
+            bytecode,
+            profile,
+            function_id,
+            instruction,
+            instruction_bytes,
+            2,
+            2,
+            "load-string",
+        ),
+        145 => record_scalar_profile_string_operand(
+            bytecode,
+            profile,
+            function_id,
+            instruction,
+            instruction_bytes,
+            2,
+            4,
+            "load-string",
+        ),
+        _ => {}
+    }
+}
+
+fn record_scalar_profile_string_operand<'a>(
+    bytecode: &HermesBytecode<'a>,
+    profile: &mut ScalarInstructionProfile<'a>,
+    function_id: u32,
+    instruction: HermesInstruction,
+    instruction_bytes: &[u8],
+    offset: usize,
+    width: usize,
+    role: &'static str,
+) {
+    let string_id = read_unsigned_operand(instruction_bytes, offset, width);
+    if let Ok(value) = read_scalar_string_operand(bytecode, function_id, instruction, string_id) {
+        *profile
+            .string_operand_counts
+            .entry((role, value))
+            .or_insert(0) += 1;
+    }
+}
+
+fn record_scalar_property_access_profile<'a>(
+    bytecode: &HermesBytecode<'a>,
+    profile: &mut ScalarInstructionProfile<'a>,
+    registers: &[ScalarValue],
+    function_id: u32,
+    instruction: HermesInstruction,
+    instruction_bytes: &[u8],
+) {
+    match instruction.opcode {
+        68 => record_scalar_named_property_access(
+            bytecode,
+            profile,
+            registers,
+            function_id,
+            instruction,
+            instruction_bytes,
+            ScalarProfileNamedAccess {
+                base_offset: 2,
+                base_width: 1,
+                string_offset: 4,
+                string_width: 1,
+                role: "get",
+            },
+        ),
+        69 | 72 => record_scalar_named_property_access(
+            bytecode,
+            profile,
+            registers,
+            function_id,
+            instruction,
+            instruction_bytes,
+            ScalarProfileNamedAccess {
+                base_offset: 2,
+                base_width: 1,
+                string_offset: 4,
+                string_width: 2,
+                role: "get",
+            },
+        ),
+        74 | 75 => record_scalar_named_property_access(
+            bytecode,
+            profile,
+            registers,
+            function_id,
+            instruction,
+            instruction_bytes,
+            ScalarProfileNamedAccess {
+                base_offset: 1,
+                base_width: 1,
+                string_offset: 4,
+                string_width: 2,
+                role: "put",
+            },
+        ),
+        86 => record_scalar_named_property_access(
+            bytecode,
+            profile,
+            registers,
+            function_id,
+            instruction,
+            instruction_bytes,
+            ScalarProfileNamedAccess {
+                base_offset: 1,
+                base_width: 1,
+                string_offset: 4,
+                string_width: 2,
+                role: "define",
+            },
+        ),
+        87 => record_scalar_named_property_access(
+            bytecode,
+            profile,
+            registers,
+            function_id,
+            instruction,
+            instruction_bytes,
+            ScalarProfileNamedAccess {
+                base_offset: 1,
+                base_width: 1,
+                string_offset: 4,
+                string_width: 4,
+                role: "define",
+            },
+        ),
+        _ => {}
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScalarProfileNamedAccess {
+    base_offset: usize,
+    base_width: usize,
+    string_offset: usize,
+    string_width: usize,
+    role: &'static str,
+}
+
+fn record_scalar_named_property_access<'a>(
+    bytecode: &HermesBytecode<'a>,
+    profile: &mut ScalarInstructionProfile<'a>,
+    registers: &[ScalarValue],
+    function_id: u32,
+    instruction: HermesInstruction,
+    instruction_bytes: &[u8],
+    access: ScalarProfileNamedAccess,
+) {
+    let base_register =
+        read_unsigned_operand(instruction_bytes, access.base_offset, access.base_width);
+    let Ok(property_name) = read_scalar_string_operand(
+        bytecode,
+        function_id,
+        instruction,
+        read_unsigned_operand(instruction_bytes, access.string_offset, access.string_width),
+    ) else {
+        return;
+    };
+    let Ok(base_index) = usize::try_from(base_register) else {
+        *profile
+            .property_access_counts
+            .entry((access.role, "register-oob", property_name))
+            .or_insert(0) += 1;
+        return;
+    };
+    let base_kind = registers
+        .get(base_index)
+        .map_or("register-oob", |value| scalar_profile_base_kind(*value));
+    *profile
+        .property_access_counts
+        .entry((access.role, base_kind, property_name))
+        .or_insert(0) += 1;
+}
+
+fn scalar_profile_base_kind(value: ScalarValue) -> &'static str {
+    match value {
+        ScalarValue::Object(ScalarObjectHandle::Global) => "global",
+        ScalarValue::Object(ScalarObjectHandle::Console) => "console",
+        ScalarValue::Object(ScalarObjectHandle::HermesInternal) => "hermes-internal",
+        ScalarValue::Object(ScalarObjectHandle::Math) => "math",
+        ScalarValue::Object(ScalarObjectHandle::Json) => "json",
+        ScalarValue::Object(ScalarObjectHandle::Object(_)) => "plain-object",
+        ScalarValue::Object(ScalarObjectHandle::NativePrototype(_)) => "native-prototype",
+        ScalarValue::Object(ScalarObjectHandle::Array(_)) => "array",
+        ScalarValue::Object(ScalarObjectHandle::Uint8Array(_)) => "uint8-array",
+        ScalarValue::Object(ScalarObjectHandle::Map(_)) => "map",
+        ScalarValue::Object(ScalarObjectHandle::Set(_)) => "set",
+        ScalarValue::Object(ScalarObjectHandle::WeakMap(_)) => "weak-map",
+        ScalarValue::Object(ScalarObjectHandle::WeakSet(_)) => "weak-set",
+        ScalarValue::Object(ScalarObjectHandle::NativeModule(_)) => "native-module",
+        ScalarValue::Environment(_) => "environment",
+        ScalarValue::Function(ScalarFunctionHandle::Bytecode { .. }) => "function-bytecode",
+        ScalarValue::Function(_) => "function-native",
+        ScalarValue::String(_) => "string",
+        ScalarValue::DynamicString(_) => "dynamic-string",
+        ScalarValue::Symbol(_) => "symbol",
+        ScalarValue::Undefined => "undefined",
+        ScalarValue::Null => "null",
+        ScalarValue::Boolean(_) => "boolean",
+        ScalarValue::Number(_) => "number",
+        ScalarValue::Empty => "empty",
+    }
+}
+
+fn record_scalar_indexed_access_profile(
+    profile: &mut ScalarInstructionProfile<'_>,
+    registers: &[ScalarValue],
+    instruction: HermesInstruction,
+    instruction_bytes: &[u8],
+) {
+    match instruction.opcode {
+        93 => record_scalar_computed_access(
+            profile,
+            registers,
+            instruction_bytes,
+            ScalarProfileComputedAccess {
+                base_offset: 2,
+                key_offset: 3,
+                role: "get-index",
+            },
+        ),
+        94 => record_scalar_immediate_index_access(
+            profile,
+            registers,
+            instruction_bytes,
+            ScalarProfileImmediateIndexAccess {
+                base_offset: 2,
+                role: "get-immediate-index",
+            },
+        ),
+        96 | 97 => record_scalar_computed_access(
+            profile,
+            registers,
+            instruction_bytes,
+            ScalarProfileComputedAccess {
+                base_offset: 1,
+                key_offset: 2,
+                role: "put-index",
+            },
+        ),
+        _ => {}
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScalarProfileComputedAccess {
+    base_offset: usize,
+    key_offset: usize,
+    role: &'static str,
+}
+
+fn record_scalar_computed_access(
+    profile: &mut ScalarInstructionProfile<'_>,
+    registers: &[ScalarValue],
+    instruction_bytes: &[u8],
+    access: ScalarProfileComputedAccess,
+) {
+    let base_register = read_unsigned_operand(instruction_bytes, access.base_offset, 1);
+    let key_register = read_unsigned_operand(instruction_bytes, access.key_offset, 1);
+    let base_kind = profile_register_base_kind(registers, base_register);
+    let key_kind = profile_register_key_kind(registers, key_register);
+    *profile
+        .indexed_access_counts
+        .entry((access.role, base_kind, key_kind))
+        .or_insert(0) += 1;
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScalarProfileImmediateIndexAccess {
+    base_offset: usize,
+    role: &'static str,
+}
+
+fn record_scalar_immediate_index_access(
+    profile: &mut ScalarInstructionProfile<'_>,
+    registers: &[ScalarValue],
+    instruction_bytes: &[u8],
+    access: ScalarProfileImmediateIndexAccess,
+) {
+    let base_register = read_unsigned_operand(instruction_bytes, access.base_offset, 1);
+    let base_kind = profile_register_base_kind(registers, base_register);
+    *profile
+        .indexed_access_counts
+        .entry((access.role, base_kind, "immediate"))
+        .or_insert(0) += 1;
+}
+
+fn profile_register_base_kind(registers: &[ScalarValue], register: u32) -> &'static str {
+    profile_register_value_kind(registers, register)
+}
+
+fn profile_register_value_kind(registers: &[ScalarValue], register: u32) -> &'static str {
+    let Ok(index) = usize::try_from(register) else {
+        return "register-oob";
+    };
+    registers
+        .get(index)
+        .map_or("register-oob", |value| scalar_profile_base_kind(*value))
+}
+
+fn profile_register_key_kind(registers: &[ScalarValue], register: u32) -> &'static str {
+    let Ok(index) = usize::try_from(register) else {
+        return "register-oob";
+    };
+    let Some(value) = registers.get(index) else {
+        return "register-oob";
+    };
+    match value {
+        ScalarValue::Number(value) if *value >= 0.0 && value.fract() == 0.0 => "numeric",
+        ScalarValue::Number(_) => "number",
+        ScalarValue::String(_) => "string",
+        ScalarValue::DynamicString(_) => "dynamic-string",
+        ScalarValue::Symbol(_) => "symbol",
+        ScalarValue::Undefined => "undefined",
+        ScalarValue::Null => "null",
+        ScalarValue::Boolean(_) => "boolean",
+        ScalarValue::Object(_) => "object",
+        ScalarValue::Function(_) => "function",
+        ScalarValue::Environment(_) => "environment",
+        ScalarValue::Empty => "empty",
+    }
+}
+
+fn record_scalar_call_target_profile(
+    profile: &mut ScalarInstructionProfile<'_>,
+    registers: &[ScalarValue],
+    instruction: HermesInstruction,
+    instruction_bytes: &[u8],
+) {
+    match instruction.opcode {
+        107 => {
+            let constructor_register = read_unsigned_operand(instruction_bytes, 2, 1);
+            record_scalar_register_call_target(
+                profile,
+                registers,
+                "construct",
+                constructor_register,
+            );
+        }
+        108 | 110 | 111 | 112 => {
+            let callee_register = read_unsigned_operand(instruction_bytes, 2, 1);
+            let role = scalar_profile_call_opcode_role(instruction.opcode);
+            let target =
+                record_scalar_register_call_target(profile, registers, role, callee_register);
+            record_scalar_direct_call_argument_kind_profile(
+                profile,
+                registers,
+                role,
+                target,
+                instruction.opcode,
+                instruction_bytes,
+            );
+        }
+        115 | 116 => {
+            let builtin_id = read_unsigned_operand(instruction_bytes, 2, 1);
+            *profile
+                .call_target_counts
+                .entry(("builtin", scalar_profile_builtin_name(builtin_id)))
+                .or_insert(0) += 1;
+        }
+        _ => {}
+    }
+}
+
+fn record_scalar_register_call_target(
+    profile: &mut ScalarInstructionProfile<'_>,
+    registers: &[ScalarValue],
+    role: &'static str,
+    register: u32,
+) -> &'static str {
+    let target = match usize::try_from(register)
+        .ok()
+        .and_then(|index| registers.get(index))
+    {
+        Some(ScalarValue::Function(function)) => scalar_profile_function_name(*function),
+        Some(value) => scalar_profile_call_value_kind(*value),
+        None => "register-oob",
+    };
+    *profile
+        .call_target_counts
+        .entry((role, target))
+        .or_insert(0) += 1;
+    target
+}
+
+fn record_scalar_direct_call_argument_kind_profile(
+    profile: &mut ScalarInstructionProfile<'_>,
+    registers: &[ScalarValue],
+    role: &'static str,
+    target: &'static str,
+    opcode: u8,
+    instruction_bytes: &[u8],
+) {
+    for argument_index in 0..scalar_direct_call_argument_count(opcode) {
+        let register = read_unsigned_operand(instruction_bytes, 3 + argument_index, 1);
+        let argument = scalar_profile_argument_name(argument_index);
+        let kind = profile_register_value_kind(registers, register);
+        *profile
+            .call_argument_kind_counts
+            .entry((role, target, argument, kind))
+            .or_insert(0) += 1;
+    }
+}
+
+fn scalar_profile_argument_name(argument_index: usize) -> &'static str {
+    match argument_index {
+        0 => "arg0",
+        1 => "arg1",
+        2 => "arg2",
+        3 => "arg3",
+        _ => "argN",
+    }
+}
+
+fn scalar_profile_call_opcode_role(opcode: u8) -> &'static str {
+    match opcode {
+        108 => "call1",
+        110 => "call2",
+        111 => "call3",
+        112 => "call4",
+        _ => unreachable!("call target profile only supports direct call opcodes"),
+    }
+}
+
+fn scalar_profile_call_value_kind(value: ScalarValue) -> &'static str {
+    match value {
+        ScalarValue::Object(_) => "non-function-object",
+        ScalarValue::Environment(_) => "non-function-environment",
+        ScalarValue::String(_) | ScalarValue::DynamicString(_) => "non-function-string",
+        ScalarValue::Symbol(_) => "non-function-symbol",
+        ScalarValue::Undefined => "non-function-undefined",
+        ScalarValue::Null => "non-function-null",
+        ScalarValue::Boolean(_) => "non-function-boolean",
+        ScalarValue::Number(_) => "non-function-number",
+        ScalarValue::Empty => "non-function-empty",
+        ScalarValue::Function(function) => scalar_profile_function_name(function),
+    }
+}
+
+fn scalar_profile_function_name(function: ScalarFunctionHandle) -> &'static str {
+    match function {
+        ScalarFunctionHandle::NativePerformanceNow => "NativePerformanceNow",
+        ScalarFunctionHandle::NativeDateConstructor => "NativeDateConstructor",
+        ScalarFunctionHandle::NativeDateNow => "NativeDateNow",
+        ScalarFunctionHandle::NativeIsNaN => "NativeIsNaN",
+        ScalarFunctionHandle::NativeMathRound => "NativeMathRound",
+        ScalarFunctionHandle::NativeMathSin => "NativeMathSin",
+        ScalarFunctionHandle::NativeMathSqrt => "NativeMathSqrt",
+        ScalarFunctionHandle::NativeJsonStringify => "NativeJsonStringify",
+        ScalarFunctionHandle::NativeJsonParse => "NativeJsonParse",
+        ScalarFunctionHandle::NativeBooleanConstructor => "NativeBooleanConstructor",
+        ScalarFunctionHandle::NativeErrorConstructor => "NativeErrorConstructor",
+        ScalarFunctionHandle::NativeFunctionConstructor => "NativeFunctionConstructor",
+        ScalarFunctionHandle::NativeFunctionToString => "NativeFunctionToString",
+        ScalarFunctionHandle::NativeFunctionToStringCall => "NativeFunctionToStringCall",
+        ScalarFunctionHandle::NativeFunctionBind => "NativeFunctionBind",
+        ScalarFunctionHandle::NativeFunctionCall => "NativeFunctionCall",
+        ScalarFunctionHandle::NativeArrayConstructor => "NativeArrayConstructor",
+        ScalarFunctionHandle::NativeArrayIsArray => "NativeArrayIsArray",
+        ScalarFunctionHandle::NativeArrayMap => "NativeArrayMap",
+        ScalarFunctionHandle::NativeArrayForEach => "NativeArrayForEach",
+        ScalarFunctionHandle::NativeUint8ArrayConstructor => "NativeUint8ArrayConstructor",
+        ScalarFunctionHandle::NativeUint8ArraySet => "NativeUint8ArraySet",
+        ScalarFunctionHandle::NativeMapConstructor => "NativeMapConstructor",
+        ScalarFunctionHandle::NativeNumberConstructor => "NativeNumberConstructor",
+        ScalarFunctionHandle::NativePromiseConstructor => "NativePromiseConstructor",
+        ScalarFunctionHandle::NativeSetConstructor => "NativeSetConstructor",
+        ScalarFunctionHandle::NativeStringConstructor => "NativeStringConstructor",
+        ScalarFunctionHandle::NativeWeakMapConstructor => "NativeWeakMapConstructor",
+        ScalarFunctionHandle::NativeWeakSetConstructor => "NativeWeakSetConstructor",
+        ScalarFunctionHandle::NativeWeakMapGet => "NativeWeakMapGet",
+        ScalarFunctionHandle::NativeWeakMapHas => "NativeWeakMapHas",
+        ScalarFunctionHandle::NativeWeakMapSet => "NativeWeakMapSet",
+        ScalarFunctionHandle::NativeStringReplace => "NativeStringReplace",
+        ScalarFunctionHandle::NativeStringIndexOf => "NativeStringIndexOf",
+        ScalarFunctionHandle::NativeStringCharCodeAt => "NativeStringCharCodeAt",
+        ScalarFunctionHandle::NativeSymbolConstructor => "NativeSymbolConstructor",
+        ScalarFunctionHandle::NativeSymbolFor => "NativeSymbolFor",
+        ScalarFunctionHandle::NativeTurboModuleProxy => "NativeTurboModuleProxy",
+        ScalarFunctionHandle::NativeModuleGetConstants => "NativeModuleGetConstants",
+        ScalarFunctionHandle::NativePerformanceGetSupportedEntryTypes => {
+            "NativePerformanceGetSupportedEntryTypes"
+        }
+        ScalarFunctionHandle::NativeNoopFunction => "NativeNoopFunction",
+        ScalarFunctionHandle::NativeObjectConstructor => "NativeObjectConstructor",
+        ScalarFunctionHandle::NativeObjectCreate => "NativeObjectCreate",
+        ScalarFunctionHandle::NativeObjectDefineProperty => "NativeObjectDefineProperty",
+        ScalarFunctionHandle::NativeObjectDefineProperties => "NativeObjectDefineProperties",
+        ScalarFunctionHandle::NativeObjectAssign => "NativeObjectAssign",
+        ScalarFunctionHandle::NativeObjectFreeze => "NativeObjectFreeze",
+        ScalarFunctionHandle::NativeObjectGetPrototypeOf => "NativeObjectGetPrototypeOf",
+        ScalarFunctionHandle::NativeObjectGetOwnPropertyDescriptor => {
+            "NativeObjectGetOwnPropertyDescriptor"
+        }
+        ScalarFunctionHandle::NativeObjectKeys => "NativeObjectKeys",
+        ScalarFunctionHandle::NativeObjectPreventExtensions => "NativeObjectPreventExtensions",
+        ScalarFunctionHandle::NativeObjectHasOwnProperty => "NativeObjectHasOwnProperty",
+        ScalarFunctionHandle::NativeObjectHasOwnPropertyCall => "NativeObjectHasOwnPropertyCall",
+        ScalarFunctionHandle::HermesInternalConcat => "HermesInternalConcat",
+        ScalarFunctionHandle::NativeMetroDefine => "NativeMetroDefine",
+        ScalarFunctionHandle::NativeMetroRequire => "NativeMetroRequire",
+        ScalarFunctionHandle::NativeMetroImportDefault => "NativeMetroImportDefault",
+        ScalarFunctionHandle::NativeMetroImportAll => "NativeMetroImportAll",
+        ScalarFunctionHandle::NativeMetroRegisterSegment => "NativeMetroRegisterSegment",
+        ScalarFunctionHandle::Bytecode { .. } => "Bytecode",
+    }
+}
+
+fn scalar_profile_builtin_name(builtin_id: u32) -> &'static str {
+    match builtin_id {
+        HERMES_BUILTIN_COPY_DATA_PROPERTIES => "CopyDataProperties",
+        HERMES_BUILTIN_FUNCTION_PROTOTYPE_CALL => "FunctionPrototypeCall",
+        _ => "Builtin",
+    }
+}
+
+fn format_scalar_profile_execution_report(report: &ScalarProfileExecutionReport<'_>) -> String {
+    let status = if report.error.is_some() {
+        "frontier"
+    } else {
+        "completed"
+    };
+    let value = report
+        .value
+        .map_or_else(|| "none".to_owned(), |value| format!("{value:?}"));
+    let error = report
+        .error
+        .as_ref()
+        .map_or_else(|| "none".to_owned(), |error| error.clone());
+    format!(
+        "status={status}, function={}, value={value}, error={error}, declaredGlobals={}, totalInstructions={}, jumpsTaken={}, topOpcodes=[{}], topInstructionOffsets=[{}], topStringOperands=[{}], topPropertyAccesses=[{}], topIndexedAccesses=[{}], topCallTargets=[{}], topCallArgumentKinds=[{}]",
+        report.function_id,
+        report.declared_global_count,
+        report.profile.total_instructions,
+        report.profile.jumps_taken,
+        format_scalar_profile_opcode_counts(&report.profile, 12),
+        format_scalar_profile_instruction_offset_counts(&report.profile, 16),
+        format_scalar_profile_string_counts(&report.profile, 16),
+        format_scalar_profile_property_access_counts(&report.profile, 16),
+        format_scalar_profile_indexed_access_counts(&report.profile, 12),
+        format_scalar_profile_call_target_counts(&report.profile, 12),
+        format_scalar_profile_call_argument_kind_counts(&report.profile, 16)
+    )
+}
+
+fn format_scalar_profile_opcode_counts(
+    profile: &ScalarInstructionProfile<'_>,
+    limit: usize,
+) -> String {
+    let mut counts = profile
+        .opcode_counts
+        .iter()
+        .enumerate()
+        .filter_map(|(opcode, count)| {
+            if *count == 0 {
+                None
+            } else {
+                Some((opcode_index_to_u8(opcode), *count))
+            }
+        })
+        .collect::<Vec<_>>();
+    counts.sort_by(|(left_opcode, left_count), (right_opcode, right_count)| {
+        right_count
+            .cmp(left_count)
+            .then_with(|| left_opcode.cmp(right_opcode))
+    });
+
+    counts
+        .into_iter()
+        .take(limit)
+        .map(|(opcode, count)| format!("{}({opcode})={count}", hermes_opcode_name(opcode)))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn format_scalar_profile_instruction_offset_counts(
+    profile: &ScalarInstructionProfile<'_>,
+    limit: usize,
+) -> String {
+    let mut counts = profile
+        .instruction_offset_counts
+        .iter()
+        .map(|((offset, opcode), count)| (*offset, *opcode, *count))
+        .collect::<Vec<_>>();
+    counts.sort_by(
+        |(left_offset, left_opcode, left_count), (right_offset, right_opcode, right_count)| {
+            right_count
+                .cmp(left_count)
+                .then_with(|| left_opcode.cmp(right_opcode))
+                .then_with(|| left_offset.cmp(right_offset))
+        },
+    );
+
+    counts
+        .into_iter()
+        .take(limit)
+        .map(|(offset, opcode, count)| {
+            format!("{}({opcode})@{offset}={count}", hermes_opcode_name(opcode))
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn format_scalar_profile_string_counts(
+    profile: &ScalarInstructionProfile<'_>,
+    limit: usize,
+) -> String {
+    let mut counts = profile
+        .string_operand_counts
+        .iter()
+        .map(|((role, value), count)| (*role, *value, *count))
+        .collect::<Vec<_>>();
+    counts.sort_by(
+        |(left_role, left_value, left_count), (right_role, right_value, right_count)| {
+            right_count
+                .cmp(left_count)
+                .then_with(|| left_role.cmp(right_role))
+                .then_with(|| left_value.cmp(right_value))
+        },
+    );
+
+    counts
+        .into_iter()
+        .take(limit)
+        .map(|(role, value, count)| format!("{role}:{}={count}", format_profile_string(value)))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn format_scalar_profile_property_access_counts(
+    profile: &ScalarInstructionProfile<'_>,
+    limit: usize,
+) -> String {
+    let mut counts = profile
+        .property_access_counts
+        .iter()
+        .map(|((role, base_kind, property_name), count)| {
+            (*role, *base_kind, *property_name, *count)
+        })
+        .collect::<Vec<_>>();
+    counts.sort_by(
+        |(left_role, left_base, left_property, left_count),
+         (right_role, right_base, right_property, right_count)| {
+            right_count
+                .cmp(left_count)
+                .then_with(|| left_role.cmp(right_role))
+                .then_with(|| left_base.cmp(right_base))
+                .then_with(|| left_property.cmp(right_property))
+        },
+    );
+
+    counts
+        .into_iter()
+        .take(limit)
+        .map(|(role, base_kind, property_name, count)| {
+            format!(
+                "{role}:{base_kind}:{}={count}",
+                format_profile_string(property_name)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn format_scalar_profile_indexed_access_counts(
+    profile: &ScalarInstructionProfile<'_>,
+    limit: usize,
+) -> String {
+    let mut counts = profile
+        .indexed_access_counts
+        .iter()
+        .map(|((role, base_kind, key_kind), count)| (*role, *base_kind, *key_kind, *count))
+        .collect::<Vec<_>>();
+    counts.sort_by(
+        |(left_role, left_base, left_key, left_count),
+         (right_role, right_base, right_key, right_count)| {
+            right_count
+                .cmp(left_count)
+                .then_with(|| left_role.cmp(right_role))
+                .then_with(|| left_base.cmp(right_base))
+                .then_with(|| left_key.cmp(right_key))
+        },
+    );
+
+    counts
+        .into_iter()
+        .take(limit)
+        .map(|(role, base_kind, key_kind, count)| format!("{role}:{base_kind}:{key_kind}={count}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn format_scalar_profile_call_target_counts(
+    profile: &ScalarInstructionProfile<'_>,
+    limit: usize,
+) -> String {
+    let mut counts = profile
+        .call_target_counts
+        .iter()
+        .map(|((role, target), count)| (*role, *target, *count))
+        .collect::<Vec<_>>();
+    counts.sort_by(
+        |(left_role, left_target, left_count), (right_role, right_target, right_count)| {
+            right_count
+                .cmp(left_count)
+                .then_with(|| left_role.cmp(right_role))
+                .then_with(|| left_target.cmp(right_target))
+        },
+    );
+
+    counts
+        .into_iter()
+        .take(limit)
+        .map(|(role, target, count)| format!("{role}:{target}={count}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn format_scalar_profile_call_argument_kind_counts(
+    profile: &ScalarInstructionProfile<'_>,
+    limit: usize,
+) -> String {
+    let mut counts = profile
+        .call_argument_kind_counts
+        .iter()
+        .map(|((role, target, argument, kind), count)| (*role, *target, *argument, *kind, *count))
+        .collect::<Vec<_>>();
+    counts.sort_by(
+        |(left_role, left_target, left_argument, left_kind, left_count),
+         (right_role, right_target, right_argument, right_kind, right_count)| {
+            right_count
+                .cmp(left_count)
+                .then_with(|| left_role.cmp(right_role))
+                .then_with(|| left_target.cmp(right_target))
+                .then_with(|| left_argument.cmp(right_argument))
+                .then_with(|| left_kind.cmp(right_kind))
+        },
+    );
+
+    counts
+        .into_iter()
+        .take(limit)
+        .map(|(role, target, argument, kind, count)| {
+            format!("{role}:{target}:{argument}:{kind}={count}")
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn format_profile_string(value: &str) -> String {
+    if value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'.' | b'-'))
+    {
+        value.to_owned()
+    } else {
+        format!("{value:?}")
+    }
+}
+
 fn describe_scalar_frontier_trace(
     bytecode: &HermesBytecode<'_>,
     function_id: u32,
     trace_limit: usize,
+    mode: ScalarTraceMode,
 ) -> Result<String, ParseError> {
     let body = bytecode.function_body(function_id)?;
     let function_header = bytecode.function_header(function_id)?;
@@ -2960,13 +4304,18 @@ fn describe_scalar_frontier_trace(
         .expect("Hermes function frame size fits in usize on supported targets");
     let mut registers = vec![ScalarValue::Empty; frame_size];
     let mut state = ScalarExecutorState {
-        relaxed_host_stubs: true,
+        relaxed_host_stubs: mode == ScalarTraceMode::Relaxed,
         remaining_steps: Some(SCALAR_EXECUTION_GLOBAL_STEP_LIMIT),
         ..ScalarExecutorState::default()
     };
     let instructions = bytecode
         .function_instructions(function_id)?
         .collect::<Result<Vec<_>, _>>()?;
+    let instruction_bytes = instructions
+        .iter()
+        .map(|instruction| instruction_bytes(body, *instruction))
+        .collect::<Vec<_>>();
+    let mut string_operand_cache = ScalarStringOperandCache::default();
     let step_limit = instructions
         .len()
         .saturating_mul(SCALAR_EXECUTION_STEP_MULTIPLIER)
@@ -2996,13 +4345,15 @@ fn describe_scalar_frontier_trace(
         let instruction = instructions[instruction_index];
         let description = describe_scalar_instruction(bytecode, body, instruction);
         let before = registers.clone();
+        let current_instruction_bytes = instruction_bytes[instruction_index];
         match execute_scalar_instruction(
             bytecode,
             &mut state,
             &mut registers,
             &[],
             function_id,
-            body,
+            current_instruction_bytes,
+            &mut string_operand_cache,
             instruction,
             None,
         ) {
@@ -3050,7 +4401,8 @@ fn describe_scalar_frontier_trace(
             }
             Err(error) => {
                 return Ok(format!(
-                    "status=frontier, error={error}, instruction={description}, steps={step_count}, trace={}",
+                    "status=frontier, error={error}, instruction={description}, steps={step_count}, recentCalls={}, trace={}",
+                    describe_recent_scalar_calls(&state),
                     trace.join(" | ")
                 ));
             }
@@ -3084,6 +4436,35 @@ fn describe_register_changes(before: &[ScalarValue], after: &[ScalarValue]) -> S
     } else {
         changes.join(",")
     }
+}
+
+fn describe_recent_scalar_calls(state: &ScalarExecutorState<'_>) -> String {
+    if state.recent_bytecode_calls.is_empty() {
+        return "none".to_owned();
+    }
+
+    state
+        .recent_bytecode_calls
+        .iter()
+        .rev()
+        .take(8)
+        .map(|frame| {
+            format!(
+                "f{}@{}:{}({})",
+                frame.function_id,
+                frame.caller_function_id,
+                frame.caller_offset,
+                frame
+                    .arguments
+                    .iter()
+                    .enumerate()
+                    .map(|(index, argument)| format!("p{index}={argument:?}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" <- ")
 }
 
 fn describe_scalar_instruction(
@@ -3206,11 +4587,11 @@ fn execute_scalar_instruction<'a>(
     registers: &mut [ScalarValue],
     arguments: &[ScalarValue],
     function_id: u32,
-    body: SectionView<'_>,
+    instruction_bytes: &[u8],
+    string_operand_cache: &mut ScalarStringOperandCache<'a>,
     instruction: HermesInstruction,
     closure_environment: Option<ScalarEnvironmentHandle>,
 ) -> Result<ScalarInstructionResult, ScalarExecutionError> {
-    let instruction_bytes = instruction_bytes(body, instruction);
     match instruction.opcode {
         1 | 2 | 3 => {
             let destination = read_unsigned_operand(instruction_bytes, 1, 1);
@@ -3302,10 +4683,40 @@ fn execute_scalar_instruction<'a>(
             )?;
             Ok(ScalarInstructionResult::Continue)
         }
+        15 => Ok(ScalarInstructionResult::Continue),
         16 => {
             let destination = read_unsigned_operand(instruction_bytes, 1, 1);
             let source = read_unsigned_operand(instruction_bytes, 2, 1);
+            if let Some(value) = registers.get(source as usize).copied() {
+                if let Some(destination_slot) = registers.get_mut(destination as usize) {
+                    *destination_slot = value;
+                    return Ok(ScalarInstructionResult::Continue);
+                }
+            }
             let value = read_scalar_register(registers, function_id, instruction, source)?;
+            write_scalar_register(registers, function_id, instruction, destination, value)?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        19 => {
+            let destination = read_unsigned_operand(instruction_bytes, 1, 1);
+            let source = read_unsigned_operand(instruction_bytes, 2, 1);
+            let value = read_scalar_register(registers, function_id, instruction, source)?;
+            write_scalar_register(
+                registers,
+                function_id,
+                instruction,
+                destination,
+                ScalarValue::Boolean(!scalar_to_boolean(value)),
+            )?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        21 => {
+            let destination = read_unsigned_operand(instruction_bytes, 1, 1);
+            let source = read_unsigned_operand(instruction_bytes, 2, 1);
+            let value = read_scalar_register(registers, function_id, instruction, source)?;
+            let type_name = scalar_typeof_name(value);
+            let value =
+                scalar_string_value_for_name(bytecode, type_name).unwrap_or(ScalarValue::Undefined);
             write_scalar_register(registers, function_id, instruction, destination, value)?;
             Ok(ScalarInstructionResult::Continue)
         }
@@ -3377,7 +4788,8 @@ fn execute_scalar_instruction<'a>(
                 read_scalar_register(registers, function_id, instruction, right_register)?;
             let value = if instruction.opcode == 32 {
                 match (left_value, right_value) {
-                    (value @ ScalarValue::String(_), _) | (_, value @ ScalarValue::String(_)) => {
+                    (value @ (ScalarValue::String(_) | ScalarValue::DynamicString(_)), _)
+                    | (_, value @ (ScalarValue::String(_) | ScalarValue::DynamicString(_))) => {
                         value
                     }
                     _ => ScalarValue::Number(
@@ -3398,6 +4810,54 @@ fn execute_scalar_instruction<'a>(
                 ScalarValue::Number(value)
             };
             write_scalar_register(registers, function_id, instruction, destination, value)?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        48 => {
+            let destination = read_unsigned_operand(instruction_bytes, 1, 1);
+            let object_register = read_unsigned_operand(instruction_bytes, 2, 1);
+            let constructor_register = read_unsigned_operand(instruction_bytes, 3, 1);
+            let object =
+                read_scalar_register(registers, function_id, instruction, object_register)?;
+            let constructor =
+                read_scalar_register(registers, function_id, instruction, constructor_register)?;
+            let value = scalar_instance_of(state, object, constructor);
+            write_scalar_register(
+                registers,
+                function_id,
+                instruction,
+                destination,
+                ScalarValue::Boolean(value),
+            )?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        49 => {
+            let destination = read_unsigned_operand(instruction_bytes, 1, 1);
+            let key_register = read_unsigned_operand(instruction_bytes, 2, 1);
+            let base_register = read_unsigned_operand(instruction_bytes, 3, 1);
+            let property_key = read_scalar_computed_property_key(
+                bytecode,
+                state,
+                registers,
+                function_id,
+                instruction,
+                key_register,
+            )?;
+            let base = read_scalar_register(registers, function_id, instruction, base_register)?;
+            let exists = scalar_computed_property_exists(
+                state,
+                function_id,
+                instruction,
+                base_register,
+                base,
+                property_key,
+            )?;
+            write_scalar_register(
+                registers,
+                function_id,
+                instruction,
+                destination,
+                ScalarValue::Boolean(exists),
+            )?;
             Ok(ScalarInstructionResult::Continue)
         }
         51 => {
@@ -3471,17 +4931,35 @@ fn execute_scalar_instruction<'a>(
             )?;
             Ok(ScalarInstructionResult::Continue)
         }
+        62 => {
+            write_scalar_destination(
+                registers,
+                function_id,
+                instruction,
+                instruction_bytes,
+                ScalarValue::Undefined,
+            )?;
+            Ok(ScalarInstructionResult::Continue)
+        }
         67 => {
             let string_id = read_unsigned_operand(instruction_bytes, 1, 4);
-            let name = read_scalar_string_operand(bytecode, function_id, instruction, string_id)?;
+            let name = read_cached_scalar_string_operand(
+                bytecode,
+                string_operand_cache,
+                function_id,
+                instruction,
+                string_id,
+            )?;
             state.declared_globals.push(name);
             Ok(ScalarInstructionResult::Continue)
         }
         64 => {
             let destination = read_unsigned_operand(instruction_bytes, 1, 1);
             let _slot_count = read_unsigned_operand(instruction_bytes, 2, 1);
-            let environment =
-                ScalarValue::Environment(allocate_scalar_environment_with_parent(state, None));
+            let environment = ScalarValue::Environment(allocate_scalar_environment_with_parent(
+                state,
+                closure_environment,
+            ));
             write_scalar_register(
                 registers,
                 function_id,
@@ -3494,8 +4972,10 @@ fn execute_scalar_instruction<'a>(
         65 => {
             let destination = read_unsigned_operand(instruction_bytes, 1, 1);
             let _slot_count = read_unsigned_operand(instruction_bytes, 2, 4);
-            let environment =
-                ScalarValue::Environment(allocate_scalar_environment_with_parent(state, None));
+            let environment = ScalarValue::Environment(allocate_scalar_environment_with_parent(
+                state,
+                closure_environment,
+            ));
             write_scalar_register(
                 registers,
                 function_id,
@@ -3538,9 +5018,23 @@ fn execute_scalar_instruction<'a>(
             let destination = read_unsigned_operand(instruction_bytes, 1, 1);
             let base_register = read_unsigned_operand(instruction_bytes, 2, 1);
             let string_id = read_unsigned_operand(instruction_bytes, 4, 1);
-            let property_name =
-                read_scalar_string_operand(bytecode, function_id, instruction, string_id)?;
+            let property_name = read_cached_scalar_string_operand(
+                bytecode,
+                string_operand_cache,
+                function_id,
+                instruction,
+                string_id,
+            )?;
+            if matches!(
+                registers.get(base_register as usize),
+                Some(ScalarValue::Object(ScalarObjectHandle::Global))
+            ) {
+                let value = read_scalar_global_property(state, property_name);
+                write_scalar_register(registers, function_id, instruction, destination, value)?;
+                return Ok(ScalarInstructionResult::Continue);
+            }
             let value = read_scalar_property(
+                bytecode,
                 state,
                 registers,
                 function_id,
@@ -3555,9 +5049,26 @@ fn execute_scalar_instruction<'a>(
             let destination = read_unsigned_operand(instruction_bytes, 1, 1);
             let base_register = read_unsigned_operand(instruction_bytes, 2, 1);
             let string_id = read_unsigned_operand(instruction_bytes, 4, 2);
-            let property_name =
-                read_scalar_string_operand(bytecode, function_id, instruction, string_id)?;
+            let property_name = read_cached_scalar_string_operand(
+                bytecode,
+                string_operand_cache,
+                function_id,
+                instruction,
+                string_id,
+            )?;
+            if instruction.opcode == 72
+                && property_name == "Math"
+                && matches!(
+                    registers.get(base_register as usize),
+                    Some(ScalarValue::Object(ScalarObjectHandle::Global))
+                )
+            {
+                let value = read_scalar_global_property(state, property_name);
+                write_scalar_register(registers, function_id, instruction, destination, value)?;
+                return Ok(ScalarInstructionResult::Continue);
+            }
             let value = read_scalar_property(
+                bytecode,
                 state,
                 registers,
                 function_id,
@@ -3572,9 +5083,31 @@ fn execute_scalar_instruction<'a>(
             let base_register = read_unsigned_operand(instruction_bytes, 1, 1);
             let value_register = read_unsigned_operand(instruction_bytes, 2, 1);
             let string_id = read_unsigned_operand(instruction_bytes, 4, 2);
-            let property_name =
-                read_scalar_string_operand(bytecode, function_id, instruction, string_id)?;
+            let property_name = read_cached_scalar_string_operand(
+                bytecode,
+                string_operand_cache,
+                function_id,
+                instruction,
+                string_id,
+            )?;
             let value = read_scalar_register(registers, function_id, instruction, value_register)?;
+            if matches!(
+                registers.get(base_register as usize),
+                Some(ScalarValue::Object(ScalarObjectHandle::Global))
+            ) {
+                let value = map_scalar_global_write(property_name, value);
+                if let Some((_, stored_value)) = state
+                    .global_properties
+                    .iter_mut()
+                    .rev()
+                    .find(|(name, _)| *name == property_name)
+                {
+                    *stored_value = value;
+                } else {
+                    state.global_properties.push((property_name, value));
+                }
+                return Ok(ScalarInstructionResult::Continue);
+            }
             write_scalar_property(
                 state,
                 registers,
@@ -3605,8 +5138,13 @@ fn execute_scalar_instruction<'a>(
             let value_register = read_unsigned_operand(instruction_bytes, 2, 1);
             let string_width = if instruction.opcode == 87 { 4 } else { 2 };
             let string_id = read_unsigned_operand(instruction_bytes, 4, string_width);
-            let property_name =
-                read_scalar_string_operand(bytecode, function_id, instruction, string_id)?;
+            let property_name = read_cached_scalar_string_operand(
+                bytecode,
+                string_operand_cache,
+                function_id,
+                instruction,
+                string_id,
+            )?;
             let value = read_scalar_register(registers, function_id, instruction, value_register)?;
             write_scalar_property(
                 state,
@@ -3634,22 +5172,77 @@ fn execute_scalar_instruction<'a>(
             let base_register = read_unsigned_operand(instruction_bytes, 1, 1);
             let key_register = read_unsigned_operand(instruction_bytes, 2, 1);
             let value_register = read_unsigned_operand(instruction_bytes, 3, 1);
-            let property_name = read_scalar_property_key(
+            let key_value =
+                read_scalar_register(registers, function_id, instruction, key_register)?;
+            let value = read_scalar_register(registers, function_id, instruction, value_register)?;
+            if let Some(index) = scalar_value_to_u32(key_value) {
+                match read_scalar_register(registers, function_id, instruction, base_register)? {
+                    ScalarValue::Object(handle) => {
+                        write_scalar_array_element(state, handle, index, value);
+                        return Ok(ScalarInstructionResult::Continue);
+                    }
+                    ScalarValue::Undefined | ScalarValue::Null | ScalarValue::Empty
+                        if state.relaxed_host_stubs =>
+                    {
+                        return Ok(ScalarInstructionResult::Continue);
+                    }
+                    value => {
+                        return Err(ScalarExecutionError::UnsupportedPropertyBase {
+                            function_id,
+                            offset: instruction.offset,
+                            opcode: instruction.opcode,
+                            register: base_register,
+                            value,
+                        });
+                    }
+                }
+            }
+            let property_key = scalar_computed_property_key_from_value(
                 bytecode,
-                registers,
+                state,
                 function_id,
                 instruction,
                 key_register,
+                key_value,
             )?;
-            let value = read_scalar_register(registers, function_id, instruction, value_register)?;
-            write_scalar_property(
+            write_scalar_computed_property(
                 state,
                 registers,
                 function_id,
                 instruction,
                 base_register,
-                property_name,
+                property_key,
                 value,
+            )?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        99 => {
+            let destination = read_unsigned_operand(instruction_bytes, 1, 1);
+            let base_register = read_unsigned_operand(instruction_bytes, 2, 1);
+            let key_register = read_unsigned_operand(instruction_bytes, 3, 1);
+            let property_key = read_scalar_computed_property_key(
+                bytecode,
+                state,
+                registers,
+                function_id,
+                instruction,
+                key_register,
+            )?;
+            let base = read_scalar_register(registers, function_id, instruction, base_register)?;
+            delete_scalar_property(
+                state,
+                function_id,
+                instruction,
+                base_register,
+                base,
+                property_key,
+            )?;
+            write_scalar_register(
+                registers,
+                function_id,
+                instruction,
+                destination,
+                ScalarValue::Boolean(true),
             )?;
             Ok(ScalarInstructionResult::Continue)
         }
@@ -3682,20 +5275,49 @@ fn execute_scalar_instruction<'a>(
             let destination = read_unsigned_operand(instruction_bytes, 1, 1);
             let base_register = read_unsigned_operand(instruction_bytes, 2, 1);
             let key_register = read_unsigned_operand(instruction_bytes, 3, 1);
-            let property_name = read_scalar_property_key(
+            let key_value =
+                read_scalar_register(registers, function_id, instruction, key_register)?;
+            if let Some(index) = scalar_value_to_u32(key_value) {
+                let value =
+                    match read_scalar_register(registers, function_id, instruction, base_register)?
+                    {
+                        ScalarValue::Object(handle) => {
+                            read_scalar_array_element(state, handle, index)
+                        }
+                        ScalarValue::Undefined | ScalarValue::Null | ScalarValue::Empty
+                            if state.relaxed_host_stubs =>
+                        {
+                            ScalarValue::Undefined
+                        }
+                        value => {
+                            return Err(ScalarExecutionError::UnsupportedPropertyBase {
+                                function_id,
+                                offset: instruction.offset,
+                                opcode: instruction.opcode,
+                                register: base_register,
+                                value,
+                            });
+                        }
+                    };
+                write_scalar_register(registers, function_id, instruction, destination, value)?;
+                return Ok(ScalarInstructionResult::Continue);
+            }
+            let property_key = scalar_computed_property_key_from_value(
                 bytecode,
-                registers,
+                state,
                 function_id,
                 instruction,
                 key_register,
+                key_value,
             )?;
-            let value = read_scalar_property(
+            let value = read_scalar_computed_property(
+                bytecode,
                 state,
                 registers,
                 function_id,
                 instruction,
                 base_register,
-                property_name,
+                property_key,
             )?;
             write_scalar_register(registers, function_id, instruction, destination, value)?;
             Ok(ScalarInstructionResult::Continue)
@@ -3715,32 +5337,20 @@ fn execute_scalar_instruction<'a>(
             )?;
             let getter =
                 read_scalar_register(registers, function_id, instruction, getter_register)?;
-            let value = match getter {
-                ScalarValue::Function(ScalarFunctionHandle::Bytecode {
-                    function_id: getter_function_id,
-                    environment,
-                }) => execute_scalar_function_with_state_and_environment(
-                    bytecode,
-                    state,
-                    getter_function_id,
-                    environment,
-                    &[ScalarValue::Undefined],
-                )
-                .map(|report| report.value)
-                .unwrap_or(ScalarValue::Undefined),
-                ScalarValue::Undefined | ScalarValue::Null | ScalarValue::Empty => {
-                    ScalarValue::Undefined
-                }
-                value => value,
-            };
-            write_scalar_property(
+            if matches!(
+                getter,
+                ScalarValue::Undefined | ScalarValue::Null | ScalarValue::Empty
+            ) {
+                return Ok(ScalarInstructionResult::Continue);
+            }
+            write_scalar_getter_property(
                 state,
                 registers,
                 function_id,
                 instruction,
                 base_register,
                 property_name,
-                value,
+                getter,
             )?;
             Ok(ScalarInstructionResult::Continue)
         }
@@ -3852,12 +5462,14 @@ fn execute_scalar_instruction<'a>(
             let constructor =
                 read_scalar_register(registers, function_id, instruction, constructor_register)?;
             let value = construct_scalar_function(
+                bytecode,
+                state,
+                registers,
                 function_id,
                 instruction,
                 constructor_register,
                 constructor,
                 argument_count,
-                state.relaxed_host_stubs,
             )?;
             write_scalar_register(registers, function_id, instruction, destination, value)?;
             Ok(ScalarInstructionResult::Continue)
@@ -3867,20 +5479,15 @@ fn execute_scalar_instruction<'a>(
             let callee_register = read_unsigned_operand(instruction_bytes, 2, 1);
             let callee =
                 read_scalar_register(registers, function_id, instruction, callee_register)?;
-            let arguments = read_scalar_direct_call_arguments(
+            let value = call_scalar_direct_function(
+                bytecode,
+                state,
                 registers,
                 function_id,
                 instruction,
                 instruction_bytes,
-            )?;
-            let value = call_scalar_function(
-                bytecode,
-                state,
-                function_id,
-                instruction,
                 callee_register,
                 callee,
-                &arguments,
             )?;
             write_scalar_register(registers, function_id, instruction, destination, value)?;
             Ok(ScalarInstructionResult::Continue)
@@ -3918,6 +5525,16 @@ fn execute_scalar_instruction<'a>(
                 function_id: target_function_id,
                 environment,
             });
+            if let ScalarValue::Function(function) = value {
+                let prototype = allocate_scalar_object(state);
+                write_scalar_named_function_property(
+                    state,
+                    function,
+                    "prototype",
+                    ScalarValue::Object(prototype),
+                );
+                write_scalar_named_object_property(state, prototype, "constructor", value);
+            }
             write_scalar_register(registers, function_id, instruction, destination, value)?;
             Ok(ScalarInstructionResult::Continue)
         }
@@ -4039,18 +5656,14 @@ fn execute_scalar_instruction<'a>(
             let delta_width = scalar_jump_delta_width(instruction.opcode);
             let left_register = read_unsigned_operand(instruction_bytes, 1 + delta_width, 1);
             let right_register = read_unsigned_operand(instruction_bytes, 2 + delta_width, 1);
-            let left = scalar_to_number(read_scalar_register(
-                registers,
-                function_id,
-                instruction,
-                left_register,
-            )?);
-            let right = scalar_to_number(read_scalar_register(
-                registers,
-                function_id,
-                instruction,
-                right_register,
-            )?);
+            let left_value =
+                read_scalar_register(registers, function_id, instruction, left_register)?;
+            let right_value =
+                read_scalar_register(registers, function_id, instruction, right_register)?;
+            let (left, right) = match (left_value, right_value) {
+                (ScalarValue::Number(left), ScalarValue::Number(right)) => (left, right),
+                _ => (scalar_to_number(left_value), scalar_to_number(right_value)),
+            };
 
             if scalar_relational_jump_matches(instruction.opcode, left, right) {
                 Ok(ScalarInstructionResult::Jump(read_scalar_jump_target(
@@ -4071,6 +5684,26 @@ fn execute_scalar_instruction<'a>(
             };
             let left_register = read_unsigned_operand(instruction_bytes, 1 + delta_width, 1);
             let right_register = read_unsigned_operand(instruction_bytes, 2 + delta_width, 1);
+            if left_register == right_register {
+                let value =
+                    read_scalar_register(registers, function_id, instruction, left_register)?;
+                let equal = scalar_value_self_equal(value);
+                let should_jump = match instruction.opcode {
+                    207 | 208 | 211 | 212 => equal,
+                    209 | 210 | 213 | 214 => !equal,
+                    _ => unreachable!("matched equality jump opcodes"),
+                };
+
+                if should_jump {
+                    return Ok(ScalarInstructionResult::Jump(read_scalar_jump_target(
+                        instruction,
+                        instruction_bytes,
+                        1,
+                        delta_width,
+                    )));
+                }
+                return Ok(ScalarInstructionResult::Continue);
+            }
             let left = read_scalar_register(registers, function_id, instruction, left_register)?;
             let right = read_scalar_register(registers, function_id, instruction, right_register)?;
             let should_jump = match instruction.opcode {
@@ -4187,12 +5820,28 @@ fn execute_scalar_instruction<'a>(
             Ok(ScalarInstructionResult::Continue)
         }
         153 => {
+            let this_value = load_scalar_this_non_strict(arguments);
             write_scalar_destination(
                 registers,
                 function_id,
                 instruction,
                 instruction_bytes,
-                ScalarValue::Object(ScalarObjectHandle::Global),
+                this_value,
+            )?;
+            Ok(ScalarInstructionResult::Continue)
+        }
+        157 => {
+            let destination = read_unsigned_operand(instruction_bytes, 1, 1);
+            let source = read_unsigned_operand(instruction_bytes, 2, 1);
+            let value = read_scalar_register(registers, function_id, instruction, source)?;
+            let string_value =
+                scalar_add_empty_string(bytecode, function_id, instruction, source, value)?;
+            write_scalar_register(
+                registers,
+                function_id,
+                instruction,
+                destination,
+                string_value,
             )?;
             Ok(ScalarInstructionResult::Continue)
         }
@@ -4242,6 +5891,27 @@ fn read_scalar_string_operand<'a>(
     })
 }
 
+fn read_cached_scalar_string_operand<'a>(
+    bytecode: &HermesBytecode<'a>,
+    cache: &mut ScalarStringOperandCache<'a>,
+    function_id: u32,
+    instruction: HermesInstruction,
+    string_id: u32,
+) -> Result<&'a str, ScalarExecutionError> {
+    let slot = usize::try_from(string_id)
+        .expect("Hermes string id fits in usize on supported targets")
+        & (SCALAR_STRING_OPERAND_CACHE_SLOTS - 1);
+    if let Some((cached_id, cached)) = cache.entries[slot] {
+        if cached_id == string_id {
+            return Ok(cached);
+        }
+    }
+
+    let value = read_scalar_string_operand(bytecode, function_id, instruction, string_id)?;
+    cache.entries[slot] = Some((string_id, value));
+    Ok(value)
+}
+
 fn scalar_jump_delta_width(opcode: u8) -> usize {
     match opcode {
         175 | 177 | 179 | 181 | 184 | 186 | 188 | 190 | 192 | 194 | 196 | 198 | 200 | 202 | 204
@@ -4272,7 +5942,8 @@ fn scalar_typeof_is_matches(value: ScalarValue, mask: u16) -> bool {
         ScalarValue::Null => TYPEOF_IS_NULL,
         ScalarValue::Boolean(_) => TYPEOF_IS_BOOLEAN,
         ScalarValue::Number(_) => TYPEOF_IS_NUMBER,
-        ScalarValue::String(_) => TYPEOF_IS_STRING,
+        ScalarValue::String(_) | ScalarValue::DynamicString(_) => TYPEOF_IS_STRING,
+        ScalarValue::Symbol(_) => TYPEOF_IS_OBJECT,
         ScalarValue::Environment(_) | ScalarValue::Object(_) => TYPEOF_IS_OBJECT,
         ScalarValue::Function(_) => TYPEOF_IS_FUNCTION,
         ScalarValue::Empty => return false,
@@ -4281,12 +5952,26 @@ fn scalar_typeof_is_matches(value: ScalarValue, mask: u16) -> bool {
     mask & type_bit != 0
 }
 
+fn scalar_typeof_name(value: ScalarValue) -> &'static str {
+    match value {
+        ScalarValue::Empty | ScalarValue::Undefined => "undefined",
+        ScalarValue::Null | ScalarValue::Environment(_) | ScalarValue::Object(_) => "object",
+        ScalarValue::Boolean(_) => "boolean",
+        ScalarValue::Number(_) => "number",
+        ScalarValue::String(_) | ScalarValue::DynamicString(_) => "string",
+        ScalarValue::Symbol(_) => "symbol",
+        ScalarValue::Function(_) => "function",
+    }
+}
+
 fn scalar_to_boolean(value: ScalarValue) -> bool {
     match value {
         ScalarValue::Empty | ScalarValue::Undefined | ScalarValue::Null => false,
         ScalarValue::Boolean(value) => value,
         ScalarValue::Number(value) => value != 0.0 && !value.is_nan(),
         ScalarValue::String(handle) => !handle.is_empty,
+        ScalarValue::DynamicString(handle) => !handle.is_empty,
+        ScalarValue::Symbol(_) => true,
         ScalarValue::Environment(_) | ScalarValue::Object(_) | ScalarValue::Function(_) => true,
     }
 }
@@ -4297,7 +5982,8 @@ fn scalar_to_number(value: ScalarValue) -> f64 {
         ScalarValue::Boolean(true) => 1.0,
         ScalarValue::Boolean(false) | ScalarValue::Null => 0.0,
         ScalarValue::Empty | ScalarValue::Undefined => f64::NAN,
-        ScalarValue::String(_) => f64::NAN,
+        ScalarValue::String(_) | ScalarValue::DynamicString(_) => f64::NAN,
+        ScalarValue::Symbol(_) => f64::NAN,
         ScalarValue::Environment(_) | ScalarValue::Object(_) | ScalarValue::Function(_) => f64::NAN,
     }
 }
@@ -4332,6 +6018,16 @@ fn scalar_relational_jump_matches(opcode: u8, left: f64, right: f64) -> bool {
     }
 }
 
+fn load_scalar_this_non_strict(arguments: &[ScalarValue]) -> ScalarValue {
+    match arguments.first().copied().unwrap_or(ScalarValue::Undefined) {
+        value @ ScalarValue::Object(_) => value,
+        ScalarValue::Empty | ScalarValue::Undefined | ScalarValue::Null => {
+            ScalarValue::Object(ScalarObjectHandle::Global)
+        }
+        value => value,
+    }
+}
+
 fn scalar_strict_equal(left: ScalarValue, right: ScalarValue) -> bool {
     match (left, right) {
         (ScalarValue::Empty, ScalarValue::Empty)
@@ -4340,11 +6036,17 @@ fn scalar_strict_equal(left: ScalarValue, right: ScalarValue) -> bool {
         (ScalarValue::Boolean(left), ScalarValue::Boolean(right)) => left == right,
         (ScalarValue::Number(left), ScalarValue::Number(right)) => left == right,
         (ScalarValue::String(left), ScalarValue::String(right)) => left == right,
+        (ScalarValue::DynamicString(left), ScalarValue::DynamicString(right)) => left == right,
+        (ScalarValue::Symbol(left), ScalarValue::Symbol(right)) => left == right,
         (ScalarValue::Object(left), ScalarValue::Object(right)) => left == right,
         (ScalarValue::Environment(left), ScalarValue::Environment(right)) => left == right,
         (ScalarValue::Function(left), ScalarValue::Function(right)) => left == right,
         _ => false,
     }
+}
+
+fn scalar_value_self_equal(value: ScalarValue) -> bool {
+    !matches!(value, ScalarValue::Number(value) if value.is_nan())
 }
 
 fn scalar_abstract_equal(left: ScalarValue, right: ScalarValue) -> bool {
@@ -4354,6 +6056,53 @@ fn scalar_abstract_equal(left: ScalarValue, right: ScalarValue) -> bool {
             (ScalarValue::Null, ScalarValue::Undefined)
                 | (ScalarValue::Undefined, ScalarValue::Null)
         )
+}
+
+fn scalar_instance_of(
+    state: &ScalarExecutorState<'_>,
+    object: ScalarValue,
+    constructor: ScalarValue,
+) -> bool {
+    let ScalarValue::Object(object) = object else {
+        return false;
+    };
+    let ScalarValue::Function(constructor) = constructor else {
+        return false;
+    };
+    let ScalarValue::Object(prototype) =
+        read_scalar_function_property(state, constructor, "prototype")
+    else {
+        return false;
+    };
+
+    scalar_prototype_chain_contains(state, object, prototype)
+}
+
+fn scalar_prototype_chain_contains(
+    state: &ScalarExecutorState<'_>,
+    object: ScalarObjectHandle,
+    expected_prototype: ScalarObjectHandle,
+) -> bool {
+    let mut current = Some(object);
+    let mut depth = 0_u8;
+    while let Some(object) = current {
+        if depth > SCALAR_PROTOTYPE_LOOKUP_DEPTH_LIMIT {
+            return false;
+        }
+        let Some(prototype) = read_scalar_object_prototype(state, object) else {
+            return false;
+        };
+        match prototype {
+            ScalarValue::Object(prototype) if prototype == expected_prototype => return true,
+            ScalarValue::Object(prototype) => {
+                current = Some(prototype);
+                depth = depth.saturating_add(1);
+            }
+            ScalarValue::Null | ScalarValue::Undefined | ScalarValue::Empty => return false,
+            _ => return false,
+        }
+    }
+    false
 }
 
 fn scalar_builtin_matches(value: ScalarValue, builtin_id: u32) -> bool {
@@ -4380,14 +6129,89 @@ fn call_scalar_function<'a>(
             Ok(ScalarValue::Number(0.0))
         }
         ScalarValue::Function(ScalarFunctionHandle::NativeDateNow) => Ok(ScalarValue::Number(0.0)),
+        ScalarValue::Function(ScalarFunctionHandle::NativeIsNaN) => Ok(ScalarValue::Boolean(
+            scalar_actual_arguments(arguments)
+                .first()
+                .copied()
+                .is_none_or(|value| scalar_to_number(value).is_nan()),
+        )),
+        ScalarValue::Function(ScalarFunctionHandle::NativeMathRound) => Ok(ScalarValue::Number(
+            scalar_math_argument_to_number(arguments).round(),
+        )),
+        ScalarValue::Function(ScalarFunctionHandle::NativeMathSin) => Ok(ScalarValue::Number(
+            scalar_math_argument_to_number(arguments).sin(),
+        )),
+        ScalarValue::Function(ScalarFunctionHandle::NativeMathSqrt) => Ok(ScalarValue::Number(
+            scalar_math_argument_to_number(arguments).sqrt(),
+        )),
+        ScalarValue::Function(ScalarFunctionHandle::NativeJsonStringify) => {
+            Ok(call_scalar_json_stringify(bytecode, state, arguments))
+        }
+        ScalarValue::Function(ScalarFunctionHandle::NativeJsonParse) => {
+            Ok(call_scalar_json_parse(bytecode, state, arguments))
+        }
+        ScalarValue::Function(ScalarFunctionHandle::NativeFunctionToString) => {
+            Ok(call_scalar_function_to_string_call(bytecode))
+        }
+        ScalarValue::Function(ScalarFunctionHandle::NativeFunctionToStringCall) => {
+            Ok(call_scalar_function_to_string_call(bytecode))
+        }
+        ScalarValue::Function(ScalarFunctionHandle::NativeFunctionBind) => {
+            Ok(arguments.first().copied().unwrap_or(ScalarValue::Undefined))
+        }
+        ScalarValue::Function(ScalarFunctionHandle::NativeFunctionCall) => {
+            let target = arguments.first().copied().unwrap_or(ScalarValue::Undefined);
+            call_scalar_function(
+                bytecode,
+                state,
+                function_id,
+                instruction,
+                register,
+                target,
+                scalar_actual_arguments(arguments),
+            )
+        }
+        ScalarValue::Function(ScalarFunctionHandle::NativeArrayIsArray) => {
+            Ok(ScalarValue::Boolean(matches!(
+                scalar_actual_arguments(arguments).first().copied(),
+                Some(ScalarValue::Object(ScalarObjectHandle::Array(_)))
+            )))
+        }
+        ScalarValue::Function(ScalarFunctionHandle::NativeArrayMap) => {
+            Ok(ScalarValue::Object(allocate_scalar_array(state, 0)))
+        }
+        ScalarValue::Function(ScalarFunctionHandle::NativeArrayForEach) => {
+            Ok(ScalarValue::Undefined)
+        }
+        ScalarValue::Function(ScalarFunctionHandle::NativeUint8ArraySet) => {
+            Ok(call_scalar_uint8_array_set(state, arguments))
+        }
         ScalarValue::Function(ScalarFunctionHandle::HermesInternalConcat) => {
             Ok(call_scalar_hermes_internal_concat(arguments))
         }
+        ScalarValue::Function(ScalarFunctionHandle::NativeObjectCreate) => {
+            Ok(call_scalar_object_create(state, arguments))
+        }
         ScalarValue::Function(ScalarFunctionHandle::NativeObjectDefineProperty) => {
-            Ok(scalar_actual_arguments(arguments)
-                .first()
-                .copied()
-                .unwrap_or(ScalarValue::Undefined))
+            call_scalar_object_define_property(bytecode, state, function_id, instruction, arguments)
+        }
+        ScalarValue::Function(ScalarFunctionHandle::NativeObjectDefineProperties) => {
+            call_scalar_object_define_properties(
+                bytecode,
+                state,
+                function_id,
+                instruction,
+                arguments,
+            )
+        }
+        ScalarValue::Function(ScalarFunctionHandle::NativeObjectAssign) => {
+            Ok(call_scalar_object_assign(state, arguments))
+        }
+        ScalarValue::Function(ScalarFunctionHandle::NativeObjectFreeze) => {
+            Ok(arguments.get(1).copied().unwrap_or(ScalarValue::Undefined))
+        }
+        ScalarValue::Function(ScalarFunctionHandle::NativeObjectGetPrototypeOf) => {
+            Ok(call_scalar_object_get_prototype_of(state, arguments))
         }
         ScalarValue::Function(ScalarFunctionHandle::NativeObjectGetOwnPropertyDescriptor) => {
             call_scalar_object_get_own_property_descriptor(
@@ -4397,6 +6221,12 @@ fn call_scalar_function<'a>(
                 instruction,
                 arguments,
             )
+        }
+        ScalarValue::Function(ScalarFunctionHandle::NativeObjectKeys) => {
+            Ok(call_scalar_object_keys(bytecode, state, arguments))
+        }
+        ScalarValue::Function(ScalarFunctionHandle::NativeObjectPreventExtensions) => {
+            Ok(arguments.get(1).copied().unwrap_or(ScalarValue::Undefined))
         }
         ScalarValue::Function(ScalarFunctionHandle::NativeObjectHasOwnProperty) => {
             Ok(ScalarValue::Boolean(call_scalar_object_has_own_property(
@@ -4440,11 +6270,26 @@ fn call_scalar_function<'a>(
         ScalarValue::Function(ScalarFunctionHandle::NativeStringReplace) => {
             Ok(arguments.first().copied().unwrap_or(ScalarValue::Undefined))
         }
+        ScalarValue::Function(ScalarFunctionHandle::NativeStringIndexOf) => {
+            Ok(call_scalar_string_index_of(bytecode, state, arguments))
+        }
+        ScalarValue::Function(ScalarFunctionHandle::NativeStringCharCodeAt) => {
+            Ok(call_scalar_string_char_code_at(bytecode, state, arguments))
+        }
+        ScalarValue::Function(ScalarFunctionHandle::NativeSymbolConstructor) => {
+            Ok(call_scalar_symbol(arguments))
+        }
+        ScalarValue::Function(ScalarFunctionHandle::NativeSymbolFor) => {
+            Ok(call_scalar_symbol(arguments))
+        }
         ScalarValue::Function(ScalarFunctionHandle::NativeTurboModuleProxy) => {
             Ok(call_scalar_turbo_module_proxy(state))
         }
         ScalarValue::Function(ScalarFunctionHandle::NativeModuleGetConstants) => {
             Ok(call_scalar_native_module_get_constants(bytecode, state))
+        }
+        ScalarValue::Function(ScalarFunctionHandle::NativePerformanceGetSupportedEntryTypes) => {
+            Ok(ScalarValue::Object(allocate_scalar_array(state, 0)))
         }
         ScalarValue::Function(ScalarFunctionHandle::NativeNoopFunction) => {
             Ok(ScalarValue::Undefined)
@@ -4456,6 +6301,12 @@ fn call_scalar_function<'a>(
         ScalarValue::Function(ScalarFunctionHandle::NativeMetroRequire) => {
             call_scalar_metro_require(bytecode, state, arguments)
         }
+        ScalarValue::Function(ScalarFunctionHandle::NativeMetroImportDefault) => {
+            Ok(call_scalar_metro_import_default(state, arguments))
+        }
+        ScalarValue::Function(ScalarFunctionHandle::NativeMetroImportAll) => {
+            Ok(call_scalar_metro_import_all(arguments))
+        }
         ScalarValue::Function(ScalarFunctionHandle::NativeMetroRegisterSegment) => {
             Ok(ScalarValue::Undefined)
         }
@@ -4463,6 +6314,13 @@ fn call_scalar_function<'a>(
             function_id: target_function_id,
             environment,
         }) => {
+            record_scalar_bytecode_call(
+                state,
+                function_id,
+                instruction.offset,
+                target_function_id,
+                arguments,
+            );
             let report = execute_scalar_function_with_state_and_environment(
                 bytecode,
                 state,
@@ -4492,6 +6350,83 @@ fn scalar_actual_arguments(arguments: &[ScalarValue]) -> &[ScalarValue] {
     arguments.get(1..).unwrap_or(&[])
 }
 
+fn scalar_math_argument_to_number(arguments: &[ScalarValue]) -> f64 {
+    match arguments.get(1).copied() {
+        Some(ScalarValue::Number(value)) => value,
+        Some(value) => scalar_to_number(value),
+        None => f64::NAN,
+    }
+}
+
+fn scalar_constructor_arguments(
+    this_value: ScalarValue,
+    registers: &[ScalarValue],
+    argument_count: u32,
+) -> Vec<ScalarValue> {
+    let mut arguments =
+        read_scalar_constructor_call_arguments(this_value, registers, argument_count)
+            .unwrap_or_else(|| read_scalar_tail_call_arguments(registers, argument_count));
+    if arguments.first().copied() != Some(this_value) {
+        arguments.insert(0, this_value);
+    }
+    arguments
+}
+
+fn read_scalar_constructor_call_arguments(
+    this_value: ScalarValue,
+    registers: &[ScalarValue],
+    argument_count: u32,
+) -> Option<Vec<ScalarValue>> {
+    let argument_count =
+        usize::try_from(argument_count).expect("Hermes argument count fits in usize");
+    if argument_count == 0 {
+        return Some(Vec::new());
+    }
+
+    let end = registers
+        .iter()
+        .rposition(|register_value| *register_value == this_value)?;
+    let start = (end + 1).saturating_sub(argument_count);
+    let mut arguments = registers[start..=end].to_vec();
+    arguments.reverse();
+    Some(arguments)
+}
+
+fn read_scalar_tail_call_arguments(
+    registers: &[ScalarValue],
+    argument_count: u32,
+) -> Vec<ScalarValue> {
+    let argument_count =
+        usize::try_from(argument_count).expect("Hermes argument count fits in usize");
+    if argument_count == 0 || registers.is_empty() {
+        return Vec::new();
+    }
+
+    let start = registers.len().saturating_sub(argument_count);
+    let mut arguments = registers[start..].to_vec();
+    arguments.reverse();
+    arguments
+}
+
+fn record_scalar_bytecode_call(
+    state: &mut ScalarExecutorState<'_>,
+    caller_function_id: u32,
+    caller_offset: u32,
+    function_id: u32,
+    arguments: &[ScalarValue],
+) {
+    const RECENT_BYTECODE_CALL_LIMIT: usize = 32;
+    state.recent_bytecode_calls.push(ScalarCallFrame {
+        caller_function_id,
+        caller_offset,
+        function_id,
+        arguments: arguments.to_vec(),
+    });
+    if state.recent_bytecode_calls.len() > RECENT_BYTECODE_CALL_LIMIT {
+        state.recent_bytecode_calls.remove(0);
+    }
+}
+
 fn call_scalar_hermes_internal_concat(arguments: &[ScalarValue]) -> ScalarValue {
     scalar_actual_arguments(arguments)
         .iter()
@@ -4503,15 +6438,601 @@ fn call_scalar_hermes_internal_concat(arguments: &[ScalarValue]) -> ScalarValue 
                     is_empty: false,
                     ..
                 })
+            ) || matches!(
+                argument,
+                ScalarValue::DynamicString(ScalarDynamicStringHandle {
+                    is_empty: false,
+                    ..
+                })
             )
         })
         .or_else(|| {
-            scalar_actual_arguments(arguments)
-                .iter()
-                .find(|argument| matches!(argument, ScalarValue::String(_)))
+            scalar_actual_arguments(arguments).iter().find(|argument| {
+                matches!(
+                    argument,
+                    ScalarValue::String(_) | ScalarValue::DynamicString(_)
+                )
+            })
         })
         .copied()
         .unwrap_or(ScalarValue::Undefined)
+}
+
+fn call_scalar_function_to_string_call(bytecode: &HermesBytecode<'_>) -> ScalarValue {
+    scalar_string_value_for_name(bytecode, "[native code]").unwrap_or(ScalarValue::Undefined)
+}
+
+fn call_scalar_json_stringify<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
+    arguments: &[ScalarValue],
+) -> ScalarValue {
+    let value = scalar_actual_arguments(arguments)
+        .first()
+        .copied()
+        .unwrap_or(ScalarValue::Undefined);
+    let Some(json_value) = scalar_value_to_json(bytecode, state, value, false, &mut Vec::new())
+    else {
+        return ScalarValue::Undefined;
+    };
+    let Ok(text) = serde_json::to_string(&json_value) else {
+        return ScalarValue::Undefined;
+    };
+
+    allocate_scalar_dynamic_json_string(state, text, json_value)
+}
+
+fn call_scalar_json_parse<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
+    arguments: &[ScalarValue],
+) -> ScalarValue {
+    let Some(value) = scalar_actual_arguments(arguments).first().copied() else {
+        return ScalarValue::Undefined;
+    };
+    let cached_json_value = match value {
+        ScalarValue::DynamicString(handle) => state
+            .dynamic_string_json_values
+            .get_mut(usize::try_from(handle.dynamic_id).expect("dynamic string id fits in usize"))
+            .and_then(Option::take)
+            .map(|json_value| (handle.dynamic_id, json_value)),
+        _ => None,
+    };
+    if let Some((dynamic_id, json_value)) = cached_json_value {
+        let parsed_value = scalar_value_from_json(bytecode, state, &json_value);
+        if let Some(slot) = state
+            .dynamic_string_json_values
+            .get_mut(usize::try_from(dynamic_id).expect("dynamic string id fits in usize"))
+        {
+            *slot = Some(json_value);
+        }
+        return parsed_value;
+    }
+
+    let Some(text) = scalar_value_string_text(bytecode, state, value) else {
+        return ScalarValue::Undefined;
+    };
+    let Ok(json_value) = serde_json::from_str::<serde_json::Value>(text.as_ref()) else {
+        return ScalarValue::Undefined;
+    };
+
+    scalar_value_from_json(bytecode, state, &json_value)
+}
+
+fn scalar_value_to_json<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &ScalarExecutorState<'a>,
+    value: ScalarValue,
+    in_array: bool,
+    stack: &mut Vec<ScalarObjectHandle>,
+) -> Option<serde_json::Value> {
+    match value {
+        ScalarValue::Empty | ScalarValue::Undefined | ScalarValue::Function(_) => {
+            in_array.then_some(serde_json::Value::Null)
+        }
+        ScalarValue::Null => Some(serde_json::Value::Null),
+        ScalarValue::Boolean(value) => Some(serde_json::Value::Bool(value)),
+        ScalarValue::Number(value) => serde_json::Number::from_f64(value)
+            .map(serde_json::Value::Number)
+            .or(Some(serde_json::Value::Null)),
+        ScalarValue::String(_) | ScalarValue::DynamicString(_) => {
+            scalar_value_string_text(bytecode, state, value)
+                .map(|value| serde_json::Value::String(value.into_owned()))
+        }
+        ScalarValue::Symbol(_) | ScalarValue::Environment(_) => {
+            in_array.then_some(serde_json::Value::Null)
+        }
+        ScalarValue::Object(object @ ScalarObjectHandle::Array(_)) => {
+            if scalar_json_stack_contains(stack, object) {
+                return None;
+            }
+            stack.push(object);
+            let length = read_scalar_array_length(state, object).unwrap_or(0);
+            let mut values =
+                Vec::with_capacity(usize::try_from(length).expect("array length fits in usize"));
+            for index in 0..length {
+                let value = read_scalar_array_element(state, object, index);
+                values.push(
+                    scalar_value_to_json(bytecode, state, value, true, stack)
+                        .unwrap_or(serde_json::Value::Null),
+                );
+            }
+            stack.pop();
+            Some(serde_json::Value::Array(values))
+        }
+        ScalarValue::Object(object @ ScalarObjectHandle::Object(_)) => {
+            if scalar_json_stack_contains(stack, object) {
+                return None;
+            }
+            stack.push(object);
+            let mut map = serde_json::Map::new();
+            for property_name in scalar_json_object_property_names(state, object) {
+                let value = read_scalar_object_property(state, object, property_name);
+                if let Some(json_value) = scalar_value_to_json(bytecode, state, value, false, stack)
+                {
+                    map.insert(property_name.to_owned(), json_value);
+                }
+            }
+            stack.pop();
+            Some(serde_json::Value::Object(map))
+        }
+        ScalarValue::Object(_) => Some(serde_json::Value::Object(serde_json::Map::new())),
+    }
+}
+
+fn scalar_json_stack_contains(stack: &[ScalarObjectHandle], object: ScalarObjectHandle) -> bool {
+    stack.contains(&object)
+}
+
+fn scalar_json_object_property_names<'a>(
+    state: &ScalarExecutorState<'a>,
+    object: ScalarObjectHandle,
+) -> Vec<&'a str> {
+    state
+        .object_property_names
+        .get(&object)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn scalar_value_from_json<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
+    value: &serde_json::Value,
+) -> ScalarValue {
+    match value {
+        serde_json::Value::Null => ScalarValue::Null,
+        serde_json::Value::Bool(value) => ScalarValue::Boolean(*value),
+        serde_json::Value::Number(value) => value
+            .as_f64()
+            .map_or(ScalarValue::Undefined, ScalarValue::Number),
+        serde_json::Value::String(value) => scalar_string_value_for_name(bytecode, value)
+            .unwrap_or_else(|| allocate_scalar_dynamic_string(state, value.clone())),
+        serde_json::Value::Array(values) => {
+            let array = allocate_scalar_array(
+                state,
+                u32::try_from(values.len()).expect("JSON array length fits in u32"),
+            );
+            for (index, value) in values.iter().enumerate() {
+                let value = scalar_value_from_json(bytecode, state, value);
+                write_scalar_array_element(
+                    state,
+                    array,
+                    u32::try_from(index).expect("JSON array index fits in u32"),
+                    value,
+                );
+            }
+            ScalarValue::Object(array)
+        }
+        serde_json::Value::Object(values) => {
+            let object = allocate_scalar_object(state);
+            for (name, value) in values {
+                let Some(name) = scalar_property_name_for_json_key(bytecode, state, name) else {
+                    continue;
+                };
+                let value = scalar_value_from_json(bytecode, state, value);
+                write_scalar_named_object_property(state, object, name, value);
+            }
+            ScalarValue::Object(object)
+        }
+    }
+}
+
+fn scalar_property_name_for_json_key<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
+    key: &str,
+) -> Option<&'a str> {
+    if let Some(cached) = state.json_property_name_cache.get(key) {
+        return *cached;
+    }
+
+    let mut property_name = None;
+    for string_id in 0..bytecode.header().string_count {
+        let Ok(string) = bytecode.string(string_id) else {
+            continue;
+        };
+        if string.is_utf16() || string.bytes() != key.as_bytes() {
+            continue;
+        }
+        property_name = std::str::from_utf8(string.bytes()).ok();
+        break;
+    }
+    state
+        .json_property_name_cache
+        .insert(key.to_owned(), property_name);
+    property_name
+}
+
+fn call_scalar_uint8_array_set(
+    state: &mut ScalarExecutorState<'_>,
+    arguments: &[ScalarValue],
+) -> ScalarValue {
+    let Some(ScalarValue::Object(target @ ScalarObjectHandle::Uint8Array(_))) =
+        arguments.first().copied()
+    else {
+        return ScalarValue::Undefined;
+    };
+    let Some(ScalarValue::Object(source @ ScalarObjectHandle::Uint8Array(_))) =
+        scalar_actual_arguments(arguments).first().copied()
+    else {
+        return ScalarValue::Undefined;
+    };
+
+    if source == target {
+        return ScalarValue::Undefined;
+    }
+
+    let ScalarObjectHandle::Uint8Array(source_id) = source else {
+        return ScalarValue::Undefined;
+    };
+    let ScalarObjectHandle::Uint8Array(target_id) = target else {
+        return ScalarValue::Undefined;
+    };
+    let source_index = usize::try_from(source_id).expect("Uint8Array id fits in usize");
+    let target_index = usize::try_from(target_id).expect("Uint8Array id fits in usize");
+
+    let Some(source_bytes) = state
+        .uint8_array_storage
+        .get(source_index)
+        .and_then(Option::as_ref)
+        .cloned()
+    else {
+        return ScalarValue::Undefined;
+    };
+    let Some(target_bytes) = state
+        .uint8_array_storage
+        .get_mut(target_index)
+        .and_then(Option::as_mut)
+    else {
+        return ScalarValue::Undefined;
+    };
+    let copy_length = target_bytes.len().min(source_bytes.len());
+    if copy_length > 0 {
+        target_bytes[..copy_length].copy_from_slice(&source_bytes[..copy_length]);
+    }
+
+    ScalarValue::Undefined
+}
+
+fn call_scalar_object_create(
+    state: &mut ScalarExecutorState<'_>,
+    arguments: &[ScalarValue],
+) -> ScalarValue {
+    let object = allocate_scalar_object(state);
+    if let Some(prototype @ (ScalarValue::Object(_) | ScalarValue::Null)) =
+        scalar_actual_arguments(arguments).first().copied()
+    {
+        write_scalar_object_prototype(state, object, prototype);
+    }
+    let Some(ScalarValue::Object(descriptors)) = scalar_actual_arguments(arguments).get(1).copied()
+    else {
+        return ScalarValue::Object(object);
+    };
+
+    let descriptor_properties = state
+        .object_properties
+        .iter()
+        .filter(|(stored_object, _, _)| *stored_object == descriptors)
+        .map(|(_, name, descriptor)| (*name, *descriptor))
+        .collect::<Vec<_>>();
+    for (name, descriptor) in descriptor_properties {
+        let value = match descriptor {
+            ScalarValue::Object(descriptor) => {
+                read_scalar_own_object_property(state, descriptor, "value")
+                    .unwrap_or(ScalarValue::Undefined)
+            }
+            value => value,
+        };
+        write_scalar_named_object_property(state, object, name, value);
+    }
+
+    ScalarValue::Object(object)
+}
+
+fn call_scalar_object_get_prototype_of(
+    state: &ScalarExecutorState<'_>,
+    arguments: &[ScalarValue],
+) -> ScalarValue {
+    let Some(value) = scalar_actual_arguments(arguments).first().copied() else {
+        return ScalarValue::Undefined;
+    };
+
+    match value {
+        ScalarValue::Function(_) => ScalarValue::Object(ScalarObjectHandle::NativePrototype(
+            ScalarNativePrototype::Function,
+        )),
+        ScalarValue::Object(ScalarObjectHandle::Map(_)) => ScalarValue::Object(
+            ScalarObjectHandle::NativePrototype(ScalarNativePrototype::Map),
+        ),
+        ScalarValue::Object(ScalarObjectHandle::Set(_)) => ScalarValue::Object(
+            ScalarObjectHandle::NativePrototype(ScalarNativePrototype::Set),
+        ),
+        ScalarValue::Object(ScalarObjectHandle::WeakMap(_)) => ScalarValue::Object(
+            ScalarObjectHandle::NativePrototype(ScalarNativePrototype::WeakMap),
+        ),
+        ScalarValue::Object(ScalarObjectHandle::WeakSet(_)) => ScalarValue::Object(
+            ScalarObjectHandle::NativePrototype(ScalarNativePrototype::WeakSet),
+        ),
+        ScalarValue::Object(object) => {
+            read_scalar_object_prototype(state, object).unwrap_or(ScalarValue::Object(
+                ScalarObjectHandle::NativePrototype(ScalarNativePrototype::Object),
+            ))
+        }
+        _ => ScalarValue::Undefined,
+    }
+}
+
+fn call_scalar_object_assign(
+    state: &mut ScalarExecutorState<'_>,
+    arguments: &[ScalarValue],
+) -> ScalarValue {
+    let actual_arguments = scalar_actual_arguments(arguments);
+    let Some(target) = actual_arguments.first().copied() else {
+        return ScalarValue::Undefined;
+    };
+    let ScalarValue::Object(target_object) = target else {
+        return target;
+    };
+
+    for source in actual_arguments.iter().skip(1).copied() {
+        let ScalarValue::Object(source_object) = source else {
+            continue;
+        };
+
+        let properties = state
+            .object_properties
+            .iter()
+            .filter(|(object, _, _)| *object == source_object)
+            .map(|(_, name, value)| (*name, *value))
+            .collect::<Vec<_>>();
+        for (name, value) in properties {
+            write_scalar_named_object_property(state, target_object, name, value);
+        }
+
+        let getters = state
+            .object_getters
+            .iter()
+            .filter(|(object, _, _)| *object == source_object)
+            .map(|(_, name, getter)| (*name, *getter))
+            .collect::<Vec<_>>();
+        for (name, getter) in getters {
+            write_scalar_named_object_getter_property(state, target_object, name, getter);
+        }
+    }
+
+    target
+}
+
+fn call_scalar_string_index_of(
+    bytecode: &HermesBytecode<'_>,
+    state: &ScalarExecutorState<'_>,
+    arguments: &[ScalarValue],
+) -> ScalarValue {
+    let Some(receiver) = arguments.first().copied() else {
+        return ScalarValue::Number(-1.0);
+    };
+    let Some(needle) = scalar_actual_arguments(arguments).first().copied() else {
+        return ScalarValue::Number(-1.0);
+    };
+    let Some(receiver) = scalar_value_string_text(bytecode, state, receiver) else {
+        return ScalarValue::Number(-1.0);
+    };
+    let Some(needle) = scalar_value_string_text(bytecode, state, needle) else {
+        return ScalarValue::Number(-1.0);
+    };
+
+    if needle.is_empty() {
+        return ScalarValue::Number(0.0);
+    }
+
+    receiver
+        .as_ref()
+        .find(needle.as_ref())
+        .map_or(ScalarValue::Number(-1.0), |index| {
+            ScalarValue::Number(index as f64)
+        })
+}
+
+fn call_scalar_string_char_code_at(
+    bytecode: &HermesBytecode<'_>,
+    state: &ScalarExecutorState<'_>,
+    arguments: &[ScalarValue],
+) -> ScalarValue {
+    let Some(receiver) = arguments.first().copied() else {
+        return ScalarValue::Number(f64::NAN);
+    };
+    let index = scalar_actual_arguments(arguments)
+        .first()
+        .and_then(|value| scalar_value_to_u32(*value))
+        .unwrap_or(0);
+    let Some(receiver) = scalar_value_string_text(bytecode, state, receiver) else {
+        return ScalarValue::Number(f64::NAN);
+    };
+    let Some(byte) = receiver
+        .as_bytes()
+        .get(usize::try_from(index).expect("u32 fits in usize"))
+    else {
+        return ScalarValue::Number(f64::NAN);
+    };
+
+    ScalarValue::Number(f64::from(*byte))
+}
+
+fn call_scalar_symbol(arguments: &[ScalarValue]) -> ScalarValue {
+    match scalar_actual_arguments(arguments).first().copied() {
+        Some(ScalarValue::String(description)) => ScalarValue::Symbol(description),
+        _ => ScalarValue::Undefined,
+    }
+}
+
+fn call_scalar_object_define_property<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
+    function_id: u32,
+    instruction: HermesInstruction,
+    arguments: &[ScalarValue],
+) -> Result<ScalarValue, ScalarExecutionError> {
+    let actual_arguments = scalar_actual_arguments(arguments);
+    let Some(target) = actual_arguments.first().copied() else {
+        return Ok(ScalarValue::Undefined);
+    };
+    let Some(property_name) = actual_arguments
+        .get(1)
+        .and_then(|value| scalar_value_to_string(bytecode, function_id, instruction, *value).ok())
+    else {
+        return Ok(target);
+    };
+    let Some(descriptor) = actual_arguments.get(2).copied() else {
+        return Ok(target);
+    };
+    let Some(definition) = scalar_descriptor_property_definition(state, descriptor) else {
+        return Ok(target);
+    };
+    write_scalar_defined_property(
+        state,
+        function_id,
+        instruction,
+        target,
+        property_name,
+        definition,
+    )?;
+
+    Ok(target)
+}
+
+fn call_scalar_object_define_properties<'a>(
+    _bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
+    function_id: u32,
+    instruction: HermesInstruction,
+    arguments: &[ScalarValue],
+) -> Result<ScalarValue, ScalarExecutionError> {
+    let actual_arguments = scalar_actual_arguments(arguments);
+    let Some(target) = actual_arguments.first().copied() else {
+        return Ok(ScalarValue::Undefined);
+    };
+    let Some(ScalarValue::Object(descriptors)) = actual_arguments.get(1).copied() else {
+        return Ok(target);
+    };
+
+    let descriptor_properties = state
+        .object_properties
+        .iter()
+        .filter(|(stored_object, _, _)| *stored_object == descriptors)
+        .map(|(_, name, descriptor)| (*name, *descriptor))
+        .collect::<Vec<_>>();
+
+    for (property_name, descriptor) in descriptor_properties {
+        let Some(definition) = scalar_descriptor_property_definition(state, descriptor) else {
+            continue;
+        };
+
+        write_scalar_defined_property(
+            state,
+            function_id,
+            instruction,
+            target,
+            property_name,
+            definition,
+        )?;
+    }
+
+    Ok(target)
+}
+
+fn scalar_descriptor_property_definition(
+    state: &ScalarExecutorState<'_>,
+    descriptor: ScalarValue,
+) -> Option<ScalarDescriptorProperty> {
+    let ScalarValue::Object(descriptor) = descriptor else {
+        return None;
+    };
+    if scalar_object_has_own_named_property(state, descriptor, "value") {
+        return read_scalar_own_object_property(state, descriptor, "value")
+            .map(ScalarDescriptorProperty::Value);
+    }
+    let getter = read_scalar_own_object_property(state, descriptor, "get");
+    match getter {
+        Some(getter @ ScalarValue::Function(_)) => Some(ScalarDescriptorProperty::Getter(getter)),
+        _ => None,
+    }
+}
+
+fn write_scalar_defined_property<'a>(
+    state: &mut ScalarExecutorState<'a>,
+    function_id: u32,
+    instruction: HermesInstruction,
+    target: ScalarValue,
+    property_name: &'a str,
+    definition: ScalarDescriptorProperty,
+) -> Result<(), ScalarExecutionError> {
+    match target {
+        ScalarValue::Object(ScalarObjectHandle::Global) => {
+            let value = match definition {
+                ScalarDescriptorProperty::Value(value) => value,
+                ScalarDescriptorProperty::Getter(getter) => getter,
+            };
+            let value = map_scalar_global_write(property_name, value);
+            if let Some((_, stored_value)) = state
+                .global_properties
+                .iter_mut()
+                .rev()
+                .find(|(name, _)| *name == property_name)
+            {
+                *stored_value = value;
+            } else {
+                state.global_properties.push((property_name, value));
+            }
+        }
+        ScalarValue::Object(handle) => match definition {
+            ScalarDescriptorProperty::Value(value) => {
+                write_scalar_named_object_property(state, handle, property_name, value);
+            }
+            ScalarDescriptorProperty::Getter(getter) => {
+                write_scalar_named_object_getter_property(state, handle, property_name, getter);
+            }
+        },
+        ScalarValue::Function(handle) => {
+            let value = match definition {
+                ScalarDescriptorProperty::Value(value) => value,
+                ScalarDescriptorProperty::Getter(getter) => getter,
+            };
+            write_scalar_named_function_property(state, handle, property_name, value);
+        }
+        ScalarValue::Undefined | ScalarValue::Null | ScalarValue::Empty
+            if state.relaxed_host_stubs => {}
+        value => {
+            return Err(ScalarExecutionError::UnsupportedPropertyBase {
+                function_id,
+                offset: instruction.offset,
+                opcode: instruction.opcode,
+                register: 0,
+                value,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn call_scalar_object_get_own_property_descriptor<'a>(
@@ -4536,7 +7057,10 @@ fn call_scalar_object_get_own_property_descriptor<'a>(
         ScalarValue::Object(ScalarObjectHandle::Global) => {
             read_scalar_global_property(state, property_name)
         }
-        ScalarValue::Object(handle) => read_scalar_object_property(state, handle, property_name),
+        ScalarValue::Object(handle) => {
+            read_scalar_own_object_property(state, handle, property_name)
+                .unwrap_or(ScalarValue::Undefined)
+        }
         ScalarValue::Function(handle) => {
             read_scalar_function_property(state, handle, property_name)
         }
@@ -4558,6 +7082,31 @@ fn call_scalar_object_get_own_property_descriptor<'a>(
         ScalarValue::Boolean(true),
     );
     Ok(ScalarValue::Object(descriptor))
+}
+
+fn call_scalar_object_keys(
+    bytecode: &HermesBytecode<'_>,
+    state: &mut ScalarExecutorState<'_>,
+    arguments: &[ScalarValue],
+) -> ScalarValue {
+    let Some(ScalarValue::Object(object)) = scalar_actual_arguments(arguments).first().copied()
+    else {
+        return ScalarValue::Object(allocate_scalar_array(state, 0));
+    };
+    let names = scalar_object_property_names(bytecode, state, object);
+    let keys = allocate_scalar_array(
+        state,
+        u32::try_from(names.len()).expect("property key count fits in u32"),
+    );
+    for (index, name) in names.into_iter().enumerate() {
+        write_scalar_array_element(
+            state,
+            keys,
+            u32::try_from(index).expect("property key index fits in u32"),
+            name,
+        );
+    }
+    ScalarValue::Object(keys)
 }
 
 fn call_scalar_object_has_own_property(
@@ -4805,6 +7354,7 @@ fn call_scalar_metro_require<'a>(
         exports_value,
         dependency_map,
     ];
+    record_scalar_bytecode_call(state, u32::MAX, 0, function_id, &factory_arguments);
     let _ = execute_scalar_function_with_state(bytecode, state, function_id, &factory_arguments)?;
     let module_exports = read_scalar_object_property(state, module, "exports");
     if let Some((_, stored_exports)) = state
@@ -4819,6 +7369,36 @@ fn call_scalar_metro_require<'a>(
     Ok(module_exports)
 }
 
+fn call_scalar_metro_import_default(
+    state: &ScalarExecutorState<'_>,
+    arguments: &[ScalarValue],
+) -> ScalarValue {
+    let module = scalar_actual_arguments(arguments)
+        .first()
+        .copied()
+        .unwrap_or(ScalarValue::Undefined);
+    let ScalarValue::Object(module_object) = module else {
+        return module;
+    };
+
+    if scalar_to_boolean(read_scalar_object_property(
+        state,
+        module_object,
+        "__esModule",
+    )) {
+        read_scalar_object_property(state, module_object, "default")
+    } else {
+        module
+    }
+}
+
+fn call_scalar_metro_import_all(arguments: &[ScalarValue]) -> ScalarValue {
+    scalar_actual_arguments(arguments)
+        .first()
+        .copied()
+        .unwrap_or(ScalarValue::Undefined)
+}
+
 fn scalar_value_to_u32(value: ScalarValue) -> Option<u32> {
     match value {
         ScalarValue::Number(value)
@@ -4828,6 +7408,16 @@ fn scalar_value_to_u32(value: ScalarValue) -> Option<u32> {
         }
         _ => None,
     }
+}
+
+fn scalar_to_uint8(value: ScalarValue) -> u8 {
+    let number = scalar_to_number(value);
+    if !number.is_finite() || number == 0.0 {
+        return 0;
+    }
+
+    let integer = number.trunc() as i64;
+    integer.rem_euclid(256) as u8
 }
 
 fn scalar_value_to_string<'a>(
@@ -4848,6 +7438,90 @@ fn scalar_value_to_string<'a>(
             value,
         }),
     }
+}
+
+fn scalar_add_empty_string(
+    bytecode: &HermesBytecode<'_>,
+    function_id: u32,
+    instruction: HermesInstruction,
+    source_register: u32,
+    value: ScalarValue,
+) -> Result<ScalarValue, ScalarExecutionError> {
+    match value {
+        ScalarValue::String(_) | ScalarValue::DynamicString(_) => Ok(value),
+        ScalarValue::Undefined => scalar_string_value_for_name(bytecode, "undefined").ok_or(
+            ScalarExecutionError::UnsupportedPropertyKey {
+                function_id,
+                offset: instruction.offset,
+                opcode: instruction.opcode,
+                register: source_register,
+                value,
+            },
+        ),
+        ScalarValue::Null => scalar_string_value_for_name(bytecode, "null").ok_or(
+            ScalarExecutionError::UnsupportedPropertyKey {
+                function_id,
+                offset: instruction.offset,
+                opcode: instruction.opcode,
+                register: source_register,
+                value,
+            },
+        ),
+        ScalarValue::Boolean(boolean) => {
+            let expected = if boolean { "true" } else { "false" };
+            scalar_string_value_for_name(bytecode, expected).ok_or(
+                ScalarExecutionError::UnsupportedPropertyKey {
+                    function_id,
+                    offset: instruction.offset,
+                    opcode: instruction.opcode,
+                    register: source_register,
+                    value,
+                },
+            )
+        }
+        ScalarValue::Number(number) => {
+            let expected = scalar_number_to_string(number);
+            scalar_string_value_for_name(bytecode, &expected).ok_or(
+                ScalarExecutionError::UnsupportedPropertyKey {
+                    function_id,
+                    offset: instruction.offset,
+                    opcode: instruction.opcode,
+                    register: source_register,
+                    value,
+                },
+            )
+        }
+        ScalarValue::Empty
+        | ScalarValue::Object(_)
+        | ScalarValue::Environment(_)
+        | ScalarValue::Function(_)
+        | ScalarValue::Symbol(_) => Err(ScalarExecutionError::UnsupportedPropertyKey {
+            function_id,
+            offset: instruction.offset,
+            opcode: instruction.opcode,
+            register: source_register,
+            value,
+        }),
+    }
+}
+
+fn scalar_number_to_string(number: f64) -> String {
+    if number.is_nan() {
+        return "NaN".to_owned();
+    }
+    if number == f64::INFINITY {
+        return "Infinity".to_owned();
+    }
+    if number == f64::NEG_INFINITY {
+        return "-Infinity".to_owned();
+    }
+    if number == 0.0 {
+        return "0".to_owned();
+    }
+    if number.fract() == 0.0 {
+        return format!("{number:.0}");
+    }
+    number.to_string()
 }
 
 fn call_scalar_builtin<'a>(
@@ -4905,26 +7579,97 @@ fn call_scalar_builtin<'a>(
     }
 }
 
-fn construct_scalar_function(
+fn construct_scalar_function<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
+    registers: &[ScalarValue],
     function_id: u32,
     instruction: HermesInstruction,
     register: u32,
     constructor: ScalarValue,
-    _argument_count: u32,
-    relaxed_host_stubs: bool,
+    argument_count: u32,
 ) -> Result<ScalarValue, ScalarExecutionError> {
     match constructor {
-        ScalarValue::Undefined | ScalarValue::Null | ScalarValue::Empty if relaxed_host_stubs => {
+        ScalarValue::Undefined | ScalarValue::Null | ScalarValue::Empty
+            if state.relaxed_host_stubs =>
+        {
             Ok(ScalarValue::Undefined)
         }
         ScalarValue::Function(
-            ScalarFunctionHandle::Bytecode { .. }
+            constructor @ ScalarFunctionHandle::Bytecode {
+                function_id: target_function_id,
+                environment,
+            },
+        ) => {
+            let Some(pending_index) = state
+                .pending_constructor_this_values
+                .iter()
+                .rposition(|(pending_constructor, _)| *pending_constructor == constructor)
+            else {
+                return Ok(ScalarValue::Undefined);
+            };
+            let (_, this_value) = state.pending_constructor_this_values.remove(pending_index);
+            let constructor_arguments =
+                scalar_constructor_arguments(this_value, registers, argument_count);
+            record_scalar_bytecode_call(
+                state,
+                function_id,
+                instruction.offset,
+                target_function_id,
+                &constructor_arguments,
+            );
+            let report = execute_scalar_function_with_state_and_environment(
+                bytecode,
+                state,
+                target_function_id,
+                environment,
+                &constructor_arguments,
+            )?;
+            Ok(report.value)
+        }
+        ScalarValue::Function(
+            ScalarFunctionHandle::NativeBooleanConstructor
             | ScalarFunctionHandle::NativeDateConstructor
             | ScalarFunctionHandle::NativeErrorConstructor
             | ScalarFunctionHandle::NativeMapConstructor
+            | ScalarFunctionHandle::NativeNumberConstructor
+            | ScalarFunctionHandle::NativePromiseConstructor
+            | ScalarFunctionHandle::NativeSetConstructor
+            | ScalarFunctionHandle::NativeStringConstructor
+            | ScalarFunctionHandle::NativeUint8ArrayConstructor
             | ScalarFunctionHandle::NativeWeakMapConstructor
+            | ScalarFunctionHandle::NativeWeakSetConstructor
             | ScalarFunctionHandle::NativeObjectConstructor,
-        ) => Ok(ScalarValue::Undefined),
+        ) => Ok(match constructor {
+            ScalarValue::Function(ScalarFunctionHandle::NativeUint8ArrayConstructor) => {
+                let pending_this = state
+                    .pending_constructor_this_values
+                    .iter()
+                    .rposition(|(pending_constructor, _)| {
+                        *pending_constructor == ScalarFunctionHandle::NativeUint8ArrayConstructor
+                    })
+                    .map(|pending_index| {
+                        state
+                            .pending_constructor_this_values
+                            .remove(pending_index)
+                            .1
+                    });
+                let arguments = pending_this.map_or_else(
+                    || read_scalar_tail_call_arguments(registers, argument_count),
+                    |this_value| {
+                        scalar_constructor_arguments(this_value, registers, argument_count)
+                    },
+                );
+                let length = scalar_actual_arguments(&arguments)
+                    .first()
+                    .copied()
+                    .or_else(|| arguments.first().copied())
+                    .and_then(scalar_value_to_u32)
+                    .unwrap_or(0);
+                ScalarValue::Object(allocate_scalar_uint8_array(state, length))
+            }
+            _ => ScalarValue::Undefined,
+        }),
         value => Err(ScalarExecutionError::UnsupportedConstructorTarget {
             function_id,
             offset: instruction.offset,
@@ -4958,24 +7703,150 @@ fn select_scalar_constructor_result(
     }
 }
 
-fn read_scalar_direct_call_arguments(
+fn call_scalar_direct_function<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
     registers: &[ScalarValue],
     function_id: u32,
     instruction: HermesInstruction,
     instruction_bytes: &[u8],
-) -> Result<Vec<ScalarValue>, ScalarExecutionError> {
-    let argument_count = scalar_direct_call_argument_count(instruction.opcode);
-    let mut arguments = Vec::with_capacity(argument_count);
-    for argument_index in 0..argument_count {
-        let register = read_unsigned_operand(instruction_bytes, 3 + argument_index, 1);
-        arguments.push(read_scalar_register(
-            registers,
-            function_id,
-            instruction,
-            register,
-        )?);
+    callee_register: u32,
+    callee: ScalarValue,
+) -> Result<ScalarValue, ScalarExecutionError> {
+    match instruction.opcode {
+        108 => {
+            let arguments = [read_scalar_call_argument_operand(
+                registers,
+                function_id,
+                instruction,
+                instruction_bytes,
+                0,
+            )?];
+            call_scalar_function(
+                bytecode,
+                state,
+                function_id,
+                instruction,
+                callee_register,
+                callee,
+                &arguments,
+            )
+        }
+        110 => {
+            let arguments = [
+                read_scalar_call_argument_operand(
+                    registers,
+                    function_id,
+                    instruction,
+                    instruction_bytes,
+                    0,
+                )?,
+                read_scalar_call_argument_operand(
+                    registers,
+                    function_id,
+                    instruction,
+                    instruction_bytes,
+                    1,
+                )?,
+            ];
+            call_scalar_function(
+                bytecode,
+                state,
+                function_id,
+                instruction,
+                callee_register,
+                callee,
+                &arguments,
+            )
+        }
+        111 => {
+            let arguments = [
+                read_scalar_call_argument_operand(
+                    registers,
+                    function_id,
+                    instruction,
+                    instruction_bytes,
+                    0,
+                )?,
+                read_scalar_call_argument_operand(
+                    registers,
+                    function_id,
+                    instruction,
+                    instruction_bytes,
+                    1,
+                )?,
+                read_scalar_call_argument_operand(
+                    registers,
+                    function_id,
+                    instruction,
+                    instruction_bytes,
+                    2,
+                )?,
+            ];
+            call_scalar_function(
+                bytecode,
+                state,
+                function_id,
+                instruction,
+                callee_register,
+                callee,
+                &arguments,
+            )
+        }
+        112 => {
+            let arguments = [
+                read_scalar_call_argument_operand(
+                    registers,
+                    function_id,
+                    instruction,
+                    instruction_bytes,
+                    0,
+                )?,
+                read_scalar_call_argument_operand(
+                    registers,
+                    function_id,
+                    instruction,
+                    instruction_bytes,
+                    1,
+                )?,
+                read_scalar_call_argument_operand(
+                    registers,
+                    function_id,
+                    instruction,
+                    instruction_bytes,
+                    2,
+                )?,
+                read_scalar_call_argument_operand(
+                    registers,
+                    function_id,
+                    instruction,
+                    instruction_bytes,
+                    3,
+                )?,
+            ];
+            call_scalar_function(
+                bytecode,
+                state,
+                function_id,
+                instruction,
+                callee_register,
+                callee,
+                &arguments,
+            )
+        }
+        _ => unreachable!("direct call helper only supports Call1 through Call4"),
     }
-    Ok(arguments)
+}
+
+fn read_scalar_call_argument_operand(
+    registers: &[ScalarValue],
+    function_id: u32,
+    instruction: HermesInstruction,
+    instruction_bytes: &[u8],
+    argument_index: usize,
+) -> Result<ScalarValue, ScalarExecutionError> {
+    let register = read_unsigned_operand(instruction_bytes, 3 + argument_index, 1);
+    read_scalar_register(registers, function_id, instruction, register)
 }
 
 fn scalar_direct_call_argument_count(opcode: u8) -> usize {
@@ -4996,15 +7867,46 @@ fn create_scalar_this_for_new(
     constructor_register: u32,
 ) -> Result<ScalarValue, ScalarExecutionError> {
     match read_scalar_register(registers, function_id, instruction, constructor_register)? {
+        ScalarValue::Function(constructor @ ScalarFunctionHandle::Bytecode { .. }) => {
+            let object = allocate_scalar_object(state);
+            let prototype = read_scalar_function_property(state, constructor, "prototype");
+            if matches!(prototype, ScalarValue::Object(_) | ScalarValue::Null) {
+                write_scalar_object_prototype(state, object, prototype);
+            }
+            let this_value = ScalarValue::Object(object);
+            state
+                .pending_constructor_this_values
+                .push((constructor, this_value));
+            Ok(this_value)
+        }
+        ScalarValue::Function(ScalarFunctionHandle::NativeMapConstructor) => {
+            Ok(ScalarValue::Object(allocate_scalar_map(state)))
+        }
+        ScalarValue::Function(ScalarFunctionHandle::NativeSetConstructor) => {
+            Ok(ScalarValue::Object(allocate_scalar_set(state)))
+        }
+        ScalarValue::Function(ScalarFunctionHandle::NativeUint8ArrayConstructor) => {
+            let this_value = ScalarValue::Object(allocate_scalar_uint8_array(state, 0));
+            state.pending_constructor_this_values.push((
+                ScalarFunctionHandle::NativeUint8ArrayConstructor,
+                this_value,
+            ));
+            Ok(this_value)
+        }
         ScalarValue::Function(ScalarFunctionHandle::NativeWeakMapConstructor) => {
             Ok(ScalarValue::Object(allocate_scalar_weak_map(state)))
         }
+        ScalarValue::Function(ScalarFunctionHandle::NativeWeakSetConstructor) => {
+            Ok(ScalarValue::Object(allocate_scalar_weak_set(state)))
+        }
         ScalarValue::Function(
-            ScalarFunctionHandle::Bytecode { .. }
+            ScalarFunctionHandle::NativeBooleanConstructor
             | ScalarFunctionHandle::NativeDateConstructor
             | ScalarFunctionHandle::NativeErrorConstructor
-            | ScalarFunctionHandle::NativeMapConstructor
-            | ScalarFunctionHandle::NativeObjectConstructor,
+            | ScalarFunctionHandle::NativeNumberConstructor
+            | ScalarFunctionHandle::NativeObjectConstructor
+            | ScalarFunctionHandle::NativePromiseConstructor
+            | ScalarFunctionHandle::NativeStringConstructor,
         ) => Ok(ScalarValue::Object(allocate_scalar_object(state))),
         ScalarValue::Undefined | ScalarValue::Null | ScalarValue::Empty
             if state.relaxed_host_stubs =>
@@ -5236,8 +8138,67 @@ fn allocate_scalar_array(state: &mut ScalarExecutorState<'_>, length: u32) -> Sc
         .checked_add(1)
         .expect("scalar object id cannot overflow before the step limit");
     let handle = ScalarObjectHandle::Array(object_id);
-    state.array_lengths.push((handle, length));
+    let storage_index = usize::try_from(object_id).expect("array id fits in usize");
+    if state.array_lengths.len() <= storage_index {
+        state.array_lengths.resize_with(storage_index + 1, || None);
+    }
+    state.array_lengths[storage_index] = Some(length);
+    if state.array_storage.len() <= storage_index {
+        state.array_storage.resize_with(storage_index + 1, || None);
+    }
+    state.array_storage[storage_index] = Some(vec![
+        ScalarValue::Undefined;
+        usize::try_from(length)
+            .expect("array length fits in usize")
+    ]);
     handle
+}
+
+fn allocate_scalar_uint8_array(
+    state: &mut ScalarExecutorState<'_>,
+    length: u32,
+) -> ScalarObjectHandle {
+    let object_id = state.next_object_id;
+    state.next_object_id = state
+        .next_object_id
+        .checked_add(1)
+        .expect("scalar object id cannot overflow before the step limit");
+    let handle = ScalarObjectHandle::Uint8Array(object_id);
+    let storage_index = usize::try_from(object_id).expect("Uint8Array id fits in usize");
+    if state.array_lengths.len() <= storage_index {
+        state.array_lengths.resize_with(storage_index + 1, || None);
+    }
+    state.array_lengths[storage_index] = Some(length);
+    if state.uint8_array_storage.len() <= storage_index {
+        state
+            .uint8_array_storage
+            .resize_with(storage_index + 1, || None);
+    }
+    state.uint8_array_storage[storage_index] = Some(vec![
+        0;
+        usize::try_from(length).expect(
+            "Uint8Array length fits in usize"
+        )
+    ]);
+    handle
+}
+
+fn allocate_scalar_map(state: &mut ScalarExecutorState<'_>) -> ScalarObjectHandle {
+    let object_id = state.next_object_id;
+    state.next_object_id = state
+        .next_object_id
+        .checked_add(1)
+        .expect("scalar object id cannot overflow before the step limit");
+    ScalarObjectHandle::Map(object_id)
+}
+
+fn allocate_scalar_set(state: &mut ScalarExecutorState<'_>) -> ScalarObjectHandle {
+    let object_id = state.next_object_id;
+    state.next_object_id = state
+        .next_object_id
+        .checked_add(1)
+        .expect("scalar object id cannot overflow before the step limit");
+    ScalarObjectHandle::Set(object_id)
 }
 
 fn allocate_scalar_weak_map(state: &mut ScalarExecutorState<'_>) -> ScalarObjectHandle {
@@ -5247,6 +8208,15 @@ fn allocate_scalar_weak_map(state: &mut ScalarExecutorState<'_>) -> ScalarObject
         .checked_add(1)
         .expect("scalar object id cannot overflow before the step limit");
     ScalarObjectHandle::WeakMap(object_id)
+}
+
+fn allocate_scalar_weak_set(state: &mut ScalarExecutorState<'_>) -> ScalarObjectHandle {
+    let object_id = state.next_object_id;
+    state.next_object_id = state
+        .next_object_id
+        .checked_add(1)
+        .expect("scalar object id cannot overflow before the step limit");
+    ScalarObjectHandle::WeakSet(object_id)
 }
 
 fn allocate_scalar_native_module(state: &mut ScalarExecutorState<'_>) -> ScalarObjectHandle {
@@ -5264,14 +8234,56 @@ fn write_scalar_array_element(
     index: u32,
     value: ScalarValue,
 ) {
-    if let Some((_, _, stored_value)) = state
-        .array_elements
-        .iter_mut()
-        .rev()
-        .find(|(handle, stored_index, _)| *handle == array && *stored_index == index)
-    {
-        *stored_value = value;
+    if let ScalarObjectHandle::Uint8Array(object_id) = array {
+        let storage_index = usize::try_from(object_id).expect("Uint8Array id fits in usize");
+        let Some(storage) = state
+            .uint8_array_storage
+            .get_mut(storage_index)
+            .and_then(Option::as_mut)
+        else {
+            return;
+        };
+        let index = usize::try_from(index).expect("Uint8Array index fits in usize");
+        if let Some(slot) = storage.get_mut(index) {
+            *slot = scalar_to_uint8(value);
+        }
+        return;
+    }
+
+    if let ScalarObjectHandle::Array(object_id) = array {
+        let next_length = index.saturating_add(1);
+        let storage_index = usize::try_from(object_id).expect("array id fits in usize");
+        if state.array_lengths.len() <= storage_index {
+            state.array_lengths.resize_with(storage_index + 1, || None);
+        }
+        match &mut state.array_lengths[storage_index] {
+            Some(stored_length) if *stored_length < next_length => {
+                *stored_length = next_length;
+            }
+            Some(_) => {}
+            length_slot @ None => {
+                *length_slot = Some(next_length);
+            }
+        }
+
+        if state.array_storage.len() <= storage_index {
+            state.array_storage.resize_with(storage_index + 1, || None);
+        }
+        let storage = state.array_storage[storage_index].get_or_insert_with(Vec::new);
+        let index = usize::try_from(index).expect("array index fits in usize");
+        if storage.len() <= index {
+            storage.resize(index + 1, ScalarValue::Undefined);
+        }
+        storage[index] = value;
+        return;
+    }
+
+    if let Some(element_index) = state.array_element_indices.get(&(array, index)).copied() {
+        state.array_elements[element_index].2 = value;
     } else {
+        state
+            .array_element_indices
+            .insert((array, index), state.array_elements.len());
         state.array_elements.push((array, index, value));
     }
 }
@@ -5281,24 +8293,93 @@ fn read_scalar_array_element(
     array: ScalarObjectHandle,
     index: u32,
 ) -> ScalarValue {
+    if let ScalarObjectHandle::Uint8Array(object_id) = array {
+        let storage_index = usize::try_from(object_id).expect("Uint8Array id fits in usize");
+        return state
+            .uint8_array_storage
+            .get(storage_index)
+            .and_then(Option::as_ref)
+            .and_then(|storage| {
+                storage
+                    .get(usize::try_from(index).expect("Uint8Array index fits in usize"))
+                    .copied()
+            })
+            .map_or(ScalarValue::Undefined, |value| {
+                ScalarValue::Number(f64::from(value))
+            });
+    }
+
+    if let ScalarObjectHandle::Array(object_id) = array {
+        let storage_index = usize::try_from(object_id).expect("array id fits in usize");
+        return state
+            .array_storage
+            .get(storage_index)
+            .and_then(Option::as_ref)
+            .and_then(|storage| {
+                storage
+                    .get(usize::try_from(index).expect("array index fits in usize"))
+                    .copied()
+            })
+            .unwrap_or(ScalarValue::Undefined);
+    }
+
     state
-        .array_elements
-        .iter()
-        .rev()
-        .find(|(handle, stored_index, _)| *handle == array && *stored_index == index)
-        .map_or(ScalarValue::Undefined, |(_, _, value)| *value)
+        .array_element_indices
+        .get(&(array, index))
+        .map_or(ScalarValue::Undefined, |element_index| {
+            state.array_elements[*element_index].2
+        })
 }
 
 fn read_scalar_array_length(
     state: &ScalarExecutorState<'_>,
     array: ScalarObjectHandle,
 ) -> Option<u32> {
+    let storage_index = match array {
+        ScalarObjectHandle::Array(object_id) | ScalarObjectHandle::Uint8Array(object_id) => {
+            usize::try_from(object_id).expect("array id fits in usize")
+        }
+        _ => return None,
+    };
+    state.array_lengths.get(storage_index).copied().flatten()
+}
+
+fn reindex_scalar_array_elements(state: &mut ScalarExecutorState<'_>) {
+    state.array_element_indices.clear();
+    for (index, (object, element_index, _)) in state.array_elements.iter().enumerate() {
+        state
+            .array_element_indices
+            .insert((*object, *element_index), index);
+    }
+}
+
+fn write_scalar_object_prototype(
+    state: &mut ScalarExecutorState<'_>,
+    object: ScalarObjectHandle,
+    prototype: ScalarValue,
+) {
+    if let Some((_, stored_prototype)) = state
+        .object_prototypes
+        .iter_mut()
+        .rev()
+        .find(|(stored_object, _)| *stored_object == object)
+    {
+        *stored_prototype = prototype;
+    } else {
+        state.object_prototypes.push((object, prototype));
+    }
+}
+
+fn read_scalar_object_prototype(
+    state: &ScalarExecutorState<'_>,
+    object: ScalarObjectHandle,
+) -> Option<ScalarValue> {
     state
-        .array_lengths
+        .object_prototypes
         .iter()
         .rev()
-        .find(|(handle, _)| *handle == array)
-        .map(|(_, length)| *length)
+        .find(|(stored_object, _)| *stored_object == object)
+        .map(|(_, prototype)| *prototype)
 }
 
 fn scalar_object_property_names(
@@ -5306,38 +8387,75 @@ fn scalar_object_property_names(
     state: &ScalarExecutorState<'_>,
     object: ScalarObjectHandle,
 ) -> Vec<ScalarValue> {
-    let mut names = Vec::new();
-    for (_, property_name, _) in state
-        .object_properties
-        .iter()
-        .filter(|(stored_object, _, _)| *stored_object == object)
-    {
-        if names
-            .iter()
-            .any(|name| scalar_string_matches(bytecode, *name, property_name))
-        {
-            continue;
-        }
-        if let Some(name) = scalar_string_value_for_name(bytecode, property_name) {
-            names.push(name);
-        }
-    }
-    names
+    state
+        .object_property_names
+        .get(&object)
+        .into_iter()
+        .flatten()
+        .filter_map(|property_name| scalar_string_value_for_name(bytecode, property_name))
+        .collect()
 }
 
-fn scalar_string_matches(
-    bytecode: &HermesBytecode<'_>,
-    value: ScalarValue,
-    expected: &str,
-) -> bool {
-    let ScalarValue::String(handle) = value else {
-        return false;
-    };
+fn scalar_string_bytes<'a>(
+    bytecode: &HermesBytecode<'a>,
+    handle: ScalarStringHandle,
+) -> Option<&'a [u8]> {
     bytecode
         .string(handle.string_id)
         .ok()
         .filter(|string| !string.is_utf16())
-        .is_some_and(|string| string.bytes() == expected.as_bytes())
+        .map(|string| string.bytes())
+}
+
+fn scalar_value_string_text<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &'a ScalarExecutorState<'a>,
+    value: ScalarValue,
+) -> Option<Cow<'a, str>> {
+    match value {
+        ScalarValue::String(handle) => {
+            let bytes = scalar_string_bytes(bytecode, handle)?;
+            std::str::from_utf8(bytes).ok().map(Cow::Borrowed)
+        }
+        ScalarValue::DynamicString(handle) => state
+            .dynamic_strings
+            .get(usize::try_from(handle.dynamic_id).expect("dynamic string id fits in usize"))
+            .map(|value| Cow::Borrowed(value.as_str())),
+        _ => None,
+    }
+}
+
+fn allocate_scalar_dynamic_string(
+    state: &mut ScalarExecutorState<'_>,
+    value: String,
+) -> ScalarValue {
+    let dynamic_id =
+        u32::try_from(state.dynamic_strings.len()).expect("dynamic string count fits in u32");
+    let is_empty = value.is_empty();
+    state.dynamic_strings.push(value);
+    state.dynamic_string_json_values.push(None);
+    ScalarValue::DynamicString(ScalarDynamicStringHandle {
+        dynamic_id,
+        is_empty,
+    })
+}
+
+fn allocate_scalar_dynamic_json_string(
+    state: &mut ScalarExecutorState<'_>,
+    value: String,
+    json_value: serde_json::Value,
+) -> ScalarValue {
+    let dynamic_string = allocate_scalar_dynamic_string(state, value);
+    let ScalarValue::DynamicString(handle) = dynamic_string else {
+        unreachable!("dynamic string allocator returns a dynamic string");
+    };
+    if let Some(slot) = state
+        .dynamic_string_json_values
+        .get_mut(usize::try_from(handle.dynamic_id).expect("dynamic string id fits in usize"))
+    {
+        *slot = Some(json_value);
+    }
+    dynamic_string
 }
 
 fn scalar_string_value_for_name(
@@ -5424,6 +8542,19 @@ fn read_scalar_object_slot_name<'a>(
         .rev()
         .find(|(stored_object, stored_slot, _)| *stored_object == object && *stored_slot == slot)
         .map(|(_, _, property_name)| *property_name)
+}
+
+fn read_scalar_object_slot_value(
+    state: &ScalarExecutorState<'_>,
+    object: ScalarObjectHandle,
+    slot: u32,
+) -> Option<ScalarValue> {
+    state
+        .object_slots
+        .iter()
+        .rev()
+        .find(|(stored_object, stored_slot, _)| *stored_object == object && *stored_slot == slot)
+        .map(|(_, _, value)| *value)
 }
 
 fn allocate_scalar_environment_with_parent(
@@ -5551,13 +8682,14 @@ fn read_scalar_optional_environment_handle(
     }
 }
 
-fn read_scalar_property(
-    state: &ScalarExecutorState<'_>,
+fn read_scalar_property<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
     registers: &[ScalarValue],
     function_id: u32,
     instruction: HermesInstruction,
     base_register: u32,
-    property_name: &str,
+    property_name: &'a str,
 ) -> Result<ScalarValue, ScalarExecutionError> {
     let base = read_scalar_register(registers, function_id, instruction, base_register)?;
     match base {
@@ -5566,15 +8698,33 @@ fn read_scalar_property(
         }
         ScalarValue::Object(
             handle @ (ScalarObjectHandle::HermesInternal
+            | ScalarObjectHandle::Console
+            | ScalarObjectHandle::Math
+            | ScalarObjectHandle::Json
             | ScalarObjectHandle::Object(_)
+            | ScalarObjectHandle::NativePrototype(_)
             | ScalarObjectHandle::Array(_)
+            | ScalarObjectHandle::Uint8Array(_)
+            | ScalarObjectHandle::Map(_)
+            | ScalarObjectHandle::Set(_)
             | ScalarObjectHandle::WeakMap(_)
+            | ScalarObjectHandle::WeakSet(_)
             | ScalarObjectHandle::NativeModule(_)),
-        ) => Ok(read_scalar_object_property(state, handle, property_name)),
+        ) => read_scalar_object_property_for_get(
+            bytecode,
+            state,
+            function_id,
+            instruction,
+            ScalarValue::Object(handle),
+            handle,
+            property_name,
+        ),
         ScalarValue::Function(handle) => {
             Ok(read_scalar_function_property(state, handle, property_name))
         }
-        ScalarValue::String(_) => Ok(read_scalar_string_property(property_name)),
+        value @ (ScalarValue::String(_) | ScalarValue::DynamicString(_)) => Ok(
+            read_scalar_string_property(bytecode, state, value, property_name),
+        ),
         ScalarValue::Undefined | ScalarValue::Null | ScalarValue::Empty
             if state.relaxed_host_stubs =>
         {
@@ -5590,6 +8740,52 @@ fn read_scalar_property(
     }
 }
 
+fn read_scalar_object_property_for_get<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
+    function_id: u32,
+    instruction: HermesInstruction,
+    receiver: ScalarValue,
+    handle: ScalarObjectHandle,
+    property_name: &'a str,
+) -> Result<ScalarValue, ScalarExecutionError> {
+    if state.object_getters.is_empty() && read_scalar_object_prototype(state, handle).is_none() {
+        if let Some(value) = read_scalar_own_object_property(state, handle, property_name) {
+            return Ok(value);
+        }
+        if let Some(value) = read_scalar_intrinsic_object_property(state, handle, property_name) {
+            return Ok(value);
+        }
+    }
+
+    match read_scalar_object_getter_lookup(state, handle, property_name, 0) {
+        ScalarObjectGetterLookup::Getter(getter @ ScalarValue::Function(_)) => {
+            call_scalar_function(
+                bytecode,
+                state,
+                function_id,
+                instruction,
+                0,
+                getter,
+                &[receiver],
+            )
+        }
+        ScalarObjectGetterLookup::Getter(getter) => {
+            Err(ScalarExecutionError::UnsupportedPropertyKey {
+                function_id,
+                offset: instruction.offset,
+                opcode: instruction.opcode,
+                register: 0,
+                value: getter,
+            })
+        }
+        ScalarObjectGetterLookup::DataProperty(value) => Ok(value),
+        ScalarObjectGetterLookup::Missing => {
+            Ok(read_scalar_object_property(state, handle, property_name))
+        }
+    }
+}
+
 fn read_scalar_property_key<'a>(
     bytecode: &HermesBytecode<'a>,
     registers: &[ScalarValue],
@@ -5601,6 +8797,9 @@ fn read_scalar_property_key<'a>(
         ScalarValue::String(handle) => {
             read_scalar_string_operand(bytecode, function_id, instruction, handle.string_id)
         }
+        ScalarValue::Symbol(handle) => {
+            read_scalar_string_operand(bytecode, function_id, instruction, handle.string_id)
+        }
         value => Err(ScalarExecutionError::UnsupportedPropertyKey {
             function_id,
             offset: instruction.offset,
@@ -5608,6 +8807,179 @@ fn read_scalar_property_key<'a>(
             register: key_register,
             value,
         }),
+    }
+}
+
+fn read_scalar_computed_property_key<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &ScalarExecutorState<'a>,
+    registers: &[ScalarValue],
+    function_id: u32,
+    instruction: HermesInstruction,
+    key_register: u32,
+) -> Result<ScalarPropertyKey<'a>, ScalarExecutionError> {
+    let value = read_scalar_register(registers, function_id, instruction, key_register)?;
+    scalar_computed_property_key_from_value(
+        bytecode,
+        state,
+        function_id,
+        instruction,
+        key_register,
+        value,
+    )
+}
+
+fn scalar_computed_property_key_from_value<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &ScalarExecutorState<'a>,
+    function_id: u32,
+    instruction: HermesInstruction,
+    key_register: u32,
+    value: ScalarValue,
+) -> Result<ScalarPropertyKey<'a>, ScalarExecutionError> {
+    match value {
+        ScalarValue::String(handle) => Ok(ScalarPropertyKey::Name(read_scalar_string_operand(
+            bytecode,
+            function_id,
+            instruction,
+            handle.string_id,
+        )?)),
+        ScalarValue::Symbol(handle) => Ok(ScalarPropertyKey::Name(read_scalar_string_operand(
+            bytecode,
+            function_id,
+            instruction,
+            handle.string_id,
+        )?)),
+        ScalarValue::DynamicString(handle) => {
+            let Some(value) = state
+                .dynamic_strings
+                .get(usize::try_from(handle.dynamic_id).expect("dynamic string id fits in usize"))
+            else {
+                return Err(ScalarExecutionError::UnsupportedPropertyKey {
+                    function_id,
+                    offset: instruction.offset,
+                    opcode: instruction.opcode,
+                    register: key_register,
+                    value: ScalarValue::DynamicString(handle),
+                });
+            };
+            scalar_string_value_for_name(bytecode, value)
+                .and_then(|value| {
+                    if let ScalarValue::String(handle) = value {
+                        read_scalar_string_operand(
+                            bytecode,
+                            function_id,
+                            instruction,
+                            handle.string_id,
+                        )
+                        .ok()
+                        .map(ScalarPropertyKey::Name)
+                    } else {
+                        None
+                    }
+                })
+                .ok_or(ScalarExecutionError::UnsupportedPropertyKey {
+                    function_id,
+                    offset: instruction.offset,
+                    opcode: instruction.opcode,
+                    register: key_register,
+                    value: ScalarValue::DynamicString(handle),
+                })
+        }
+        value => {
+            if let Some(index) = scalar_value_to_u32(value) {
+                Ok(ScalarPropertyKey::Index(index))
+            } else {
+                Err(ScalarExecutionError::UnsupportedPropertyKey {
+                    function_id,
+                    offset: instruction.offset,
+                    opcode: instruction.opcode,
+                    register: key_register,
+                    value,
+                })
+            }
+        }
+    }
+}
+
+fn read_scalar_computed_property<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
+    registers: &[ScalarValue],
+    function_id: u32,
+    instruction: HermesInstruction,
+    base_register: u32,
+    property_key: ScalarPropertyKey<'a>,
+) -> Result<ScalarValue, ScalarExecutionError> {
+    match property_key {
+        ScalarPropertyKey::Name(property_name) => read_scalar_property(
+            bytecode,
+            state,
+            registers,
+            function_id,
+            instruction,
+            base_register,
+            property_name,
+        ),
+        ScalarPropertyKey::Index(index) => {
+            match read_scalar_register(registers, function_id, instruction, base_register)? {
+                ScalarValue::Object(handle) => Ok(read_scalar_array_element(state, handle, index)),
+                ScalarValue::Undefined | ScalarValue::Null | ScalarValue::Empty
+                    if state.relaxed_host_stubs =>
+                {
+                    Ok(ScalarValue::Undefined)
+                }
+                value => Err(ScalarExecutionError::UnsupportedPropertyBase {
+                    function_id,
+                    offset: instruction.offset,
+                    opcode: instruction.opcode,
+                    register: base_register,
+                    value,
+                }),
+            }
+        }
+    }
+}
+
+fn write_scalar_computed_property<'a>(
+    state: &mut ScalarExecutorState<'a>,
+    registers: &[ScalarValue],
+    function_id: u32,
+    instruction: HermesInstruction,
+    base_register: u32,
+    property_key: ScalarPropertyKey<'a>,
+    value: ScalarValue,
+) -> Result<(), ScalarExecutionError> {
+    match property_key {
+        ScalarPropertyKey::Name(property_name) => write_scalar_property(
+            state,
+            registers,
+            function_id,
+            instruction,
+            base_register,
+            property_name,
+            value,
+        ),
+        ScalarPropertyKey::Index(index) => {
+            match read_scalar_register(registers, function_id, instruction, base_register)? {
+                ScalarValue::Object(handle) => {
+                    write_scalar_array_element(state, handle, index, value);
+                    Ok(())
+                }
+                ScalarValue::Undefined | ScalarValue::Null | ScalarValue::Empty
+                    if state.relaxed_host_stubs =>
+                {
+                    Ok(())
+                }
+                value => Err(ScalarExecutionError::UnsupportedPropertyBase {
+                    function_id,
+                    offset: instruction.offset,
+                    opcode: instruction.opcode,
+                    register: base_register,
+                    value,
+                }),
+            }
+        }
     }
 }
 
@@ -5638,9 +9010,16 @@ fn write_scalar_property<'a>(
         }
         ScalarValue::Object(
             handle @ (ScalarObjectHandle::HermesInternal
+            | ScalarObjectHandle::Console
+            | ScalarObjectHandle::Json
             | ScalarObjectHandle::Object(_)
+            | ScalarObjectHandle::NativePrototype(_)
             | ScalarObjectHandle::Array(_)
+            | ScalarObjectHandle::Uint8Array(_)
+            | ScalarObjectHandle::Map(_)
+            | ScalarObjectHandle::Set(_)
             | ScalarObjectHandle::WeakMap(_)
+            | ScalarObjectHandle::WeakSet(_)
             | ScalarObjectHandle::NativeModule(_)),
         ) => {
             write_scalar_named_object_property(state, handle, property_name, value);
@@ -5665,6 +9044,396 @@ fn write_scalar_property<'a>(
     }
 }
 
+fn write_scalar_getter_property<'a>(
+    state: &mut ScalarExecutorState<'a>,
+    registers: &[ScalarValue],
+    function_id: u32,
+    instruction: HermesInstruction,
+    base_register: u32,
+    property_name: &'a str,
+    getter: ScalarValue,
+) -> Result<(), ScalarExecutionError> {
+    let base = read_scalar_register(registers, function_id, instruction, base_register)?;
+    match base {
+        ScalarValue::Object(handle) => {
+            write_scalar_named_object_getter_property(state, handle, property_name, getter);
+            Ok(())
+        }
+        ScalarValue::Undefined | ScalarValue::Null | ScalarValue::Empty
+            if state.relaxed_host_stubs =>
+        {
+            Ok(())
+        }
+        value => Err(ScalarExecutionError::UnsupportedPropertyBase {
+            function_id,
+            offset: instruction.offset,
+            opcode: instruction.opcode,
+            register: base_register,
+            value,
+        }),
+    }
+}
+
+fn delete_scalar_property(
+    state: &mut ScalarExecutorState<'_>,
+    function_id: u32,
+    instruction: HermesInstruction,
+    base_register: u32,
+    base: ScalarValue,
+    property_key: ScalarPropertyKey<'_>,
+) -> Result<(), ScalarExecutionError> {
+    let ScalarPropertyKey::Name(property_name) = property_key else {
+        if let ScalarPropertyKey::Index(index) = property_key {
+            match base {
+                ScalarValue::Object(handle) => {
+                    if let ScalarObjectHandle::Array(object_id) = handle {
+                        let storage_index =
+                            usize::try_from(object_id).expect("array id fits in usize");
+                        if let Some(storage) = state
+                            .array_storage
+                            .get_mut(storage_index)
+                            .and_then(Option::as_mut)
+                        {
+                            if let Some(slot) = storage
+                                .get_mut(usize::try_from(index).expect("array index fits in usize"))
+                            {
+                                *slot = ScalarValue::Undefined;
+                            }
+                        }
+                    }
+                    state.array_elements.retain(|(object, element_index, _)| {
+                        *object != handle || *element_index != index
+                    });
+                    reindex_scalar_array_elements(state);
+                    return Ok(());
+                }
+                ScalarValue::Undefined | ScalarValue::Null | ScalarValue::Empty
+                    if state.relaxed_host_stubs =>
+                {
+                    return Ok(());
+                }
+                value => {
+                    return Err(ScalarExecutionError::UnsupportedPropertyBase {
+                        function_id,
+                        offset: instruction.offset,
+                        opcode: instruction.opcode,
+                        register: base_register,
+                        value,
+                    });
+                }
+            }
+        }
+        unreachable!("matched all computed property key variants");
+    };
+
+    match base {
+        ScalarValue::Object(ScalarObjectHandle::Global) => {
+            state
+                .global_properties
+                .retain(|(name, _)| *name != property_name);
+            Ok(())
+        }
+        ScalarValue::Object(handle) => {
+            state
+                .object_properties
+                .retain(|(object, name, _)| *object != handle || *name != property_name);
+            reindex_scalar_object_properties(state);
+            Ok(())
+        }
+        ScalarValue::Function(handle) => {
+            state
+                .function_properties
+                .retain(|(function, name, _)| *function != handle || *name != property_name);
+            Ok(())
+        }
+        ScalarValue::Undefined | ScalarValue::Null | ScalarValue::Empty
+            if state.relaxed_host_stubs =>
+        {
+            Ok(())
+        }
+        value => Err(ScalarExecutionError::UnsupportedPropertyBase {
+            function_id,
+            offset: instruction.offset,
+            opcode: instruction.opcode,
+            register: base_register,
+            value,
+        }),
+    }
+}
+
+fn scalar_computed_property_exists(
+    state: &ScalarExecutorState<'_>,
+    function_id: u32,
+    instruction: HermesInstruction,
+    base_register: u32,
+    base: ScalarValue,
+    property_key: ScalarPropertyKey<'_>,
+) -> Result<bool, ScalarExecutionError> {
+    match property_key {
+        ScalarPropertyKey::Name(property_name) => scalar_property_exists(
+            state,
+            function_id,
+            instruction,
+            base_register,
+            base,
+            property_name,
+        ),
+        ScalarPropertyKey::Index(index) => match base {
+            ScalarValue::Object(handle) => Ok(state
+                .array_elements
+                .iter()
+                .rev()
+                .any(|(object, element_index, _)| *object == handle && *element_index == index)),
+            ScalarValue::Undefined | ScalarValue::Null | ScalarValue::Empty
+                if state.relaxed_host_stubs =>
+            {
+                Ok(false)
+            }
+            value => Err(ScalarExecutionError::UnsupportedPropertyBase {
+                function_id,
+                offset: instruction.offset,
+                opcode: instruction.opcode,
+                register: base_register,
+                value,
+            }),
+        },
+    }
+}
+
+fn scalar_property_exists(
+    state: &ScalarExecutorState<'_>,
+    function_id: u32,
+    instruction: HermesInstruction,
+    base_register: u32,
+    base: ScalarValue,
+    property_name: &str,
+) -> Result<bool, ScalarExecutionError> {
+    match base {
+        ScalarValue::Object(ScalarObjectHandle::Global) => {
+            Ok(scalar_global_property_exists(state, property_name))
+        }
+        ScalarValue::Object(handle) => {
+            Ok(scalar_object_property_exists(state, handle, property_name))
+        }
+        ScalarValue::Function(handle) => Ok(scalar_function_property_exists(
+            state,
+            handle,
+            property_name,
+        )),
+        ScalarValue::String(_) | ScalarValue::DynamicString(_) => {
+            Ok(scalar_string_property_exists(property_name))
+        }
+        ScalarValue::Undefined | ScalarValue::Null | ScalarValue::Empty
+            if state.relaxed_host_stubs =>
+        {
+            Ok(false)
+        }
+        value => Err(ScalarExecutionError::UnsupportedPropertyBase {
+            function_id,
+            offset: instruction.offset,
+            opcode: instruction.opcode,
+            register: base_register,
+            value,
+        }),
+    }
+}
+
+fn scalar_global_property_exists(state: &ScalarExecutorState<'_>, property_name: &str) -> bool {
+    if state
+        .global_properties
+        .iter()
+        .rev()
+        .any(|(name, _)| *name == property_name)
+    {
+        return true;
+    }
+
+    matches!(
+        property_name,
+        "globalThis"
+            | "Array"
+            | "Boolean"
+            | "console"
+            | "Date"
+            | "DOMException"
+            | "Error"
+            | "Function"
+            | "HermesInternal"
+            | "isNaN"
+            | "JSON"
+            | "Map"
+            | "Number"
+            | "Object"
+            | "Promise"
+            | "Set"
+            | "String"
+            | "Symbol"
+            | "TypeError"
+            | "Uint8Array"
+            | "WeakMap"
+            | "WeakSet"
+            | "__turboModuleProxy"
+            | "nativePerformanceNow"
+    ) || state
+        .declared_globals
+        .iter()
+        .any(|name| *name == property_name)
+}
+
+fn scalar_object_property_exists(
+    state: &ScalarExecutorState<'_>,
+    handle: ScalarObjectHandle,
+    property_name: &str,
+) -> bool {
+    scalar_object_property_exists_with_depth(state, handle, property_name, 0)
+}
+
+fn scalar_object_property_exists_with_depth(
+    state: &ScalarExecutorState<'_>,
+    handle: ScalarObjectHandle,
+    property_name: &str,
+    depth: u8,
+) -> bool {
+    if scalar_object_has_own_named_property(state, handle, property_name) {
+        return true;
+    }
+    if handle == ScalarObjectHandle::HermesInternal && property_name == "concat" {
+        return true;
+    }
+    if handle == ScalarObjectHandle::Console && property_name == "error" {
+        return true;
+    }
+    if handle == ScalarObjectHandle::Math && matches!(property_name, "round" | "sin" | "sqrt") {
+        return true;
+    }
+    if handle == ScalarObjectHandle::Json && matches!(property_name, "parse" | "stringify") {
+        return true;
+    }
+    if matches!(
+        property_name,
+        "registerCallableModule" | "registerLazyCallableModule"
+    ) {
+        return true;
+    }
+    if let ScalarObjectHandle::NativePrototype(_) = handle {
+        if property_name == "constructor" {
+            return true;
+        }
+    }
+    if matches!(
+        handle,
+        ScalarObjectHandle::Console
+            | ScalarObjectHandle::Json
+            | ScalarObjectHandle::Object(_)
+            | ScalarObjectHandle::NativePrototype(_)
+            | ScalarObjectHandle::Array(_)
+            | ScalarObjectHandle::Uint8Array(_)
+            | ScalarObjectHandle::Map(_)
+            | ScalarObjectHandle::Set(_)
+            | ScalarObjectHandle::WeakMap(_)
+            | ScalarObjectHandle::WeakSet(_)
+            | ScalarObjectHandle::NativeModule(_)
+    ) && property_name == "hasOwnProperty"
+    {
+        return true;
+    }
+    if matches!(handle, ScalarObjectHandle::NativeModule(_)) {
+        return true;
+    }
+    if matches!(handle, ScalarObjectHandle::Array(_)) && matches!(property_name, "forEach" | "map")
+    {
+        return true;
+    }
+    if matches!(handle, ScalarObjectHandle::Array(_)) && property_name == "length" {
+        return true;
+    }
+    if matches!(handle, ScalarObjectHandle::Uint8Array(_))
+        && matches!(property_name, "byteLength" | "length" | "set")
+    {
+        return true;
+    }
+    if matches!(
+        handle,
+        ScalarObjectHandle::Map(_) | ScalarObjectHandle::WeakMap(_)
+    ) && matches!(property_name, "get" | "has" | "set")
+    {
+        return true;
+    }
+    if depth < 16 {
+        if let Some(ScalarValue::Object(prototype)) = read_scalar_object_prototype(state, handle) {
+            if scalar_object_property_exists_with_depth(state, prototype, property_name, depth + 1)
+            {
+                return true;
+            }
+        }
+    }
+
+    matches!(handle, ScalarObjectHandle::Object(_))
+        && read_scalar_rn_object_stub_property(property_name).is_some()
+}
+
+fn scalar_function_property_exists(
+    state: &ScalarExecutorState<'_>,
+    handle: ScalarFunctionHandle,
+    property_name: &str,
+) -> bool {
+    if state
+        .function_properties
+        .iter()
+        .rev()
+        .any(|(function, name, _)| *function == handle && *name == property_name)
+    {
+        return true;
+    }
+    if property_name == "prototype" && scalar_native_constructor_prototype(handle).is_some() {
+        return true;
+    }
+    if handle == ScalarFunctionHandle::NativeDateConstructor && property_name == "now" {
+        return true;
+    }
+    if handle == ScalarFunctionHandle::NativeArrayConstructor && property_name == "isArray" {
+        return true;
+    }
+    if handle == ScalarFunctionHandle::NativeSymbolConstructor && property_name == "for" {
+        return true;
+    }
+    if matches!(property_name, "toString" | "bind" | "call") {
+        return true;
+    }
+    if handle == ScalarFunctionHandle::NativeFunctionToString && property_name == "call" {
+        return true;
+    }
+    if handle == ScalarFunctionHandle::NativeObjectConstructor
+        && matches!(
+            property_name,
+            "create"
+                | "defineProperties"
+                | "defineProperty"
+                | "assign"
+                | "freeze"
+                | "getOwnPropertyDescriptor"
+                | "getPrototypeOf"
+                | "keys"
+                | "preventExtensions"
+        )
+    {
+        return true;
+    }
+    if handle == ScalarFunctionHandle::NativeObjectHasOwnProperty && property_name == "call" {
+        return true;
+    }
+
+    matches!(handle, ScalarFunctionHandle::Bytecode { .. })
+        && read_scalar_rn_object_stub_property(property_name).is_some()
+}
+
+fn scalar_string_property_exists(property_name: &str) -> bool {
+    matches!(
+        property_name,
+        "charCodeAt" | "indexOf" | "length" | "replace"
+    )
+}
+
 fn map_scalar_global_write(property_name: &str, value: ScalarValue) -> ScalarValue {
     match property_name {
         "__d" => ScalarValue::Function(ScalarFunctionHandle::NativeMetroDefine),
@@ -5683,15 +9452,76 @@ fn write_scalar_named_object_property<'a>(
     property_name: &'a str,
     value: ScalarValue,
 ) {
-    if let Some((_, _, stored_value)) = state
+    if !state.object_getters.is_empty() {
+        state.object_getters.retain(|(stored_object, name, _)| {
+            !(*stored_object == object && *name == property_name)
+        });
+    }
+    if state.object_properties.len() <= SCALAR_LINEAR_OBJECT_PROPERTY_LIMIT {
+        if let Some((_, _, stored_value)) = state
+            .object_properties
+            .iter_mut()
+            .rev()
+            .find(|(stored_object, name, _)| *stored_object == object && *name == property_name)
+        {
+            *stored_value = value;
+            return;
+        }
+    }
+    if let Some(property_index) = state
+        .object_property_indices
+        .get(&(object, property_name))
+        .copied()
+    {
+        state.object_properties[property_index].2 = value;
+    } else {
+        let property_index = state.object_properties.len();
+        state
+            .object_property_indices
+            .insert((object, property_name), property_index);
+        state
+            .object_property_names
+            .entry(object)
+            .or_default()
+            .push(property_name);
+        state.object_properties.push((object, property_name, value));
+    }
+}
+
+fn write_scalar_named_object_getter_property<'a>(
+    state: &mut ScalarExecutorState<'a>,
+    object: ScalarObjectHandle,
+    property_name: &'a str,
+    getter: ScalarValue,
+) {
+    state
         .object_properties
+        .retain(|(stored_object, name, _)| !(*stored_object == object && *name == property_name));
+    reindex_scalar_object_properties(state);
+    if let Some((_, _, stored_getter)) = state
+        .object_getters
         .iter_mut()
         .rev()
         .find(|(stored_object, name, _)| *stored_object == object && *name == property_name)
     {
-        *stored_value = value;
+        *stored_getter = getter;
     } else {
-        state.object_properties.push((object, property_name, value));
+        state.object_getters.push((object, property_name, getter));
+    }
+}
+
+fn reindex_scalar_object_properties<'a>(state: &mut ScalarExecutorState<'a>) {
+    state.object_property_indices.clear();
+    state.object_property_names.clear();
+    for (index, (object, name, _)) in state.object_properties.iter().enumerate() {
+        state
+            .object_property_indices
+            .insert((*object, *name), index);
+        state
+            .object_property_names
+            .entry(*object)
+            .or_default()
+            .push(*name);
     }
 }
 
@@ -5728,14 +9558,37 @@ fn read_scalar_global_property(
         return *value;
     }
 
+    read_scalar_builtin_global_property(state, property_name)
+}
+
+fn read_scalar_builtin_global_property(
+    state: &ScalarExecutorState<'_>,
+    property_name: &str,
+) -> ScalarValue {
     match property_name {
         "globalThis" => ScalarValue::Object(ScalarObjectHandle::Global),
+        "Array" => ScalarValue::Function(ScalarFunctionHandle::NativeArrayConstructor),
+        "Boolean" => ScalarValue::Function(ScalarFunctionHandle::NativeBooleanConstructor),
+        "console" => ScalarValue::Object(ScalarObjectHandle::Console),
         "Date" => ScalarValue::Function(ScalarFunctionHandle::NativeDateConstructor),
+        "DOMException" => ScalarValue::Function(ScalarFunctionHandle::NativeErrorConstructor),
         "Error" => ScalarValue::Function(ScalarFunctionHandle::NativeErrorConstructor),
+        "Function" => ScalarValue::Function(ScalarFunctionHandle::NativeFunctionConstructor),
         "HermesInternal" => ScalarValue::Object(ScalarObjectHandle::HermesInternal),
+        "isNaN" => ScalarValue::Function(ScalarFunctionHandle::NativeIsNaN),
+        "JSON" => ScalarValue::Object(ScalarObjectHandle::Json),
+        "Math" => ScalarValue::Object(ScalarObjectHandle::Math),
         "Map" => ScalarValue::Function(ScalarFunctionHandle::NativeMapConstructor),
+        "Number" => ScalarValue::Function(ScalarFunctionHandle::NativeNumberConstructor),
         "Object" => ScalarValue::Function(ScalarFunctionHandle::NativeObjectConstructor),
+        "Promise" => ScalarValue::Function(ScalarFunctionHandle::NativePromiseConstructor),
+        "Set" => ScalarValue::Function(ScalarFunctionHandle::NativeSetConstructor),
+        "String" => ScalarValue::Function(ScalarFunctionHandle::NativeStringConstructor),
+        "Symbol" => ScalarValue::Function(ScalarFunctionHandle::NativeSymbolConstructor),
+        "TypeError" => ScalarValue::Function(ScalarFunctionHandle::NativeErrorConstructor),
+        "Uint8Array" => ScalarValue::Function(ScalarFunctionHandle::NativeUint8ArrayConstructor),
         "WeakMap" => ScalarValue::Function(ScalarFunctionHandle::NativeWeakMapConstructor),
+        "WeakSet" => ScalarValue::Function(ScalarFunctionHandle::NativeWeakSetConstructor),
         "__turboModuleProxy" => ScalarValue::Function(ScalarFunctionHandle::NativeTurboModuleProxy),
         "nativePerformanceNow" => ScalarValue::Function(ScalarFunctionHandle::NativePerformanceNow),
         name if state.declared_globals.contains(&name) => ScalarValue::Undefined,
@@ -5748,45 +9601,278 @@ fn read_scalar_object_property(
     handle: ScalarObjectHandle,
     property_name: &str,
 ) -> ScalarValue {
-    if handle == ScalarObjectHandle::HermesInternal && property_name == "concat" {
-        return ScalarValue::Function(ScalarFunctionHandle::HermesInternalConcat);
+    read_scalar_object_property_with_depth(state, handle, property_name, 0)
+}
+
+fn read_scalar_object_property_with_depth(
+    state: &ScalarExecutorState<'_>,
+    handle: ScalarObjectHandle,
+    property_name: &str,
+    depth: u8,
+) -> ScalarValue {
+    if let Some(value) = read_scalar_intrinsic_object_property(state, handle, property_name) {
+        return value;
     }
-    if matches!(
-        handle,
-        ScalarObjectHandle::Object(_)
-            | ScalarObjectHandle::Array(_)
-            | ScalarObjectHandle::WeakMap(_)
-            | ScalarObjectHandle::NativeModule(_)
-    ) && property_name == "hasOwnProperty"
-    {
-        return ScalarValue::Function(ScalarFunctionHandle::NativeObjectHasOwnProperty);
+
+    if let Some(value) = read_scalar_own_object_property(state, handle, property_name) {
+        return value;
     }
-    if matches!(handle, ScalarObjectHandle::NativeModule(_)) {
-        match property_name {
-            "getConstants" => {
-                return ScalarValue::Function(ScalarFunctionHandle::NativeModuleGetConstants);
-            }
-            "currentTimestamp" => {
-                return ScalarValue::Function(ScalarFunctionHandle::NativePerformanceNow);
-            }
-            _ => return ScalarValue::Function(ScalarFunctionHandle::NativeNoopFunction),
-        }
-    }
-    if matches!(handle, ScalarObjectHandle::WeakMap(_)) {
-        match property_name {
-            "get" => return ScalarValue::Function(ScalarFunctionHandle::NativeWeakMapGet),
-            "has" => return ScalarValue::Function(ScalarFunctionHandle::NativeWeakMapHas),
-            "set" => return ScalarValue::Function(ScalarFunctionHandle::NativeWeakMapSet),
-            _ => {}
+
+    if depth < 16 {
+        if let Some(ScalarValue::Object(prototype)) = read_scalar_object_prototype(state, handle) {
+            return read_scalar_object_property_with_depth(
+                state,
+                prototype,
+                property_name,
+                depth + 1,
+            );
         }
     }
 
+    if matches!(handle, ScalarObjectHandle::Object(_)) {
+        if let Some(value) = read_scalar_rn_object_stub_property(property_name) {
+            return value;
+        }
+    }
+
+    ScalarValue::Undefined
+}
+
+fn read_scalar_intrinsic_object_property(
+    state: &ScalarExecutorState<'_>,
+    handle: ScalarObjectHandle,
+    property_name: &str,
+) -> Option<ScalarValue> {
+    if handle == ScalarObjectHandle::HermesInternal && property_name == "concat" {
+        return Some(ScalarValue::Function(
+            ScalarFunctionHandle::HermesInternalConcat,
+        ));
+    }
+    if handle == ScalarObjectHandle::Console && property_name == "error" {
+        return Some(ScalarValue::Function(
+            ScalarFunctionHandle::NativeNoopFunction,
+        ));
+    }
+    if handle == ScalarObjectHandle::Math {
+        match property_name {
+            "round" => return Some(ScalarValue::Function(ScalarFunctionHandle::NativeMathRound)),
+            "sin" => return Some(ScalarValue::Function(ScalarFunctionHandle::NativeMathSin)),
+            "sqrt" => return Some(ScalarValue::Function(ScalarFunctionHandle::NativeMathSqrt)),
+            _ => {}
+        }
+    }
+    if handle == ScalarObjectHandle::Json {
+        match property_name {
+            "parse" => return Some(ScalarValue::Function(ScalarFunctionHandle::NativeJsonParse)),
+            "stringify" => {
+                return Some(ScalarValue::Function(
+                    ScalarFunctionHandle::NativeJsonStringify,
+                ));
+            }
+            _ => {}
+        }
+    }
+    if matches!(
+        property_name,
+        "registerCallableModule" | "registerLazyCallableModule"
+    ) {
+        return Some(ScalarValue::Function(
+            ScalarFunctionHandle::NativeNoopFunction,
+        ));
+    }
+    if let ScalarObjectHandle::NativePrototype(prototype) = handle {
+        if property_name == "constructor" {
+            return Some(
+                scalar_native_prototype_constructor(prototype)
+                    .map_or(ScalarValue::Undefined, ScalarValue::Function),
+            );
+        }
+    }
+    if matches!(
+        handle,
+        ScalarObjectHandle::Console
+            | ScalarObjectHandle::Json
+            | ScalarObjectHandle::Object(_)
+            | ScalarObjectHandle::NativePrototype(_)
+            | ScalarObjectHandle::Array(_)
+            | ScalarObjectHandle::Uint8Array(_)
+            | ScalarObjectHandle::Map(_)
+            | ScalarObjectHandle::Set(_)
+            | ScalarObjectHandle::WeakMap(_)
+            | ScalarObjectHandle::WeakSet(_)
+            | ScalarObjectHandle::NativeModule(_)
+    ) && property_name == "hasOwnProperty"
+    {
+        return Some(ScalarValue::Function(
+            ScalarFunctionHandle::NativeObjectHasOwnProperty,
+        ));
+    }
+    if matches!(handle, ScalarObjectHandle::NativeModule(_)) {
+        return Some(match property_name {
+            "getConstants" => ScalarValue::Function(ScalarFunctionHandle::NativeModuleGetConstants),
+            "currentTimestamp" => ScalarValue::Function(ScalarFunctionHandle::NativePerformanceNow),
+            "getSupportedPerformanceEntryTypes" => {
+                ScalarValue::Function(ScalarFunctionHandle::NativePerformanceGetSupportedEntryTypes)
+            }
+            _ => ScalarValue::Function(ScalarFunctionHandle::NativeNoopFunction),
+        });
+    }
+    if matches!(handle, ScalarObjectHandle::Array(_)) {
+        match property_name {
+            "length" => {
+                return Some(ScalarValue::Number(
+                    read_scalar_array_length(state, handle).map_or(0.0, f64::from),
+                ));
+            }
+            "forEach" => {
+                return Some(ScalarValue::Function(
+                    ScalarFunctionHandle::NativeArrayForEach,
+                ));
+            }
+            "map" => return Some(ScalarValue::Function(ScalarFunctionHandle::NativeArrayMap)),
+            _ => {}
+        }
+    }
+    if matches!(handle, ScalarObjectHandle::Uint8Array(_)) {
+        match property_name {
+            "byteLength" | "length" => {
+                return Some(ScalarValue::Number(
+                    read_scalar_array_length(state, handle).map_or(0.0, f64::from),
+                ));
+            }
+            "set" => {
+                return Some(ScalarValue::Function(
+                    ScalarFunctionHandle::NativeUint8ArraySet,
+                ));
+            }
+            _ => {}
+        }
+    }
+    if matches!(
+        handle,
+        ScalarObjectHandle::Map(_) | ScalarObjectHandle::WeakMap(_)
+    ) {
+        match property_name {
+            "get" => {
+                return Some(ScalarValue::Function(
+                    ScalarFunctionHandle::NativeWeakMapGet,
+                ));
+            }
+            "has" => {
+                return Some(ScalarValue::Function(
+                    ScalarFunctionHandle::NativeWeakMapHas,
+                ));
+            }
+            "set" => {
+                return Some(ScalarValue::Function(
+                    ScalarFunctionHandle::NativeWeakMapSet,
+                ));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn read_scalar_object_getter_lookup(
+    state: &ScalarExecutorState<'_>,
+    handle: ScalarObjectHandle,
+    property_name: &str,
+    depth: u8,
+) -> ScalarObjectGetterLookup {
+    if let Some(value) = read_scalar_own_object_property(state, handle, property_name) {
+        return ScalarObjectGetterLookup::DataProperty(value);
+    }
+    if let Some(getter) = read_scalar_own_object_getter_property(state, handle, property_name) {
+        return ScalarObjectGetterLookup::Getter(getter);
+    }
+    if depth < SCALAR_PROTOTYPE_LOOKUP_DEPTH_LIMIT {
+        if let Some(ScalarValue::Object(prototype)) = read_scalar_object_prototype(state, handle) {
+            return read_scalar_object_getter_lookup(state, prototype, property_name, depth + 1);
+        }
+    }
+    ScalarObjectGetterLookup::Missing
+}
+
+fn read_scalar_own_object_getter_property(
+    state: &ScalarExecutorState<'_>,
+    handle: ScalarObjectHandle,
+    property_name: &str,
+) -> Option<ScalarValue> {
     state
-        .object_properties
+        .object_getters
         .iter()
         .rev()
         .find(|(object, name, _)| *object == handle && *name == property_name)
-        .map_or(ScalarValue::Undefined, |(_, _, value)| *value)
+        .map(|(_, _, getter)| *getter)
+}
+
+fn read_scalar_own_object_property(
+    state: &ScalarExecutorState<'_>,
+    handle: ScalarObjectHandle,
+    property_name: &str,
+) -> Option<ScalarValue> {
+    if state.object_properties.len() <= SCALAR_LINEAR_OBJECT_PROPERTY_LIMIT {
+        if let Some(value) = state
+            .object_properties
+            .iter()
+            .rev()
+            .find(|(object, name, _)| *object == handle && *name == property_name)
+            .map(|(_, _, value)| *value)
+        {
+            return Some(value);
+        }
+    }
+
+    if let Some(value) = state
+        .object_property_indices
+        .get(&(handle, property_name))
+        .map(|property_index| state.object_properties[*property_index].2)
+    {
+        return Some(value);
+    }
+
+    let slot = state
+        .object_slot_names
+        .iter()
+        .rev()
+        .find(|(object, _, name)| *object == handle && *name == property_name)
+        .map(|(_, slot, _)| *slot)?;
+    read_scalar_object_slot_value(state, handle, slot)
+}
+
+fn read_scalar_rn_object_stub_property(property_name: &str) -> Option<ScalarValue> {
+    match property_name {
+        "currentTimestamp" => Some(ScalarValue::Function(
+            ScalarFunctionHandle::NativePerformanceNow,
+        )),
+        "addNetworkingHandler"
+        | "addTimespan"
+        | "append"
+        | "clear"
+        | "clearCompleted"
+        | "close"
+        | "logEverything"
+        | "markPoint"
+        | "removeExtra"
+        | "setExtra"
+        | "setReactNativeMicrotasksCallback"
+        | "startTimespan"
+        | "stopTimespan" => Some(ScalarValue::Function(
+            ScalarFunctionHandle::NativeNoopFunction,
+        )),
+        _ => None,
+    }
+}
+
+fn scalar_object_has_own_named_property(
+    state: &ScalarExecutorState<'_>,
+    handle: ScalarObjectHandle,
+    property_name: &str,
+) -> bool {
+    state
+        .object_property_indices
+        .contains_key(&(handle, property_name))
 }
 
 fn read_scalar_function_property(
@@ -5794,8 +9880,28 @@ fn read_scalar_function_property(
     handle: ScalarFunctionHandle,
     property_name: &str,
 ) -> ScalarValue {
+    if property_name == "prototype" {
+        if let Some(prototype) = scalar_native_constructor_prototype(handle) {
+            return ScalarValue::Object(ScalarObjectHandle::NativePrototype(prototype));
+        }
+    }
     if handle == ScalarFunctionHandle::NativeDateConstructor && property_name == "now" {
         return ScalarValue::Function(ScalarFunctionHandle::NativeDateNow);
+    }
+    if handle == ScalarFunctionHandle::NativeSymbolConstructor && property_name == "for" {
+        return ScalarValue::Function(ScalarFunctionHandle::NativeSymbolFor);
+    }
+    if handle == ScalarFunctionHandle::NativeArrayConstructor && property_name == "isArray" {
+        return ScalarValue::Function(ScalarFunctionHandle::NativeArrayIsArray);
+    }
+    if property_name == "toString" {
+        return ScalarValue::Function(ScalarFunctionHandle::NativeFunctionToString);
+    }
+    if property_name == "bind" {
+        return ScalarValue::Function(ScalarFunctionHandle::NativeFunctionBind);
+    }
+    if handle == ScalarFunctionHandle::NativeFunctionToString && property_name == "call" {
+        return ScalarValue::Function(ScalarFunctionHandle::NativeFunctionToStringCall);
     }
 
     if handle == ScalarFunctionHandle::NativeObjectConstructor && property_name == "defineProperty"
@@ -5803,24 +9909,126 @@ fn read_scalar_function_property(
         return ScalarValue::Function(ScalarFunctionHandle::NativeObjectDefineProperty);
     }
     if handle == ScalarFunctionHandle::NativeObjectConstructor
+        && property_name == "defineProperties"
+    {
+        return ScalarValue::Function(ScalarFunctionHandle::NativeObjectDefineProperties);
+    }
+    if handle == ScalarFunctionHandle::NativeObjectConstructor && property_name == "assign" {
+        return ScalarValue::Function(ScalarFunctionHandle::NativeObjectAssign);
+    }
+    if handle == ScalarFunctionHandle::NativeObjectConstructor && property_name == "freeze" {
+        return ScalarValue::Function(ScalarFunctionHandle::NativeObjectFreeze);
+    }
+    if handle == ScalarFunctionHandle::NativeObjectConstructor && property_name == "create" {
+        return ScalarValue::Function(ScalarFunctionHandle::NativeObjectCreate);
+    }
+    if handle == ScalarFunctionHandle::NativeObjectConstructor && property_name == "getPrototypeOf"
+    {
+        return ScalarValue::Function(ScalarFunctionHandle::NativeObjectGetPrototypeOf);
+    }
+    if handle == ScalarFunctionHandle::NativeObjectConstructor
         && property_name == "getOwnPropertyDescriptor"
     {
         return ScalarValue::Function(ScalarFunctionHandle::NativeObjectGetOwnPropertyDescriptor);
     }
+    if handle == ScalarFunctionHandle::NativeObjectConstructor
+        && property_name == "preventExtensions"
+    {
+        return ScalarValue::Function(ScalarFunctionHandle::NativeObjectPreventExtensions);
+    }
+    if handle == ScalarFunctionHandle::NativeObjectConstructor && property_name == "keys" {
+        return ScalarValue::Function(ScalarFunctionHandle::NativeObjectKeys);
+    }
     if handle == ScalarFunctionHandle::NativeObjectHasOwnProperty && property_name == "call" {
         return ScalarValue::Function(ScalarFunctionHandle::NativeObjectHasOwnPropertyCall);
     }
+    if handle == ScalarFunctionHandle::NativeMetroRequire && property_name == "importDefault" {
+        return ScalarValue::Function(ScalarFunctionHandle::NativeMetroImportDefault);
+    }
+    if handle == ScalarFunctionHandle::NativeMetroRequire && property_name == "importAll" {
+        return ScalarValue::Function(ScalarFunctionHandle::NativeMetroImportAll);
+    }
+    if property_name == "call" {
+        return ScalarValue::Function(ScalarFunctionHandle::NativeFunctionCall);
+    }
 
-    state
+    let stored_property = state
         .function_properties
         .iter()
         .rev()
         .find(|(function, name, _)| *function == handle && *name == property_name)
-        .map_or(ScalarValue::Undefined, |(_, _, value)| *value)
+        .map(|(_, _, value)| *value);
+    if let Some(value) = stored_property {
+        return value;
+    }
+
+    if matches!(handle, ScalarFunctionHandle::Bytecode { .. }) {
+        if let Some(value) = read_scalar_rn_object_stub_property(property_name) {
+            return value;
+        }
+    }
+
+    ScalarValue::Undefined
 }
 
-fn read_scalar_string_property(property_name: &str) -> ScalarValue {
+fn scalar_native_constructor_prototype(
+    handle: ScalarFunctionHandle,
+) -> Option<ScalarNativePrototype> {
+    match handle {
+        ScalarFunctionHandle::NativeArrayConstructor => Some(ScalarNativePrototype::Array),
+        ScalarFunctionHandle::NativeUint8ArrayConstructor => {
+            Some(ScalarNativePrototype::Uint8Array)
+        }
+        ScalarFunctionHandle::NativeBooleanConstructor => Some(ScalarNativePrototype::Boolean),
+        ScalarFunctionHandle::NativeDateConstructor => Some(ScalarNativePrototype::Date),
+        ScalarFunctionHandle::NativeFunctionConstructor => Some(ScalarNativePrototype::Function),
+        ScalarFunctionHandle::NativeMapConstructor => Some(ScalarNativePrototype::Map),
+        ScalarFunctionHandle::NativeNumberConstructor => Some(ScalarNativePrototype::Number),
+        ScalarFunctionHandle::NativeObjectConstructor => Some(ScalarNativePrototype::Object),
+        ScalarFunctionHandle::NativePromiseConstructor => Some(ScalarNativePrototype::Promise),
+        ScalarFunctionHandle::NativeSetConstructor => Some(ScalarNativePrototype::Set),
+        ScalarFunctionHandle::NativeStringConstructor => Some(ScalarNativePrototype::String),
+        ScalarFunctionHandle::NativeWeakMapConstructor => Some(ScalarNativePrototype::WeakMap),
+        ScalarFunctionHandle::NativeWeakSetConstructor => Some(ScalarNativePrototype::WeakSet),
+        _ => None,
+    }
+}
+
+fn scalar_native_prototype_constructor(
+    prototype: ScalarNativePrototype,
+) -> Option<ScalarFunctionHandle> {
+    match prototype {
+        ScalarNativePrototype::Array => Some(ScalarFunctionHandle::NativeArrayConstructor),
+        ScalarNativePrototype::Uint8Array => {
+            Some(ScalarFunctionHandle::NativeUint8ArrayConstructor)
+        }
+        ScalarNativePrototype::Boolean => Some(ScalarFunctionHandle::NativeBooleanConstructor),
+        ScalarNativePrototype::Date => Some(ScalarFunctionHandle::NativeDateConstructor),
+        ScalarNativePrototype::Function => Some(ScalarFunctionHandle::NativeFunctionConstructor),
+        ScalarNativePrototype::Map => Some(ScalarFunctionHandle::NativeMapConstructor),
+        ScalarNativePrototype::Number => Some(ScalarFunctionHandle::NativeNumberConstructor),
+        ScalarNativePrototype::Object => Some(ScalarFunctionHandle::NativeObjectConstructor),
+        ScalarNativePrototype::Promise => Some(ScalarFunctionHandle::NativePromiseConstructor),
+        ScalarNativePrototype::Set => Some(ScalarFunctionHandle::NativeSetConstructor),
+        ScalarNativePrototype::String => Some(ScalarFunctionHandle::NativeStringConstructor),
+        ScalarNativePrototype::WeakMap => Some(ScalarFunctionHandle::NativeWeakMapConstructor),
+        ScalarNativePrototype::WeakSet => Some(ScalarFunctionHandle::NativeWeakSetConstructor),
+    }
+}
+
+fn read_scalar_string_property(
+    bytecode: &HermesBytecode<'_>,
+    state: &ScalarExecutorState<'_>,
+    value: ScalarValue,
+    property_name: &str,
+) -> ScalarValue {
     match property_name {
+        "charCodeAt" => ScalarValue::Function(ScalarFunctionHandle::NativeStringCharCodeAt),
+        "indexOf" => ScalarValue::Function(ScalarFunctionHandle::NativeStringIndexOf),
+        "length" => scalar_value_string_text(bytecode, state, value)
+            .map_or(ScalarValue::Undefined, |value| {
+                ScalarValue::Number(value.chars().count() as f64)
+            }),
         "replace" => ScalarValue::Function(ScalarFunctionHandle::NativeStringReplace),
         _ => ScalarValue::Undefined,
     }
@@ -5843,16 +10051,15 @@ fn read_scalar_register(
     instruction: HermesInstruction,
     register: u32,
 ) -> Result<ScalarValue, ScalarExecutionError> {
-    registers
-        .get(usize::try_from(register).expect("u32 always fits in usize on supported targets"))
-        .copied()
-        .ok_or(ScalarExecutionError::RegisterOutOfBounds {
+    registers.get(register as usize).copied().ok_or_else(|| {
+        ScalarExecutionError::RegisterOutOfBounds {
             function_id,
             offset: instruction.offset,
             opcode: instruction.opcode,
             register,
             frame_size: u32::try_from(registers.len()).expect("Hermes frame size is stored as u32"),
-        })
+        }
+    })
 }
 
 fn write_scalar_register(
@@ -5862,16 +10069,15 @@ fn write_scalar_register(
     register: u32,
     value: ScalarValue,
 ) -> Result<(), ScalarExecutionError> {
-    let frame_size = u32::try_from(registers.len()).expect("Hermes frame size is stored as u32");
-    let register_slot = registers
-        .get_mut(usize::try_from(register).expect("u32 always fits in usize on supported targets"))
-        .ok_or(ScalarExecutionError::RegisterOutOfBounds {
+    let Some(register_slot) = registers.get_mut(register as usize) else {
+        return Err(ScalarExecutionError::RegisterOutOfBounds {
             function_id,
             offset: instruction.offset,
             opcode: instruction.opcode,
             register,
-            frame_size,
-        })?;
+            frame_size: u32::try_from(registers.len()).expect("Hermes frame size is stored as u32"),
+        });
+    };
     *register_slot = value;
     Ok(())
 }
@@ -5981,7 +10187,11 @@ fn iris_scalar_executor_supports_opcode(opcode: u8) -> bool {
             | 6
             | 7
             | 8
+            | 15
             | 16
+            | 19
+            | 21
+            | 49
             | 51
             | 55
             | 56
@@ -5990,6 +10200,7 @@ fn iris_scalar_executor_supports_opcode(opcode: u8) -> bool {
             | 59
             | 60
             | 61
+            | 62
             | 64
             | 66
             | 67
@@ -6002,8 +10213,10 @@ fn iris_scalar_executor_supports_opcode(opcode: u8) -> bool {
             | 83
             | 86
             | 87
+            | 93
             | 96
             | 97
+            | 99
             | 107
             | 108
             | 110
@@ -6022,6 +10235,7 @@ fn iris_scalar_executor_supports_opcode(opcode: u8) -> bool {
             | 141
             | 144
             | 153
+            | 157
             | 174
             | 175
             | 176
@@ -7978,12 +12192,13 @@ fn instruction_bytes(body: SectionView<'_>, instruction: HermesInstruction) -> &
 fn read_unsigned_operand(bytes: &[u8], offset: usize, width: usize) -> u32 {
     match width {
         1 => u32::from(bytes[offset]),
-        2 => u32::from(u16::from_le_bytes(
-            bytes[offset..offset + 2]
-                .try_into()
-                .expect("validated instruction operand has u16 width"),
-        )),
-        4 => read_u32(bytes, offset),
+        2 => u32::from(bytes[offset]) | (u32::from(bytes[offset + 1]) << 8),
+        4 => {
+            u32::from(bytes[offset])
+                | (u32::from(bytes[offset + 1]) << 8)
+                | (u32::from(bytes[offset + 2]) << 16)
+                | (u32::from(bytes[offset + 3]) << 24)
+        }
         _ => unreachable!("Hermes integer operand width is 1, 2, or 4 bytes"),
     }
 }
@@ -7991,11 +12206,13 @@ fn read_unsigned_operand(bytes: &[u8], offset: usize, width: usize) -> u32 {
 fn read_signed_operand(bytes: &[u8], offset: usize, width: usize) -> i64 {
     match width {
         1 => i64::from(i8::from_le_bytes([bytes[offset]])),
-        4 => i64::from(i32::from_le_bytes(
-            bytes[offset..offset + 4]
-                .try_into()
-                .expect("validated instruction operand has i32 width"),
-        )),
+        4 => {
+            let value = u32::from(bytes[offset])
+                | (u32::from(bytes[offset + 1]) << 8)
+                | (u32::from(bytes[offset + 2]) << 16)
+                | (u32::from(bytes[offset + 3]) << 24);
+            i64::from(value as i32)
+        }
         _ => unreachable!("Hermes jump operand width is 1 or 4 bytes"),
     }
 }
@@ -8102,7 +12319,10 @@ mod tests {
     const NEW_ARRAY_WITH_BUFFER_OPCODE: u8 = 6;
     const NEW_ARRAY_WITH_BUFFER_LONG_OPCODE: u8 = 7;
     const NEW_ARRAY_OPCODE: u8 = 8;
+    const CACHE_NEW_OBJECT_OPCODE: u8 = 15;
     const MOV_OPCODE: u8 = 16;
+    const NOT_OPCODE: u8 = 19;
+    const IS_IN_OPCODE: u8 = 49;
     const TYPE_OF_IS_OPCODE: u8 = 51;
     const STORE_TO_ENVIRONMENT_OPCODE: u8 = 55;
     const STORE_TO_ENVIRONMENT_L_OPCODE: u8 = 56;
@@ -8110,6 +12330,7 @@ mod tests {
     const LOAD_FROM_ENVIRONMENT_OPCODE: u8 = 59;
     const LOAD_FROM_ENVIRONMENT_L_OPCODE: u8 = 60;
     const GET_GLOBAL_OBJECT_OPCODE: u8 = 61;
+    const GET_NEW_TARGET_OPCODE: u8 = 62;
     const CREATE_FUNCTION_ENVIRONMENT_OPCODE: u8 = 64;
     const CREATE_ENVIRONMENT_OPCODE: u8 = 66;
     const DECLARE_GLOBAL_VAR_OPCODE: u8 = 67;
@@ -8118,8 +12339,10 @@ mod tests {
     const PUT_BY_ID_LOOSE_OPCODE: u8 = 74;
     const PUT_OWN_BY_SLOT_IDX_OPCODE: u8 = 82;
     const DEFINE_OWN_BY_ID_OPCODE: u8 = 86;
+    const GET_BY_VAL_OPCODE: u8 = 93;
     const PUT_BY_VAL_LOOSE_OPCODE: u8 = 96;
     const PUT_BY_VAL_STRICT_OPCODE: u8 = 97;
+    const DEL_BY_VAL_OPCODE: u8 = 99;
     const CONSTRUCT_OPCODE: u8 = 107;
     const CALL1_OPCODE: u8 = 108;
     const CALL2_OPCODE: u8 = 110;
@@ -8144,7 +12367,9 @@ mod tests {
     const LOAD_CONST_FALSE_OPCODE: u8 = 150;
     const LOAD_CONST_ZERO_OPCODE: u8 = 151;
     const LOAD_THIS_NS_OPCODE: u8 = 153;
+    const ADD_EMPTY_STRING_OPCODE: u8 = 157;
     const LOAD_PARAM_OPCODE: u8 = 137;
+    const INSTANCE_OF_OPCODE: u8 = 48;
     const CREATE_CLOSURE_OPCODE: u8 = 132;
     const CREATE_CLOSURE_LONG_INDEX_OPCODE: u8 = 133;
     const CREATE_THIS_FOR_NEW_OPCODE: u8 = 134;
@@ -8801,6 +13026,56 @@ mod tests {
     }
 
     #[test]
+    fn describes_strict_scalar_execution_completion_for_cxx_hosts() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(&mut bytes, &[LOAD_CONST_UNDEFINED_OPCODE, 0, RET_OPCODE, 0]);
+
+        let report = describe_hbc_strict_scalar_execution(&bytes)
+            .expect("valid strict scalar execution report");
+
+        assert!(report.contains("status=completed"));
+        assert!(report.contains("value=Undefined"));
+    }
+
+    #[test]
+    fn profiles_strict_scalar_execution_hot_paths() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                DECLARE_GLOBAL_VAR_OPCODE,
+                1,
+                0,
+                0,
+                0,
+                GET_GLOBAL_OBJECT_OPCODE,
+                0,
+                TRY_GET_BY_ID_OPCODE,
+                1,
+                0,
+                0,
+                1,
+                0,
+                LOAD_CONST_UNDEFINED_OPCODE,
+                0,
+                RET_OPCODE,
+                0,
+            ],
+        );
+
+        let report = profile_hbc_global_scalar_execution(&bytes).expect("valid profile report");
+
+        assert!(report.contains("status=completed"));
+        assert!(report.contains("totalInstructions=5"));
+        assert!(report.contains("DeclareGlobalVar(67)=1"));
+        assert!(report.contains("topInstructionOffsets=["));
+        assert!(report.contains("declare:cdef=1"));
+        assert!(report.contains("get:global:cdef=1"));
+        assert!(report.contains("topCallTargets=[]"));
+        assert!(report.contains("topCallArgumentKinds=[]"));
+    }
+
+    #[test]
     fn describes_scalar_execution_frontier_for_cxx_hosts() {
         let mut bytes = fixture_bytecode();
         replace_global_body(
@@ -8810,6 +13085,21 @@ mod tests {
 
         let report =
             describe_hbc_scalar_execution(&bytes).expect("valid scalar execution frontier report");
+
+        assert!(report.contains("status=frontier"));
+        assert!(report.contains("LoadConstBigInt"));
+    }
+
+    #[test]
+    fn describes_strict_scalar_execution_frontier_for_cxx_hosts() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[LOAD_CONST_BIGINT_OPCODE, 0, 0, 0, RET_OPCODE, 0],
+        );
+
+        let report = describe_hbc_strict_scalar_execution(&bytes)
+            .expect("valid strict scalar execution frontier report");
 
         assert!(report.contains("status=frontier"));
         assert!(report.contains("LoadConstBigInt"));
@@ -8915,6 +13205,37 @@ mod tests {
     }
 
     #[test]
+    fn scalar_executor_adds_empty_string_to_string_without_copying_payload() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                LOAD_CONST_STRING_OPCODE,
+                0,
+                1,
+                0,
+                ADD_EMPTY_STRING_OPCODE,
+                1,
+                0,
+                RET_OPCODE,
+                1,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::String(ScalarStringHandle {
+                string_id: 1,
+                is_empty: false,
+            })),
+        );
+
+        let report = describe_hbc_execution_gap(&bytes).expect("valid execution gap report");
+        assert!(report.contains("supportedInstructions=3/3"));
+        assert!(report.contains("firstUnsupported=none"));
+    }
+
+    #[test]
     fn scalar_executor_loads_non_strict_this_as_global_object() {
         let mut bytes = fixture_bytecode();
         replace_global_body(&mut bytes, &[LOAD_THIS_NS_OPCODE, 0, RET_OPCODE, 0]);
@@ -8927,6 +13248,20 @@ mod tests {
         let report = describe_hbc_execution_gap(&bytes).expect("valid execution gap report");
         assert!(report.contains("supportedInstructions=2/2"));
         assert!(report.contains("firstUnsupported=none"));
+    }
+
+    #[test]
+    fn scalar_executor_loads_non_strict_object_this_from_arguments() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(&mut bytes, &[LOAD_THIS_NS_OPCODE, 0, RET_OPCODE, 0]);
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid Hermes bytecode");
+        let mut state = ScalarExecutorState::default();
+        let this_value = ScalarValue::Object(allocate_scalar_object(&mut state));
+
+        let report = execute_scalar_function_with_state(&bytecode, &mut state, 1, &[this_value])
+            .expect("LoadThisNS with object this");
+
+        assert_eq!(report.value, this_value);
     }
 
     #[test]
@@ -8973,6 +13308,39 @@ mod tests {
     }
 
     #[test]
+    fn scalar_executor_maps_typeof_names() {
+        assert_eq!(scalar_typeof_name(ScalarValue::Empty), "undefined");
+        assert_eq!(scalar_typeof_name(ScalarValue::Undefined), "undefined");
+        assert_eq!(scalar_typeof_name(ScalarValue::Null), "object");
+        assert_eq!(scalar_typeof_name(ScalarValue::Boolean(false)), "boolean");
+        assert_eq!(scalar_typeof_name(ScalarValue::Number(1.0)), "number");
+        assert_eq!(
+            scalar_typeof_name(ScalarValue::String(ScalarStringHandle {
+                string_id: 1,
+                is_empty: false,
+            })),
+            "string",
+        );
+        assert_eq!(
+            scalar_typeof_name(ScalarValue::Symbol(ScalarStringHandle {
+                string_id: 2,
+                is_empty: false,
+            })),
+            "symbol",
+        );
+        assert_eq!(
+            scalar_typeof_name(ScalarValue::Object(ScalarObjectHandle::Object(7))),
+            "object",
+        );
+        assert_eq!(
+            scalar_typeof_name(ScalarValue::Function(
+                ScalarFunctionHandle::NativePerformanceNow,
+            )),
+            "function",
+        );
+    }
+
+    #[test]
     fn scalar_executor_writes_typeof_is_result() {
         let mut bytes = fixture_bytecode();
         replace_global_body(
@@ -8999,6 +13367,72 @@ mod tests {
 
         let report = describe_hbc_execution_gap(&bytes).expect("valid execution gap report");
         assert!(report.contains("supportedInstructions=3/3"));
+        assert!(report.contains("firstUnsupported=none"));
+    }
+
+    #[test]
+    fn scalar_executor_writes_logical_not_result() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[LOAD_CONST_FALSE_OPCODE, 0, NOT_OPCODE, 1, 0, RET_OPCODE, 1],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Boolean(true)),
+        );
+
+        let report = describe_hbc_execution_gap(&bytes).expect("valid execution gap report");
+        assert!(report.contains("supportedInstructions=3/3"));
+        assert!(report.contains("firstUnsupported=none"));
+    }
+
+    #[test]
+    fn scalar_executor_loads_new_target_as_undefined_subset() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(&mut bytes, &[GET_NEW_TARGET_OPCODE, 0, RET_OPCODE, 0]);
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Undefined),
+        );
+
+        let report = describe_hbc_execution_gap(&bytes).expect("valid execution gap report");
+        assert!(report.contains("supportedInstructions=2/2"));
+        assert!(report.contains("firstUnsupported=none"));
+    }
+
+    #[test]
+    fn scalar_executor_ignores_cache_new_object_hint() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                NEW_OBJECT_OPCODE,
+                0,
+                GET_NEW_TARGET_OPCODE,
+                1,
+                CACHE_NEW_OBJECT_OPCODE,
+                0,
+                1,
+                0xcd,
+                0x02,
+                0x00,
+                0x00,
+                0x00,
+                RET_OPCODE,
+                0,
+            ],
+        );
+
+        assert!(matches!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Object(ScalarObjectHandle::Object(_))),
+        ));
+
+        let report = describe_hbc_execution_gap(&bytes).expect("valid execution gap report");
+        assert!(report.contains("supportedInstructions=4/4"));
         assert!(report.contains("firstUnsupported=none"));
     }
 
@@ -9155,6 +13589,19 @@ mod tests {
     }
 
     #[test]
+    fn scalar_executor_reads_named_property_from_object_slot_fallback() {
+        let mut state = ScalarExecutorState::default();
+        let object = allocate_scalar_object(&mut state);
+        write_scalar_object_slot_name(&mut state, object, 1, "cdef");
+        write_scalar_object_slot(&mut state, object, 1, ScalarValue::Number(21.0));
+
+        assert_eq!(
+            read_scalar_own_object_property(&state, object, "cdef"),
+            Some(ScalarValue::Number(21.0)),
+        );
+    }
+
+    #[test]
     fn scalar_executor_defines_own_property_by_id() {
         let mut bytes = fixture_bytecode();
         replace_global_body(
@@ -9201,6 +13648,170 @@ mod tests {
         let report = describe_hbc_execution_gap(&bytes).expect("valid execution gap report");
         assert!(report.contains("supportedInstructions=2/2"));
         assert!(report.contains("firstUnsupported=none"));
+    }
+
+    #[test]
+    fn scalar_executor_reads_array_length_property() {
+        let mut state = ScalarExecutorState::default();
+        let array = allocate_scalar_array(&mut state, 3);
+
+        assert_eq!(
+            read_scalar_object_property(&state, array, "length"),
+            ScalarValue::Number(3.0),
+        );
+        assert!(scalar_object_property_exists(&state, array, "length"));
+    }
+
+    #[test]
+    fn scalar_executor_updates_array_length_on_index_write() {
+        let mut state = ScalarExecutorState::default();
+        let array = allocate_scalar_array(&mut state, 0);
+
+        write_scalar_array_element(&mut state, array, 3, ScalarValue::Number(17.0));
+
+        assert_eq!(read_scalar_array_length(&state, array), Some(4));
+        assert_eq!(
+            read_scalar_array_element(&state, array, 3),
+            ScalarValue::Number(17.0),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_models_uint8_array_length_and_index_writes() {
+        let mut state = ScalarExecutorState::default();
+        let array = allocate_scalar_uint8_array(&mut state, 4);
+
+        write_scalar_array_element(&mut state, array, 0, ScalarValue::Number(300.0));
+        write_scalar_array_element(&mut state, array, 1, ScalarValue::Number(1.9));
+        write_scalar_array_element(&mut state, array, 2, ScalarValue::Number(-1.0));
+        write_scalar_array_element(&mut state, array, 3, ScalarValue::Number(f64::NAN));
+        write_scalar_array_element(&mut state, array, 6, ScalarValue::Number(17.0));
+
+        assert_eq!(read_scalar_array_length(&state, array), Some(4));
+        assert_eq!(
+            read_scalar_object_property(&state, array, "length"),
+            ScalarValue::Number(4.0),
+        );
+        assert_eq!(
+            read_scalar_object_property(&state, array, "byteLength"),
+            ScalarValue::Number(4.0),
+        );
+        assert_eq!(
+            read_scalar_object_property(&state, array, "set"),
+            ScalarValue::Function(ScalarFunctionHandle::NativeUint8ArraySet),
+        );
+        assert_eq!(
+            read_scalar_array_element(&state, array, 0),
+            ScalarValue::Number(44.0),
+        );
+        assert_eq!(
+            read_scalar_array_element(&state, array, 1),
+            ScalarValue::Number(1.0),
+        );
+        assert_eq!(
+            read_scalar_array_element(&state, array, 2),
+            ScalarValue::Number(255.0),
+        );
+        assert_eq!(
+            read_scalar_array_element(&state, array, 3),
+            ScalarValue::Number(0.0),
+        );
+        assert_eq!(
+            read_scalar_array_element(&state, array, 6),
+            ScalarValue::Undefined,
+        );
+    }
+
+    #[test]
+    fn scalar_executor_copies_uint8_array_with_native_set() {
+        let bytes = fixture_bytecode();
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid Hermes bytecode");
+        let mut state = ScalarExecutorState::default();
+        let source = allocate_scalar_uint8_array(&mut state, 3);
+        let target = allocate_scalar_uint8_array(&mut state, 3);
+
+        write_scalar_array_element(&mut state, source, 0, ScalarValue::Number(5.0));
+        write_scalar_array_element(&mut state, source, 1, ScalarValue::Number(260.0));
+        write_scalar_array_element(&mut state, source, 2, ScalarValue::Number(7.0));
+
+        assert_eq!(
+            call_scalar_function(
+                &bytecode,
+                &mut state,
+                1,
+                HermesInstruction {
+                    offset: 123,
+                    opcode: CALL2_OPCODE,
+                    width: 4,
+                },
+                2,
+                ScalarValue::Function(ScalarFunctionHandle::NativeUint8ArraySet),
+                &[ScalarValue::Object(target), ScalarValue::Object(source)],
+            ),
+            Ok(ScalarValue::Undefined),
+        );
+        assert_eq!(
+            read_scalar_array_element(&state, target, 0),
+            ScalarValue::Number(5.0),
+        );
+        assert_eq!(
+            read_scalar_array_element(&state, target, 1),
+            ScalarValue::Number(4.0),
+        );
+        assert_eq!(
+            read_scalar_array_element(&state, target, 2),
+            ScalarValue::Number(7.0),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_calls_array_is_array() {
+        let bytes = fixture_bytecode();
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid Hermes bytecode");
+        let mut state = ScalarExecutorState::default();
+        let array = allocate_scalar_array(&mut state, 0);
+        let object = allocate_scalar_object(&mut state);
+
+        assert_eq!(
+            read_scalar_function_property(
+                &state,
+                ScalarFunctionHandle::NativeArrayConstructor,
+                "isArray",
+            ),
+            ScalarValue::Function(ScalarFunctionHandle::NativeArrayIsArray),
+        );
+        assert_eq!(
+            call_scalar_function(
+                &bytecode,
+                &mut state,
+                bytecode.header().global_code_index,
+                HermesInstruction {
+                    offset: 0,
+                    opcode: CALL2_OPCODE,
+                    width: 5,
+                },
+                0,
+                ScalarValue::Function(ScalarFunctionHandle::NativeArrayIsArray),
+                &[ScalarValue::Undefined, ScalarValue::Object(array)],
+            ),
+            Ok(ScalarValue::Boolean(true)),
+        );
+        assert_eq!(
+            call_scalar_function(
+                &bytecode,
+                &mut state,
+                bytecode.header().global_code_index,
+                HermesInstruction {
+                    offset: 0,
+                    opcode: CALL2_OPCODE,
+                    width: 5,
+                },
+                0,
+                ScalarValue::Function(ScalarFunctionHandle::NativeArrayIsArray),
+                &[ScalarValue::Undefined, ScalarValue::Object(object)],
+            ),
+            Ok(ScalarValue::Boolean(false)),
+        );
     }
 
     #[test]
@@ -9299,6 +13910,35 @@ mod tests {
         let report = describe_hbc_execution_gap(&bytes).expect("valid execution gap report");
         assert!(report.contains("supportedInstructions=2/2"));
         assert!(report.contains("firstUnsupported=none"));
+    }
+
+    #[test]
+    fn scalar_executor_links_function_environment_to_closure_parent() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[CREATE_FUNCTION_ENVIRONMENT_OPCODE, 0, 2, RET_OPCODE, 0],
+        );
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid Hermes bytecode");
+        let mut state = ScalarExecutorState::default();
+        let parent = allocate_scalar_environment_with_parent(&mut state, None);
+
+        let report = execute_scalar_function_with_state_and_environment(
+            &bytecode,
+            &mut state,
+            bytecode.header().global_code_index,
+            Some(parent),
+            &[],
+        )
+        .expect("function environment allocation succeeds");
+
+        let ScalarValue::Environment(environment) = report.value else {
+            panic!("expected function environment");
+        };
+        assert_eq!(
+            read_scalar_environment_parent(&state, environment),
+            Some(parent),
+        );
     }
 
     #[test]
@@ -9570,12 +14210,44 @@ mod tests {
 
         assert_eq!(
             execute_global_scalar_function(&bytes),
-            Ok(ScalarValue::Object(ScalarObjectHandle::Object(0))),
+            Ok(ScalarValue::Object(ScalarObjectHandle::Object(1))),
         );
 
         let report = describe_hbc_execution_gap(&bytes).expect("valid execution gap report");
         assert!(report.contains("supportedInstructions=4/4"));
         assert!(report.contains("firstUnsupported=none"));
+    }
+
+    #[test]
+    fn scalar_executor_matches_instanceof_for_constructor_prototype_chain() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                LOAD_CONST_UNDEFINED_OPCODE,
+                0,
+                CREATE_CLOSURE_OPCODE,
+                1,
+                0,
+                0,
+                0,
+                CREATE_THIS_FOR_NEW_OPCODE,
+                2,
+                1,
+                0,
+                INSTANCE_OF_OPCODE,
+                3,
+                2,
+                1,
+                RET_OPCODE,
+                3,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Boolean(true)),
+        );
     }
 
     #[test]
@@ -9640,6 +14312,55 @@ mod tests {
     }
 
     #[test]
+    fn scalar_executor_runs_pending_bytecode_constructor_with_this_argument() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(&mut bytes, &[LOAD_PARAM_OPCODE, 0, 0, RET_OPCODE, 0]);
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid Hermes bytecode");
+        let mut state = ScalarExecutorState::default();
+        let constructor = ScalarFunctionHandle::Bytecode {
+            function_id: 1,
+            environment: None,
+        };
+        let this_value = ScalarValue::Object(allocate_scalar_object(&mut state));
+        state
+            .pending_constructor_this_values
+            .push((constructor, this_value));
+        let registers = [this_value];
+
+        let result = construct_scalar_function(
+            &bytecode,
+            &mut state,
+            &registers,
+            1,
+            HermesInstruction {
+                offset: 0,
+                opcode: CONSTRUCT_OPCODE,
+                width: 4,
+            },
+            0,
+            ScalarValue::Function(constructor),
+            1,
+        );
+
+        assert_eq!(result, Ok(this_value));
+        assert!(state.pending_constructor_this_values.is_empty());
+    }
+
+    #[test]
+    fn scalar_executor_reads_constructor_arguments_ending_at_this_register() {
+        let this_value = ScalarValue::Object(ScalarObjectHandle::Object(1));
+        let executor = ScalarValue::Function(ScalarFunctionHandle::NativeNoopFunction);
+        let mut registers = vec![ScalarValue::Empty; 19];
+        registers[10] = executor;
+        registers[11] = this_value;
+
+        assert_eq!(
+            scalar_constructor_arguments(this_value, &registers, 2),
+            vec![this_value, executor],
+        );
+    }
+
+    #[test]
     fn scalar_executor_selects_this_when_constructor_return_is_not_object() {
         let mut bytes = fixture_bytecode();
         replace_global_body(
@@ -9671,7 +14392,7 @@ mod tests {
 
         assert_eq!(
             execute_global_scalar_function(&bytes),
-            Ok(ScalarValue::Object(ScalarObjectHandle::Object(0))),
+            Ok(ScalarValue::Object(ScalarObjectHandle::Object(1))),
         );
 
         let report = describe_hbc_execution_gap(&bytes).expect("valid execution gap report");
@@ -9964,6 +14685,118 @@ mod tests {
     }
 
     #[test]
+    fn scalar_executor_checks_computed_string_property_existence() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                NEW_OBJECT_OPCODE,
+                0,
+                LOAD_CONST_STRING_OPCODE,
+                1,
+                1,
+                0,
+                LOAD_CONST_TRUE_OPCODE,
+                2,
+                PUT_BY_VAL_LOOSE_OPCODE,
+                0,
+                1,
+                2,
+                IS_IN_OPCODE,
+                3,
+                1,
+                0,
+                RET_OPCODE,
+                3,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Boolean(true)),
+        );
+
+        let report = describe_hbc_execution_gap(&bytes).expect("valid execution gap report");
+        assert!(report.contains("supportedInstructions=6/6"));
+        assert!(report.contains("firstUnsupported=none"));
+    }
+
+    #[test]
+    fn scalar_executor_writes_and_reads_computed_numeric_property() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                NEW_OBJECT_OPCODE,
+                0,
+                LOAD_CONST_UINT8_OPCODE,
+                1,
+                45,
+                LOAD_CONST_UINT8_OPCODE,
+                2,
+                62,
+                PUT_BY_VAL_STRICT_OPCODE,
+                0,
+                1,
+                2,
+                GET_BY_VAL_OPCODE,
+                3,
+                0,
+                1,
+                RET_OPCODE,
+                3,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Number(62.0)),
+        );
+
+        let report = describe_hbc_execution_gap(&bytes).expect("valid execution gap report");
+        assert!(report.contains("supportedInstructions=6/6"));
+        assert!(report.contains("firstUnsupported=none"));
+    }
+
+    #[test]
+    fn scalar_executor_deletes_computed_string_property() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                NEW_OBJECT_OPCODE,
+                0,
+                LOAD_CONST_STRING_OPCODE,
+                1,
+                1,
+                0,
+                LOAD_CONST_TRUE_OPCODE,
+                2,
+                PUT_BY_VAL_LOOSE_OPCODE,
+                0,
+                1,
+                2,
+                DEL_BY_VAL_OPCODE,
+                3,
+                0,
+                1,
+                0,
+                RET_OPCODE,
+                3,
+            ],
+        );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Boolean(true)),
+        );
+
+        let report = describe_hbc_execution_gap(&bytes).expect("valid execution gap report");
+        assert!(report.contains("supportedInstructions=6/6"));
+        assert!(report.contains("firstUnsupported=none"));
+    }
+
+    #[test]
     fn scalar_executor_rejects_computed_property_key_outside_string_subset() {
         let mut bytes = fixture_bytecode();
         let body_offset = replace_global_body(
@@ -9971,9 +14804,8 @@ mod tests {
             &[
                 NEW_OBJECT_OPCODE,
                 0,
-                LOAD_CONST_UINT8_OPCODE,
+                NEW_OBJECT_OPCODE,
                 1,
-                7,
                 LOAD_CONST_TRUE_OPCODE,
                 2,
                 PUT_BY_VAL_LOOSE_OPCODE,
@@ -9989,10 +14821,10 @@ mod tests {
             execute_global_scalar_function(&bytes),
             Err(ScalarExecutionError::UnsupportedPropertyKey {
                 function_id: 1,
-                offset: body_offset + 7,
+                offset: body_offset + 6,
                 opcode: PUT_BY_VAL_LOOSE_OPCODE,
                 register: 1,
-                value: ScalarValue::Number(7.0),
+                value: ScalarValue::Object(ScalarObjectHandle::Object(1)),
             }),
         );
     }
@@ -10014,12 +14846,175 @@ mod tests {
             ScalarValue::Object(ScalarObjectHandle::HermesInternal),
         );
         assert_eq!(
+            read_scalar_global_property(&state, "Math"),
+            ScalarValue::Object(ScalarObjectHandle::Math),
+        );
+        assert_eq!(
+            read_scalar_object_property(&state, ScalarObjectHandle::Math, "sqrt"),
+            ScalarValue::Function(ScalarFunctionHandle::NativeMathSqrt),
+        );
+        assert_eq!(
+            read_scalar_global_property(&state, "Array"),
+            ScalarValue::Function(ScalarFunctionHandle::NativeArrayConstructor),
+        );
+        assert_eq!(
             read_scalar_global_property(&state, "Map"),
             ScalarValue::Function(ScalarFunctionHandle::NativeMapConstructor),
         );
         assert_eq!(
+            read_scalar_global_property(&state, "Uint8Array"),
+            ScalarValue::Function(ScalarFunctionHandle::NativeUint8ArrayConstructor),
+        );
+        assert_eq!(
             read_scalar_global_property(&state, "Object"),
             ScalarValue::Function(ScalarFunctionHandle::NativeObjectConstructor),
+        );
+        assert_eq!(
+            read_scalar_global_property(&state, "Function"),
+            ScalarValue::Function(ScalarFunctionHandle::NativeFunctionConstructor),
+        );
+        assert_eq!(
+            read_scalar_global_property(&state, "DOMException"),
+            ScalarValue::Function(ScalarFunctionHandle::NativeErrorConstructor),
+        );
+        assert_eq!(
+            read_scalar_global_property(&state, "TypeError"),
+            ScalarValue::Function(ScalarFunctionHandle::NativeErrorConstructor),
+        );
+        assert_eq!(
+            read_scalar_global_property(&state, "Symbol"),
+            ScalarValue::Function(ScalarFunctionHandle::NativeSymbolConstructor),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_creates_symbol_property_keys() {
+        let bytes = fixture_bytecode();
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid Hermes bytecode");
+        let symbol = call_scalar_symbol(&[
+            ScalarValue::Undefined,
+            ScalarValue::String(ScalarStringHandle {
+                string_id: 1,
+                is_empty: false,
+            }),
+        ]);
+
+        assert_eq!(
+            symbol,
+            ScalarValue::Symbol(ScalarStringHandle {
+                string_id: 1,
+                is_empty: false,
+            }),
+        );
+        assert_eq!(
+            read_scalar_property_key(
+                &bytecode,
+                &[symbol],
+                bytecode.header().global_code_index,
+                HermesInstruction {
+                    offset: 0,
+                    opcode: PUT_BY_VAL_LOOSE_OPCODE,
+                    width: 4,
+                },
+                0,
+            ),
+            Ok("cdef"),
+        );
+        assert_eq!(
+            read_scalar_function_property(
+                &ScalarExecutorState::default(),
+                ScalarFunctionHandle::NativeSymbolConstructor,
+                "for",
+            ),
+            ScalarValue::Function(ScalarFunctionHandle::NativeSymbolFor),
+        );
+        assert_eq!(
+            call_scalar_function(
+                &bytecode,
+                &mut ScalarExecutorState::default(),
+                bytecode.header().global_code_index,
+                HermesInstruction {
+                    offset: 0,
+                    opcode: CALL2_OPCODE,
+                    width: 5,
+                },
+                0,
+                ScalarValue::Function(ScalarFunctionHandle::NativeSymbolFor),
+                &[
+                    ScalarValue::Undefined,
+                    ScalarValue::String(ScalarStringHandle {
+                        string_id: 1,
+                        is_empty: false,
+                    }),
+                ],
+            ),
+            Ok(symbol),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_handles_native_function_to_string_index_of() {
+        let bytes = fixture_bytecode();
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid Hermes bytecode");
+        let string = ScalarValue::String(ScalarStringHandle {
+            string_id: 1,
+            is_empty: false,
+        });
+
+        assert_eq!(
+            read_scalar_function_property(
+                &ScalarExecutorState::default(),
+                ScalarFunctionHandle::NativeFunctionConstructor,
+                "toString",
+            ),
+            ScalarValue::Function(ScalarFunctionHandle::NativeFunctionToString),
+        );
+        assert_eq!(
+            read_scalar_function_property(
+                &ScalarExecutorState::default(),
+                ScalarFunctionHandle::NativeFunctionToString,
+                "call",
+            ),
+            ScalarValue::Function(ScalarFunctionHandle::NativeFunctionToStringCall),
+        );
+        assert_eq!(
+            call_scalar_string_index_of(
+                &bytecode,
+                &ScalarExecutorState::default(),
+                &[string, string]
+            ),
+            ScalarValue::Number(0.0),
+        );
+        assert_eq!(
+            call_scalar_string_index_of(
+                &bytecode,
+                &ScalarExecutorState::default(),
+                &[
+                    string,
+                    ScalarValue::String(ScalarStringHandle {
+                        string_id: 0,
+                        is_empty: false,
+                    }),
+                ],
+            ),
+            ScalarValue::Number(-1.0),
+        );
+        assert_eq!(
+            read_scalar_string_property(
+                &bytecode,
+                &ScalarExecutorState::default(),
+                string,
+                "charCodeAt",
+            ),
+            ScalarValue::Function(ScalarFunctionHandle::NativeStringCharCodeAt),
+        );
+        assert_eq!(
+            call_scalar_string_char_code_at(
+                &bytecode,
+                &ScalarExecutorState::default(),
+                &[string, ScalarValue::Undefined, ScalarValue::Number(0.0)],
+            ),
+            ScalarValue::Number(99.0),
         );
     }
 
@@ -10049,6 +15044,325 @@ mod tests {
                 &[ScalarValue::Undefined, ScalarValue::Number(1.0)],
             ),
             Ok(ScalarValue::Number(0.0)),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_calls_native_function_call_handle() {
+        let bytes = fixture_bytecode();
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid Hermes bytecode");
+        let mut state = ScalarExecutorState::default();
+
+        assert_eq!(
+            read_scalar_function_property(&state, ScalarFunctionHandle::NativeNoopFunction, "call",),
+            ScalarValue::Function(ScalarFunctionHandle::NativeFunctionCall),
+        );
+        assert_eq!(
+            call_scalar_function(
+                &bytecode,
+                &mut state,
+                1,
+                HermesInstruction {
+                    offset: 123,
+                    opcode: CALL2_OPCODE,
+                    width: 4,
+                },
+                2,
+                ScalarValue::Function(ScalarFunctionHandle::NativeFunctionCall),
+                &[
+                    ScalarValue::Function(ScalarFunctionHandle::NativeNoopFunction),
+                    ScalarValue::Undefined,
+                ],
+            ),
+            Ok(ScalarValue::Undefined),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_calls_global_is_nan() {
+        let bytes = fixture_bytecode();
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid Hermes bytecode");
+        let mut state = ScalarExecutorState::default();
+
+        assert_eq!(
+            read_scalar_global_property(&state, "isNaN"),
+            ScalarValue::Function(ScalarFunctionHandle::NativeIsNaN),
+        );
+        assert_eq!(
+            call_scalar_function(
+                &bytecode,
+                &mut state,
+                1,
+                HermesInstruction {
+                    offset: 123,
+                    opcode: CALL2_OPCODE,
+                    width: 4,
+                },
+                2,
+                ScalarValue::Function(ScalarFunctionHandle::NativeIsNaN),
+                &[ScalarValue::Undefined, ScalarValue::Number(3.0)],
+            ),
+            Ok(ScalarValue::Boolean(false)),
+        );
+        assert_eq!(
+            call_scalar_function(
+                &bytecode,
+                &mut state,
+                1,
+                HermesInstruction {
+                    offset: 123,
+                    opcode: CALL1_OPCODE,
+                    width: 3,
+                },
+                2,
+                ScalarValue::Function(ScalarFunctionHandle::NativeIsNaN),
+                &[ScalarValue::Undefined],
+            ),
+            Ok(ScalarValue::Boolean(true)),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_calls_native_math_functions() {
+        let bytes = fixture_bytecode();
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid Hermes bytecode");
+        let mut state = ScalarExecutorState::default();
+        let instruction = HermesInstruction {
+            offset: 123,
+            opcode: CALL2_OPCODE,
+            width: 4,
+        };
+
+        assert_eq!(
+            call_scalar_function(
+                &bytecode,
+                &mut state,
+                1,
+                instruction,
+                2,
+                ScalarValue::Function(ScalarFunctionHandle::NativeMathSqrt),
+                &[ScalarValue::Undefined, ScalarValue::Number(9.0)],
+            ),
+            Ok(ScalarValue::Number(3.0)),
+        );
+        assert_eq!(
+            call_scalar_function(
+                &bytecode,
+                &mut state,
+                1,
+                instruction,
+                2,
+                ScalarValue::Function(ScalarFunctionHandle::NativeMathSin),
+                &[ScalarValue::Undefined, ScalarValue::Number(0.0)],
+            ),
+            Ok(ScalarValue::Number(0.0)),
+        );
+        assert_eq!(
+            call_scalar_function(
+                &bytecode,
+                &mut state,
+                1,
+                instruction,
+                2,
+                ScalarValue::Function(ScalarFunctionHandle::NativeMathRound),
+                &[ScalarValue::Undefined, ScalarValue::Number(3.5)],
+            ),
+            Ok(ScalarValue::Number(4.0)),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_stringifies_and_parses_json_subset() {
+        let bytes = fixture_bytecode();
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid Hermes bytecode");
+        let mut state = ScalarExecutorState::default();
+        let object = allocate_scalar_object(&mut state);
+        let array = allocate_scalar_array(&mut state, 1);
+        write_scalar_array_element(&mut state, array, 0, ScalarValue::Number(7.0));
+        write_scalar_named_object_property(&mut state, object, "cdef", ScalarValue::Object(array));
+
+        let encoded = call_scalar_json_stringify(
+            &bytecode,
+            &mut state,
+            &[
+                ScalarValue::Object(ScalarObjectHandle::Json),
+                ScalarValue::Object(object),
+            ],
+        );
+        assert!(matches!(encoded, ScalarValue::DynamicString(_)));
+
+        let parsed = call_scalar_json_parse(
+            &bytecode,
+            &mut state,
+            &[ScalarValue::Object(ScalarObjectHandle::Json), encoded],
+        );
+        let ScalarValue::Object(parsed) = parsed else {
+            panic!("expected parsed object");
+        };
+        let ScalarValue::Object(parsed_array) = read_scalar_object_property(&state, parsed, "cdef")
+        else {
+            panic!("expected parsed array property");
+        };
+        assert_eq!(
+            read_scalar_array_element(&state, parsed_array, 0),
+            ScalarValue::Number(7.0),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_calls_object_prevent_extensions_as_identity() {
+        let bytes = fixture_bytecode();
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid Hermes bytecode");
+        let mut state = ScalarExecutorState::default();
+        let object = ScalarValue::Object(allocate_scalar_object(&mut state));
+
+        assert_eq!(
+            read_scalar_function_property(
+                &state,
+                ScalarFunctionHandle::NativeObjectConstructor,
+                "preventExtensions",
+            ),
+            ScalarValue::Function(ScalarFunctionHandle::NativeObjectPreventExtensions),
+        );
+        assert_eq!(
+            call_scalar_function(
+                &bytecode,
+                &mut state,
+                1,
+                HermesInstruction {
+                    offset: 123,
+                    opcode: CALL2_OPCODE,
+                    width: 4,
+                },
+                2,
+                ScalarValue::Function(ScalarFunctionHandle::NativeObjectPreventExtensions),
+                &[ScalarValue::Undefined, object],
+            ),
+            Ok(object),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_calls_object_freeze_as_identity() {
+        let bytes = fixture_bytecode();
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid Hermes bytecode");
+        let mut state = ScalarExecutorState::default();
+        let object = ScalarValue::Object(allocate_scalar_object(&mut state));
+
+        assert_eq!(
+            read_scalar_function_property(
+                &state,
+                ScalarFunctionHandle::NativeObjectConstructor,
+                "freeze",
+            ),
+            ScalarValue::Function(ScalarFunctionHandle::NativeObjectFreeze),
+        );
+        assert_eq!(
+            call_scalar_function(
+                &bytecode,
+                &mut state,
+                1,
+                HermesInstruction {
+                    offset: 123,
+                    opcode: CALL2_OPCODE,
+                    width: 4,
+                },
+                2,
+                ScalarValue::Function(ScalarFunctionHandle::NativeObjectFreeze),
+                &[ScalarValue::Undefined, object],
+            ),
+            Ok(object),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_stubs_native_performance_entry_types_and_array_map() {
+        let bytes = fixture_bytecode();
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid Hermes bytecode");
+        let mut state = ScalarExecutorState::default();
+        let native_module = allocate_scalar_native_module(&mut state);
+
+        assert_eq!(
+            read_scalar_object_property(&state, native_module, "getSupportedPerformanceEntryTypes",),
+            ScalarValue::Function(ScalarFunctionHandle::NativePerformanceGetSupportedEntryTypes),
+        );
+        let supported = call_scalar_function(
+            &bytecode,
+            &mut state,
+            1,
+            HermesInstruction {
+                offset: 123,
+                opcode: CALL1_OPCODE,
+                width: 3,
+            },
+            2,
+            ScalarValue::Function(ScalarFunctionHandle::NativePerformanceGetSupportedEntryTypes),
+            &[ScalarValue::Undefined],
+        )
+        .expect("supported entry types");
+        let ScalarValue::Object(array) = supported else {
+            panic!("expected array");
+        };
+        assert_eq!(
+            read_scalar_object_property(&state, array, "map"),
+            ScalarValue::Function(ScalarFunctionHandle::NativeArrayMap),
+        );
+        assert_eq!(
+            read_scalar_object_property(&state, array, "forEach"),
+            ScalarValue::Function(ScalarFunctionHandle::NativeArrayForEach),
+        );
+        assert_eq!(
+            call_scalar_function(
+                &bytecode,
+                &mut state,
+                1,
+                HermesInstruction {
+                    offset: 123,
+                    opcode: CALL2_OPCODE,
+                    width: 4,
+                },
+                2,
+                ScalarValue::Function(ScalarFunctionHandle::NativeArrayMap),
+                &[ScalarValue::Object(array), ScalarValue::Undefined],
+            )
+            .map(|value| matches!(value, ScalarValue::Object(ScalarObjectHandle::Array(_)))),
+            Ok(true),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_calls_object_keys_for_own_properties() {
+        let bytes = fixture_bytecode();
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid Hermes bytecode");
+        let mut state = ScalarExecutorState::default();
+        let object = allocate_scalar_object(&mut state);
+        write_scalar_named_object_property(&mut state, object, "cdef", ScalarValue::Number(7.0));
+
+        let keys = call_scalar_function(
+            &bytecode,
+            &mut state,
+            1,
+            HermesInstruction {
+                offset: 123,
+                opcode: CALL2_OPCODE,
+                width: 4,
+            },
+            2,
+            ScalarValue::Function(ScalarFunctionHandle::NativeObjectKeys),
+            &[ScalarValue::Undefined, ScalarValue::Object(object)],
+        )
+        .expect("object keys");
+
+        let ScalarValue::Object(keys) = keys else {
+            panic!("expected keys array");
+        };
+        assert_eq!(read_scalar_array_length(&state, keys), Some(1));
+        assert_eq!(
+            read_scalar_array_element(&state, keys, 0),
+            ScalarValue::String(ScalarStringHandle {
+                string_id: 1,
+                is_empty: false,
+            }),
         );
     }
 
@@ -10098,6 +15412,433 @@ mod tests {
         assert_eq!(state.metro_module_exports.len(), 1);
         assert_eq!(state.metro_module_exports[0].0, 7);
         assert_eq!(result, Ok(state.metro_module_exports[0].1));
+    }
+
+    #[test]
+    fn scalar_executor_reads_metro_default_import_from_es_module() {
+        let mut state = ScalarExecutorState::default();
+        let module = allocate_scalar_object(&mut state);
+        let default_value = ScalarValue::Function(ScalarFunctionHandle::NativeNoopFunction);
+        write_scalar_named_object_property(
+            &mut state,
+            module,
+            "__esModule",
+            ScalarValue::Boolean(true),
+        );
+        write_scalar_named_object_property(&mut state, module, "default", default_value);
+
+        assert_eq!(
+            call_scalar_metro_import_default(
+                &state,
+                &[ScalarValue::Undefined, ScalarValue::Object(module)],
+            ),
+            default_value,
+        );
+    }
+
+    #[test]
+    fn scalar_executor_uses_module_object_for_non_es_module_default_import() {
+        let mut state = ScalarExecutorState::default();
+        let module = ScalarValue::Object(allocate_scalar_object(&mut state));
+
+        assert_eq!(
+            call_scalar_metro_import_default(&state, &[ScalarValue::Undefined, module]),
+            module,
+        );
+    }
+
+    #[test]
+    fn scalar_object_define_property_writes_descriptor_value() {
+        let bytes = fixture_bytecode();
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid Hermes bytecode");
+        let mut state = ScalarExecutorState::default();
+        let target = allocate_scalar_object(&mut state);
+        let descriptor = allocate_scalar_object(&mut state);
+        write_scalar_named_object_property(
+            &mut state,
+            descriptor,
+            "value",
+            ScalarValue::Boolean(true),
+        );
+
+        let result = call_scalar_object_define_property(
+            &bytecode,
+            &mut state,
+            bytecode.header().global_code_index,
+            HermesInstruction {
+                offset: 0,
+                opcode: CALL4_OPCODE,
+                width: 6,
+            },
+            &[
+                ScalarValue::Undefined,
+                ScalarValue::Object(target),
+                ScalarValue::String(ScalarStringHandle {
+                    string_id: 1,
+                    is_empty: false,
+                }),
+                ScalarValue::Object(descriptor),
+            ],
+        );
+
+        assert_eq!(result, Ok(ScalarValue::Object(target)));
+        assert_eq!(
+            read_scalar_object_property(&state, target, "cdef"),
+            ScalarValue::Boolean(true),
+        );
+    }
+
+    #[test]
+    fn scalar_object_define_property_without_value_preserves_existing_property() {
+        let bytes = fixture_bytecode();
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid Hermes bytecode");
+        let mut state = ScalarExecutorState::default();
+        let target = allocate_scalar_object(&mut state);
+        let descriptor = allocate_scalar_object(&mut state);
+        write_scalar_named_object_property(&mut state, target, "cdef", ScalarValue::Number(7.0));
+
+        let result = call_scalar_object_define_property(
+            &bytecode,
+            &mut state,
+            bytecode.header().global_code_index,
+            HermesInstruction {
+                offset: 0,
+                opcode: CALL4_OPCODE,
+                width: 6,
+            },
+            &[
+                ScalarValue::Undefined,
+                ScalarValue::Object(target),
+                ScalarValue::String(ScalarStringHandle {
+                    string_id: 1,
+                    is_empty: false,
+                }),
+                ScalarValue::Object(descriptor),
+            ],
+        );
+
+        assert_eq!(result, Ok(ScalarValue::Object(target)));
+        assert_eq!(
+            read_scalar_object_property(&state, target, "cdef"),
+            ScalarValue::Number(7.0),
+        );
+    }
+
+    #[test]
+    fn scalar_object_define_property_stores_get_descriptor() {
+        let bytes = fixture_bytecode();
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid Hermes bytecode");
+        let mut state = ScalarExecutorState::default();
+        let target = allocate_scalar_object(&mut state);
+        let descriptor = allocate_scalar_object(&mut state);
+        write_scalar_named_object_property(
+            &mut state,
+            descriptor,
+            "get",
+            ScalarValue::Function(ScalarFunctionHandle::NativePerformanceNow),
+        );
+
+        let result = call_scalar_object_define_property(
+            &bytecode,
+            &mut state,
+            bytecode.header().global_code_index,
+            HermesInstruction {
+                offset: 0,
+                opcode: CALL4_OPCODE,
+                width: 6,
+            },
+            &[
+                ScalarValue::Undefined,
+                ScalarValue::Object(target),
+                ScalarValue::String(ScalarStringHandle {
+                    string_id: 1,
+                    is_empty: false,
+                }),
+                ScalarValue::Object(descriptor),
+            ],
+        );
+
+        assert_eq!(result, Ok(ScalarValue::Object(target)));
+        assert_eq!(
+            read_scalar_own_object_getter_property(&state, target, "cdef"),
+            Some(ScalarValue::Function(
+                ScalarFunctionHandle::NativePerformanceNow
+            )),
+        );
+        assert_eq!(
+            read_scalar_own_object_property(&state, target, "cdef"),
+            None
+        );
+        assert_eq!(
+            read_scalar_property(
+                &bytecode,
+                &mut state,
+                &[ScalarValue::Object(target)],
+                bytecode.header().global_code_index,
+                HermesInstruction {
+                    offset: 0,
+                    opcode: GET_BY_ID_SHORT_OPCODE,
+                    width: 5,
+                },
+                0,
+                "cdef",
+            ),
+            Ok(ScalarValue::Number(0.0)),
+        );
+    }
+
+    #[test]
+    fn scalar_object_define_properties_writes_descriptor_values() {
+        let bytes = fixture_bytecode();
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid Hermes bytecode");
+        let mut state = ScalarExecutorState::default();
+        let target = allocate_scalar_object(&mut state);
+        let descriptors = allocate_scalar_object(&mut state);
+        let descriptor = allocate_scalar_object(&mut state);
+        write_scalar_named_object_property(
+            &mut state,
+            descriptor,
+            "value",
+            ScalarValue::Function(ScalarFunctionHandle::NativeNoopFunction),
+        );
+        write_scalar_named_object_property(
+            &mut state,
+            descriptors,
+            "markPoint",
+            ScalarValue::Object(descriptor),
+        );
+
+        let result = call_scalar_object_define_properties(
+            &bytecode,
+            &mut state,
+            bytecode.header().global_code_index,
+            HermesInstruction {
+                offset: 0,
+                opcode: CALL3_OPCODE,
+                width: 5,
+            },
+            &[
+                ScalarValue::Undefined,
+                ScalarValue::Object(target),
+                ScalarValue::Object(descriptors),
+            ],
+        );
+
+        assert_eq!(result, Ok(ScalarValue::Object(target)));
+        assert_eq!(
+            read_scalar_object_property(&state, target, "markPoint"),
+            ScalarValue::Function(ScalarFunctionHandle::NativeNoopFunction),
+        );
+    }
+
+    #[test]
+    fn scalar_object_assign_copies_own_properties() {
+        let mut state = ScalarExecutorState::default();
+        let target = allocate_scalar_object(&mut state);
+        let source = allocate_scalar_object(&mut state);
+        write_scalar_named_object_property(
+            &mut state,
+            source,
+            "markPoint",
+            ScalarValue::Number(7.0),
+        );
+
+        assert_eq!(
+            read_scalar_function_property(
+                &state,
+                ScalarFunctionHandle::NativeObjectConstructor,
+                "assign",
+            ),
+            ScalarValue::Function(ScalarFunctionHandle::NativeObjectAssign),
+        );
+        assert_eq!(
+            call_scalar_object_assign(
+                &mut state,
+                &[
+                    ScalarValue::Undefined,
+                    ScalarValue::Object(target),
+                    ScalarValue::Object(source),
+                ],
+            ),
+            ScalarValue::Object(target),
+        );
+        assert_eq!(
+            read_scalar_object_property(&state, target, "markPoint"),
+            ScalarValue::Number(7.0),
+        );
+    }
+
+    #[test]
+    fn scalar_object_create_writes_descriptor_values() {
+        let mut state = ScalarExecutorState::default();
+        let descriptors = allocate_scalar_object(&mut state);
+        let constructor_descriptor = allocate_scalar_object(&mut state);
+        let constructor = ScalarValue::Function(ScalarFunctionHandle::NativeNoopFunction);
+        write_scalar_named_object_property(
+            &mut state,
+            constructor_descriptor,
+            "value",
+            constructor,
+        );
+        write_scalar_named_object_property(
+            &mut state,
+            descriptors,
+            "constructor",
+            ScalarValue::Object(constructor_descriptor),
+        );
+
+        let result = call_scalar_object_create(
+            &mut state,
+            &[
+                ScalarValue::Undefined,
+                ScalarValue::Null,
+                ScalarValue::Object(descriptors),
+            ],
+        );
+
+        let ScalarValue::Object(object) = result else {
+            panic!("expected object");
+        };
+        assert_eq!(
+            read_scalar_object_property(&state, object, "constructor"),
+            constructor,
+        );
+    }
+
+    #[test]
+    fn scalar_object_create_links_prototype_for_property_lookup() {
+        let mut state = ScalarExecutorState::default();
+        let prototype = allocate_scalar_object(&mut state);
+        write_scalar_named_object_property(
+            &mut state,
+            prototype,
+            "currentTimestamp",
+            ScalarValue::Function(ScalarFunctionHandle::NativePerformanceNow),
+        );
+
+        let result = call_scalar_object_create(
+            &mut state,
+            &[
+                ScalarValue::Undefined,
+                ScalarValue::Object(prototype),
+                ScalarValue::Undefined,
+            ],
+        );
+
+        let ScalarValue::Object(object) = result else {
+            panic!("expected object");
+        };
+        assert_eq!(
+            read_scalar_object_property(&state, object, "currentTimestamp"),
+            ScalarValue::Function(ScalarFunctionHandle::NativePerformanceNow),
+        );
+        assert_eq!(
+            call_scalar_object_get_prototype_of(
+                &state,
+                &[ScalarValue::Undefined, ScalarValue::Object(object)],
+            ),
+            ScalarValue::Object(prototype),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_links_bytecode_constructor_prototype_to_this() {
+        let mut state = ScalarExecutorState::default();
+        let constructor = ScalarFunctionHandle::Bytecode {
+            function_id: 1,
+            environment: None,
+        };
+        let prototype = allocate_scalar_object(&mut state);
+        write_scalar_named_function_property(
+            &mut state,
+            constructor,
+            "prototype",
+            ScalarValue::Object(prototype),
+        );
+        write_scalar_named_object_property(
+            &mut state,
+            prototype,
+            "markPoint",
+            ScalarValue::Function(ScalarFunctionHandle::NativeNoopFunction),
+        );
+        let registers = [ScalarValue::Function(constructor)];
+
+        let value = create_scalar_this_for_new(
+            &mut state,
+            &registers,
+            1,
+            HermesInstruction {
+                offset: 0,
+                opcode: CREATE_THIS_FOR_NEW_OPCODE,
+                width: 4,
+            },
+            0,
+        );
+
+        let Ok(ScalarValue::Object(object)) = value else {
+            panic!("expected object");
+        };
+        assert_eq!(
+            read_scalar_object_property(&state, object, "markPoint"),
+            ScalarValue::Function(ScalarFunctionHandle::NativeNoopFunction),
+        );
+        assert_eq!(
+            state.pending_constructor_this_values,
+            vec![(constructor, ScalarValue::Object(object))],
+        );
+    }
+
+    #[test]
+    fn scalar_executor_stubs_rn_performance_logger_methods_after_lookup_miss() {
+        let mut state = ScalarExecutorState::default();
+        let object = allocate_scalar_object(&mut state);
+        write_scalar_named_object_property(
+            &mut state,
+            object,
+            "markPoint",
+            ScalarValue::Number(7.0),
+        );
+
+        assert_eq!(
+            read_scalar_object_property(&state, object, "markPoint"),
+            ScalarValue::Number(7.0),
+        );
+        assert_eq!(
+            read_scalar_object_property(&state, object, "currentTimestamp"),
+            ScalarValue::Function(ScalarFunctionHandle::NativePerformanceNow),
+        );
+        assert_eq!(
+            read_scalar_object_property(&state, object, "setReactNativeMicrotasksCallback"),
+            ScalarValue::Function(ScalarFunctionHandle::NativeNoopFunction),
+        );
+        assert_eq!(
+            read_scalar_object_property(&state, object, "addNetworkingHandler"),
+            ScalarValue::Function(ScalarFunctionHandle::NativeNoopFunction),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_stubs_rn_bytecode_static_methods_after_lookup_miss() {
+        let mut state = ScalarExecutorState::default();
+        let function = ScalarFunctionHandle::Bytecode {
+            function_id: 1,
+            environment: None,
+        };
+        write_scalar_named_function_property(
+            &mut state,
+            function,
+            "markPoint",
+            ScalarValue::Number(7.0),
+        );
+
+        assert_eq!(
+            read_scalar_function_property(&state, function, "markPoint"),
+            ScalarValue::Number(7.0),
+        );
+        assert_eq!(
+            read_scalar_function_property(&state, function, "addNetworkingHandler"),
+            ScalarValue::Function(ScalarFunctionHandle::NativeNoopFunction),
+        );
     }
 
     #[test]
@@ -10508,6 +16249,16 @@ mod tests {
             execute_global_scalar_function(&bytes),
             Ok(ScalarValue::Boolean(true)),
         );
+    }
+
+    #[test]
+    fn scalar_executor_self_equality_preserves_nan_semantics() {
+        assert!(!scalar_value_self_equal(ScalarValue::Number(f64::NAN)));
+        assert!(scalar_value_self_equal(ScalarValue::Number(1.0)));
+        assert!(scalar_value_self_equal(ScalarValue::Undefined));
+        assert!(scalar_value_self_equal(ScalarValue::Function(
+            ScalarFunctionHandle::NativeMathSin
+        )));
     }
 
     #[test]

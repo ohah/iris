@@ -149,9 +149,37 @@ run = "bun run bench:qjs:smoke"
 description = "Run host-side strict Hermes bytecode engine comparison for Hermes and Iris"
 run = "bun run bench:strict-hbc-engine-compare"
 
+[tasks.bench-strict-hbc-engine-compare-repeat]
+description = "Run repeated host-side strict Hermes bytecode engine comparisons and summarize stability"
+run = "bun run bench:strict-hbc-engine-compare:repeat"
+
 [tasks.bench-strict-hbc-engine-compare-smoke]
 description = "Run a short host-side strict Hermes bytecode engine comparison smoke test"
 run = "bun run bench:strict-hbc-engine-compare:smoke"
+
+[tasks.bench-strict-hbc-call-targets]
+description = "Compare strict Hermes bytecode Math call target variants"
+run = "bun run bench:strict-hbc-call-targets"
+
+[tasks.bench-strict-hbc-compare-artifacts]
+description = "Compare two existing strict HBC engine comparison artifacts"
+run = "bun run bench:strict-hbc-compare-artifacts"
+
+[tasks.bench-strict-hbc-compare-gate]
+description = "Fail when a strict HBC candidate artifact regresses beyond the configured threshold"
+run = "bun run bench:strict-hbc-compare-gate"
+
+[tasks.bench-strict-hbc-math-lookup]
+description = "Compare strict Hermes bytecode Math lookup-only variants"
+run = "bun run bench:strict-hbc-math-lookup"
+
+[tasks.bench-strict-hbc-profile]
+description = "Profile host-side strict Hermes bytecode scalar executor hot paths"
+run = "bun run bench:strict-hbc-profile"
+
+[tasks.bench-strict-hbc-source-shape]
+description = "Compare strict Hermes bytecode source-shape variants for global var and lexical bindings"
+run = "bun run bench:strict-hbc-source-shape"
 
 [tasks.bench-android-release]
 description = "Build, install, run, and extract the Android physical release Hermes benchmark"

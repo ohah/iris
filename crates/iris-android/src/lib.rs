@@ -40,6 +40,7 @@ mod ffi {
         fn parse_hbc_metadata(bytes: &[u8]) -> Result<HbcMetadata>;
         fn describe_hbc_execution_gap(bytes: &[u8]) -> Result<String>;
         fn describe_hbc_scalar_execution(bytes: &[u8]) -> Result<String>;
+        fn describe_hbc_strict_scalar_execution(bytes: &[u8]) -> Result<String>;
         fn run_quickjs_benchmark_json(
             artifact_path: &str,
             commit: &str,
@@ -100,6 +101,10 @@ fn describe_hbc_execution_gap(bytes: &[u8]) -> Result<String, String> {
 
 fn describe_hbc_scalar_execution(bytes: &[u8]) -> Result<String, String> {
     iris_hbc::describe_hbc_scalar_execution(bytes).map_err(|error| error.to_string())
+}
+
+fn describe_hbc_strict_scalar_execution(bytes: &[u8]) -> Result<String, String> {
+    iris_hbc::describe_hbc_strict_scalar_execution(bytes).map_err(|error| error.to_string())
 }
 
 fn run_quickjs_benchmark_json(

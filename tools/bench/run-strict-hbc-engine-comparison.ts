@@ -21,6 +21,9 @@ type EngineRun = {
   declaredGlobals?: number;
 };
 
+type EngineName = EngineRun["engine"];
+type EngineOrder = "alternate" | "hermes-first" | "iris-first";
+
 type Stats = {
   max: number;
   mean: number;
@@ -149,6 +152,8 @@ function defaultCasePaths() {
   const caseDir = resolve(root, defaultCaseDir);
   return readdirSync(caseDir)
     .filter((entry) => entry.endsWith(".js"))
+    .filter((entry) => !entry.endsWith("-lexical.js"))
+    .filter((entry) => !entry.endsWith("-diagnostic.js"))
     .sort()
     .map((entry) => resolve(caseDir, entry));
 }
@@ -251,9 +256,58 @@ function compareCase(
   };
 }
 
+function readEngineOrder(rounds: number): EngineOrder {
+  const rawOrder = readArg("--engine-order") ?? (rounds > 1 ? "alternate" : "hermes-first");
+  if (rawOrder !== "alternate" && rawOrder !== "hermes-first" && rawOrder !== "iris-first") {
+    throw new Error("--engine-order must be one of alternate, hermes-first, or iris-first.");
+  }
+  return rawOrder;
+}
+
+function engineOrderForRound(engineOrder: EngineOrder, roundIndex: number): EngineName[] {
+  if (engineOrder === "hermes-first") {
+    return ["hermes", "iris"];
+  }
+  if (engineOrder === "iris-first") {
+    return ["iris", "hermes"];
+  }
+  return roundIndex % 2 === 0 ? ["hermes", "iris"] : ["iris", "hermes"];
+}
+
+function mergeEngineRuns(engine: EngineName, runs: EngineRun[]): EngineRun {
+  if (runs.length === 0) {
+    throw new Error(`missing ${engine} run samples.`);
+  }
+  const [firstRun] = runs;
+  for (const run of runs.slice(1)) {
+    if (!sameValue(firstRun.value, run.value)) {
+      throw new Error(
+        `${engine} repeated checksum mismatch: first=${JSON.stringify(firstRun.value)} next=${JSON.stringify(run.value)}`,
+      );
+    }
+    if (firstRun.casePath !== run.casePath) {
+      throw new Error(
+        `${engine} repeated case mismatch: first=${firstRun.casePath} next=${run.casePath}`,
+      );
+    }
+  }
+
+  return {
+    engine,
+    casePath: firstRun.casePath,
+    value: firstRun.value,
+    warmupIterations: runs.reduce((sum, run) => sum + run.warmupIterations, 0),
+    measuredIterations: runs.reduce((sum, run) => sum + run.measuredIterations, 0),
+    samplesMs: runs.flatMap((run) => run.samplesMs),
+    declaredGlobals: firstRun.declaredGlobals,
+  };
+}
+
 function main() {
   const warmupIterations = readNumberArg("--warmup", 3, true);
   const measuredIterations = readNumberArg("--iterations", 20);
+  const rounds = readNumberArg("--rounds", 1);
+  const engineOrder = readEngineOrder(rounds);
   const outputPath = resolve(root, readArg("--output") ?? defaultOutputPath);
   const hbcDir = resolve(root, readArg("--hbc-dir") ?? defaultHbcDir);
   const hermesc = resolve(root, readArg("--hermesc") ?? defaultHermesc);
@@ -282,18 +336,34 @@ function main() {
   ensureFreshHermesRunner(hermesRunnerSource, hermesRunner, hermesFrameworkDir);
   run(cargo, ["build", "--release", "-p", "iris-hbc", "--bin", "hbc-bench"]);
 
-  const cases = casePaths.map((sourcePath) => {
-    const hbcPath = compileHbc(hermesc, sourcePath, hbcDir);
-    const hermesRun = captureJson<EngineRun>(hermesRunner, [
-      `--warmup=${warmupIterations}`,
-      `--iterations=${measuredIterations}`,
-      hbcPath,
-    ]);
-    const irisRun = captureJson<EngineRun>(resolve(root, "target/release/hbc-bench"), [
-      `--warmup=${warmupIterations}`,
-      `--iterations=${measuredIterations}`,
-      hbcPath,
-    ]);
+  const compiledCases = casePaths.map((sourcePath) => ({
+    sourcePath,
+    hbcPath: compileHbc(hermesc, sourcePath, hbcDir),
+    runs: {
+      hermes: [],
+      iris: [],
+    } satisfies Record<EngineName, EngineRun[]>,
+  }));
+  for (let roundIndex = 0; roundIndex < rounds; roundIndex += 1) {
+    const roundCases = roundIndex % 2 === 0 ? compiledCases : [...compiledCases].reverse();
+    for (const compiledCase of roundCases) {
+      for (const engine of engineOrderForRound(engineOrder, roundIndex)) {
+        const runner =
+          engine === "hermes" ? hermesRunner : resolve(root, "target/release/hbc-bench");
+        compiledCase.runs[engine].push(
+          captureJson<EngineRun>(runner, [
+            `--warmup=${warmupIterations}`,
+            `--iterations=${measuredIterations}`,
+            compiledCase.hbcPath,
+          ]),
+        );
+      }
+    }
+  }
+
+  const cases = compiledCases.map(({ sourcePath, hbcPath, runs }) => {
+    const hermesRun = mergeEngineRuns("hermes", runs.hermes);
+    const irisRun = mergeEngineRuns("iris", runs.iris);
     const comparison = compareCase(sourcePath, hbcPath, hermesRun, irisRun);
 
     console.log(
@@ -315,9 +385,14 @@ function main() {
       iris: "Iris parses HBC once, then executes the global function with a fresh scalar executor state for each sample.",
       scope:
         "Host-side strict HBC microbenchmark, not a full React Native runtime replacement benchmark.",
+      order:
+        "When rounds is greater than one, engine execution order can be alternated and case order is reversed on odd rounds to reduce first-run and thermal bias.",
     },
     warmupIterations,
     measuredIterations,
+    rounds,
+    engineOrder,
+    totalMeasuredIterations: measuredIterations * rounds,
     engines: {
       hermes: {
         frameworkDir: relativePath(hermesFrameworkDir),

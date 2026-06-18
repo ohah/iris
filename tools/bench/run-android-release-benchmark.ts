@@ -265,6 +265,7 @@ function extractBenchmarkReport(inputLogPath: string, outputReportPath: string) 
             "iris-hbc-metadata-parse",
             "iris-hbc-static-coverage-scan",
             "iris-hbc-scalar-execution-frontier",
+            "iris-hbc-strict-scalar-execution",
           ]
         : [...strictRnBenchmarkCaseIds];
   const extractionArgs = [

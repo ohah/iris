@@ -554,7 +554,7 @@ void IrisRuntime::abortBytecodeExecutionUnavailable(
   __android_log_assert(
       "IrisBytecodeExecutionUnavailable",
       "IrisEngine",
-      "Iris %s prepared Hermes bytecode v%u (%u bytes, %u functions, %u strings, functionHeaders=%u+%u, stringStorage=%u+%u, cjsModules=%u, cjsTable=%u+%u, functionBodies=%u, globalFunction=%u+%u name=%u params=%u frame=%u instructions=%u, source=%s). %s. Bytecode execution is not implemented yet. This is an Iris-owned Runtime scaffold, not a Hermes/JSC fallback.",
+      "Iris %s prepared Hermes bytecode v%u (%u bytes, %u functions, %u strings, functionHeaders=%u+%u, stringStorage=%u+%u, cjsModules=%u, cjsTable=%u+%u, functionBodies=%u, globalFunction=%u+%u name=%u params=%u frame=%u instructions=%u, source=%s). %s. RN JSI runtime bytecode execution is not implemented yet. This is an Iris-owned Runtime scaffold, not a Hermes/JSC fallback.",
       operation,
       metadata.version,
       metadata.fileLength,
@@ -609,11 +609,14 @@ void IrisRuntime::emitBootstrapBenchmarkArtifact(
   std::vector<double> metadataSamples;
   std::vector<double> coverageSamples;
   std::vector<double> executionSamples;
+  std::vector<double> strictExecutionSamples;
   std::string coverageDetail = "not scanned";
   std::string executionDetail = "not executed";
+  std::string strictExecutionDetail = "not executed";
   metadataSamples.reserve(metadataIterations);
   coverageSamples.reserve(coverageIterations);
   executionSamples.reserve(executionIterations);
+  strictExecutionSamples.reserve(executionIterations);
 
   try {
     for (size_t index = 0; index < warmupIterations; ++index) {
@@ -643,6 +646,16 @@ void IrisRuntime::emitBootstrapBenchmarkArtifact(
       executionDetail =
           std::string(iris::android::describe_hbc_scalar_execution(hbcBytes));
       executionSamples.push_back(elapsedMilliseconds(start));
+    }
+
+    for (size_t index = 0; index < executionWarmupIterations; ++index) {
+      (void)iris::android::describe_hbc_strict_scalar_execution(hbcBytes);
+    }
+    for (size_t index = 0; index < executionIterations; ++index) {
+      const auto start = std::chrono::steady_clock::now();
+      strictExecutionDetail = std::string(
+          iris::android::describe_hbc_strict_scalar_execution(hbcBytes));
+      strictExecutionSamples.push_back(elapsedMilliseconds(start));
     }
   } catch (const rust::Error& error) {
     abortBundleContractViolation(
@@ -679,6 +692,14 @@ void IrisRuntime::emitBootstrapBenchmarkArtifact(
       executionDetail,
       static_cast<uint64_t>(metadata.globalInstructionCount),
       executionSamples,
+      executionWarmupIterations);
+  const auto strictExecutionCase = benchmarkCaseJson(
+      "iris-hbc-strict-scalar-execution",
+      "Iris HBC strict scalar execution",
+      "Execute the current Rust scalar subset with strict host semantics until completion or the first semantic frontier.",
+      strictExecutionDetail,
+      static_cast<uint64_t>(metadata.globalInstructionCount),
+      strictExecutionSamples,
       executionWarmupIterations);
   const std::vector<NativeMeasuredCase> nativeMirrorCases{
       measureNativeMirrorCase(
@@ -744,6 +765,8 @@ void IrisRuntime::emitBootstrapBenchmarkArtifact(
       std::accumulate(coverageSamples.begin(), coverageSamples.end(), 0.0) +
       std::accumulate(executionSamples.begin(), executionSamples.end(), 0.0) +
       std::accumulate(
+          strictExecutionSamples.begin(), strictExecutionSamples.end(), 0.0) +
+      std::accumulate(
           nativeMirrorCases.begin(),
           nativeMirrorCases.end(),
           0.0,
@@ -752,7 +775,7 @@ void IrisRuntime::emitBootstrapBenchmarkArtifact(
           });
   const auto totalMeasuredIterations =
       metadataSamples.size() + coverageSamples.size() +
-      executionSamples.size() +
+      executionSamples.size() + strictExecutionSamples.size() +
       std::accumulate(
           nativeMirrorCases.begin(),
           nativeMirrorCases.end(),
@@ -773,12 +796,12 @@ void IrisRuntime::emitBootstrapBenchmarkArtifact(
       << "\"reactNative\":{\"version\":\"0.85.0\"},"
       << "\"runtime\":{\"fabric\":true,\"hermes\":false,\"hermesVersion\":\"none\",\"jsEngine\":\"iris-skeleton\",\"newArchitecture\":true,\"turboModuleProxy\":true}},"
       << "\"cases\":[" << metadataCase << "," << coverageCase << ","
-      << executionCase;
+      << executionCase << "," << strictExecutionCase;
   for (const auto& nativeMirrorCase : nativeMirrorCases) {
     artifact << "," << nativeMirrorCase.json;
   }
   artifact << "],"
-           << "\"summary\":{\"caseCount\":" << (3 + nativeMirrorCases.size())
+           << "\"summary\":{\"caseCount\":" << (4 + nativeMirrorCases.size())
            << ",\"measuredIterations\":" << totalMeasuredIterations
            << ",\"totalElapsedMs\":" << formatDouble(totalElapsedMs) << "}}";
 
@@ -786,7 +809,7 @@ void IrisRuntime::emitBootstrapBenchmarkArtifact(
   __android_log_print(
       ANDROID_LOG_WARN,
       "IrisEngine",
-      "Iris emitted bootstrap benchmark for Hermes bytecode v%u from %s. Full bytecode execution is still unavailable, so this is not an RN JS workload benchmark.",
+      "Iris emitted bootstrap benchmark for Hermes bytecode v%u from %s. This scalar bootstrap is not an RN JS workload, Fabric, or TurboModule completion benchmark.",
       metadata.version,
       sourceURL.c_str());
 }

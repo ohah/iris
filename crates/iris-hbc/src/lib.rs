@@ -5725,6 +5725,26 @@ fn execute_scalar_instruction<'a>(
             }
             let left = read_scalar_register(registers, function_id, instruction, left_register)?;
             let right = read_scalar_register(registers, function_id, instruction, right_register)?;
+            if let (ScalarValue::Number(left), ScalarValue::Number(right)) = (left, right) {
+                let equal = left == right;
+                let should_jump = match instruction.opcode {
+                    211 | 212 => equal,
+                    213 | 214 => !equal,
+                    207 | 208 => equal,
+                    209 | 210 => !equal,
+                    _ => unreachable!("matched equality jump opcodes"),
+                };
+
+                if should_jump {
+                    return Ok(ScalarInstructionResult::Jump(read_scalar_jump_target(
+                        instruction,
+                        instruction_bytes,
+                        1,
+                        delta_width,
+                    )));
+                }
+                return Ok(ScalarInstructionResult::Continue);
+            }
             let should_jump = match instruction.opcode {
                 207 | 208 => scalar_abstract_equal(left, right),
                 209 | 210 => !scalar_abstract_equal(left, right),
@@ -16484,6 +16504,64 @@ mod tests {
                 2,
             ],
         );
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Boolean(true)),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_does_not_jump_when_strict_equal_numbers_are_nan() {
+        let mut bytes = fixture_bytecode();
+        let mut body = vec![LOAD_CONST_DOUBLE_OPCODE, 0];
+        body.extend_from_slice(&f64::NAN.to_le_bytes());
+        body.extend_from_slice(&[LOAD_CONST_DOUBLE_OPCODE, 1]);
+        body.extend_from_slice(&f64::NAN.to_le_bytes());
+        body.extend_from_slice(&[
+            J_STRICT_EQUAL_OPCODE,
+            8,
+            0,
+            1,
+            LOAD_CONST_FALSE_OPCODE,
+            2,
+            RET_OPCODE,
+            2,
+            LOAD_CONST_TRUE_OPCODE,
+            2,
+            RET_OPCODE,
+            2,
+        ]);
+        replace_global_body(&mut bytes, &body);
+
+        assert_eq!(
+            execute_global_scalar_function(&bytes),
+            Ok(ScalarValue::Boolean(false)),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_jumps_when_strict_not_equal_numbers_are_nan() {
+        let mut bytes = fixture_bytecode();
+        let mut body = vec![LOAD_CONST_DOUBLE_OPCODE, 0];
+        body.extend_from_slice(&f64::NAN.to_le_bytes());
+        body.extend_from_slice(&[LOAD_CONST_DOUBLE_OPCODE, 1]);
+        body.extend_from_slice(&f64::NAN.to_le_bytes());
+        body.extend_from_slice(&[
+            J_STRICT_NOT_EQUAL_OPCODE,
+            8,
+            0,
+            1,
+            LOAD_CONST_FALSE_OPCODE,
+            2,
+            RET_OPCODE,
+            2,
+            LOAD_CONST_TRUE_OPCODE,
+            2,
+            RET_OPCODE,
+            2,
+        ]);
+        replace_global_body(&mut bytes, &body);
 
         assert_eq!(
             execute_global_scalar_function(&bytes),

@@ -3002,6 +3002,7 @@ struct ScalarExecutorState<'a> {
     environment_parents: Vec<(ScalarEnvironmentHandle, Option<ScalarEnvironmentHandle>)>,
     environment_slots: Vec<(ScalarEnvironmentHandle, u32, ScalarValue)>,
     function_properties: Vec<(ScalarFunctionHandle, &'a str, ScalarValue)>,
+    global_property_operand_cache: [Option<(u32, usize)>; SCALAR_STRING_OPERAND_CACHE_SLOTS],
     global_properties: Vec<(&'a str, ScalarValue)>,
     json_property_name_cache: HashMap<String, Option<&'a str>>,
     metro_module_exports: Vec<(u32, ScalarValue)>,
@@ -5029,7 +5030,7 @@ fn execute_scalar_instruction<'a>(
                 registers.get(base_register as usize),
                 Some(ScalarValue::Object(ScalarObjectHandle::Global))
             ) {
-                let value = read_scalar_global_property(state, property_name);
+                let value = read_cached_scalar_global_property(state, string_id, property_name);
                 write_scalar_register(registers, function_id, instruction, destination, value)?;
                 return Ok(ScalarInstructionResult::Continue);
             }
@@ -5063,7 +5064,7 @@ fn execute_scalar_instruction<'a>(
                     Some(ScalarValue::Object(ScalarObjectHandle::Global))
                 )
             {
-                let value = read_scalar_global_property(state, property_name);
+                let value = read_cached_scalar_global_property(state, string_id, property_name);
                 write_scalar_register(registers, function_id, instruction, destination, value)?;
                 return Ok(ScalarInstructionResult::Continue);
             }
@@ -5095,17 +5096,7 @@ fn execute_scalar_instruction<'a>(
                 registers.get(base_register as usize),
                 Some(ScalarValue::Object(ScalarObjectHandle::Global))
             ) {
-                let value = map_scalar_global_write(property_name, value);
-                if let Some((_, stored_value)) = state
-                    .global_properties
-                    .iter_mut()
-                    .rev()
-                    .find(|(name, _)| *name == property_name)
-                {
-                    *stored_value = value;
-                } else {
-                    state.global_properties.push((property_name, value));
-                }
+                write_cached_scalar_global_property(state, string_id, property_name, value);
                 return Ok(ScalarInstructionResult::Continue);
             }
             write_scalar_property(
@@ -6993,17 +6984,7 @@ fn write_scalar_defined_property<'a>(
                 ScalarDescriptorProperty::Value(value) => value,
                 ScalarDescriptorProperty::Getter(getter) => getter,
             };
-            let value = map_scalar_global_write(property_name, value);
-            if let Some((_, stored_value)) = state
-                .global_properties
-                .iter_mut()
-                .rev()
-                .find(|(name, _)| *name == property_name)
-            {
-                *stored_value = value;
-            } else {
-                state.global_properties.push((property_name, value));
-            }
+            write_scalar_global_property(state, property_name, value);
         }
         ScalarValue::Object(handle) => match definition {
             ScalarDescriptorProperty::Value(value) => {
@@ -7122,10 +7103,9 @@ fn call_scalar_object_has_own_property(
     };
 
     match object {
-        ScalarValue::Object(ScalarObjectHandle::Global) => state
-            .global_properties
-            .iter()
-            .any(|(name, _)| *name == property_name),
+        ScalarValue::Object(ScalarObjectHandle::Global) => {
+            scalar_global_property_index(state, property_name).is_some()
+        }
         ScalarValue::Object(handle) => state
             .object_properties
             .iter()
@@ -8995,17 +8975,7 @@ fn write_scalar_property<'a>(
     let base = read_scalar_register(registers, function_id, instruction, base_register)?;
     match base {
         ScalarValue::Object(ScalarObjectHandle::Global) => {
-            let value = map_scalar_global_write(property_name, value);
-            if let Some((_, stored_value)) = state
-                .global_properties
-                .iter_mut()
-                .rev()
-                .find(|(name, _)| *name == property_name)
-            {
-                *stored_value = value;
-            } else {
-                state.global_properties.push((property_name, value));
-            }
+            write_scalar_global_property(state, property_name, value);
             Ok(())
         }
         ScalarValue::Object(
@@ -9131,6 +9101,7 @@ fn delete_scalar_property(
             state
                 .global_properties
                 .retain(|(name, _)| *name != property_name);
+            clear_scalar_global_property_operand_cache(state);
             Ok(())
         }
         ScalarValue::Object(handle) => {
@@ -9239,12 +9210,7 @@ fn scalar_property_exists(
 }
 
 fn scalar_global_property_exists(state: &ScalarExecutorState<'_>, property_name: &str) -> bool {
-    if state
-        .global_properties
-        .iter()
-        .rev()
-        .any(|(name, _)| *name == property_name)
-    {
+    if scalar_global_property_index(state, property_name).is_some() {
         return true;
     }
 
@@ -9277,7 +9243,7 @@ fn scalar_global_property_exists(state: &ScalarExecutorState<'_>, property_name:
     ) || state
         .declared_globals
         .iter()
-        .any(|name| *name == property_name)
+        .any(|name| scalar_property_name_matches(name, property_name))
 }
 
 fn scalar_object_property_exists(
@@ -9545,17 +9511,90 @@ fn write_scalar_named_function_property<'a>(
     }
 }
 
+fn scalar_property_name_matches(stored: &str, requested: &str) -> bool {
+    stored.len() == requested.len()
+        && (stored.as_ptr() == requested.as_ptr() || stored == requested)
+}
+
+fn scalar_string_operand_cache_slot(string_id: u32) -> usize {
+    usize::try_from(string_id).expect("Hermes string id fits in usize on supported targets")
+        & (SCALAR_STRING_OPERAND_CACHE_SLOTS - 1)
+}
+
+fn clear_scalar_global_property_operand_cache(state: &mut ScalarExecutorState<'_>) {
+    state.global_property_operand_cache = [None; SCALAR_STRING_OPERAND_CACHE_SLOTS];
+}
+
+fn scalar_global_property_index(
+    state: &ScalarExecutorState<'_>,
+    property_name: &str,
+) -> Option<usize> {
+    state
+        .global_properties
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, (name, _))| scalar_property_name_matches(name, property_name))
+        .map(|(index, _)| index)
+}
+
+fn read_cached_scalar_global_property<'a>(
+    state: &mut ScalarExecutorState<'a>,
+    string_id: u32,
+    property_name: &'a str,
+) -> ScalarValue {
+    let slot = scalar_string_operand_cache_slot(string_id);
+    if let Some((cached_id, index)) = state.global_property_operand_cache[slot] {
+        if cached_id == string_id {
+            if let Some((stored_name, value)) = state.global_properties.get(index) {
+                if scalar_property_name_matches(stored_name, property_name) {
+                    return *value;
+                }
+            }
+        }
+    }
+
+    if let Some(index) = scalar_global_property_index(state, property_name) {
+        state.global_property_operand_cache[slot] = Some((string_id, index));
+        return state.global_properties[index].1;
+    }
+
+    read_scalar_builtin_global_property(state, property_name)
+}
+
+fn write_cached_scalar_global_property<'a>(
+    state: &mut ScalarExecutorState<'a>,
+    string_id: u32,
+    property_name: &'a str,
+    value: ScalarValue,
+) {
+    let index = write_scalar_global_property(state, property_name, value);
+    state.global_property_operand_cache[scalar_string_operand_cache_slot(string_id)] =
+        Some((string_id, index));
+}
+
+fn write_scalar_global_property<'a>(
+    state: &mut ScalarExecutorState<'a>,
+    property_name: &'a str,
+    value: ScalarValue,
+) -> usize {
+    let value = map_scalar_global_write(property_name, value);
+    if let Some(index) = scalar_global_property_index(state, property_name) {
+        state.global_properties[index].1 = value;
+        return index;
+    }
+
+    let index = state.global_properties.len();
+    state.global_properties.push((property_name, value));
+    index
+}
+
 fn read_scalar_global_property(
     state: &ScalarExecutorState<'_>,
     property_name: &str,
 ) -> ScalarValue {
-    if let Some((_, value)) = state
-        .global_properties
-        .iter()
-        .rev()
-        .find(|(name, _)| *name == property_name)
-    {
-        return *value;
+    if let Some(index) = scalar_global_property_index(state, property_name) {
+        return state.global_properties[index].1;
     }
 
     read_scalar_builtin_global_property(state, property_name)
@@ -9591,7 +9630,13 @@ fn read_scalar_builtin_global_property(
         "WeakSet" => ScalarValue::Function(ScalarFunctionHandle::NativeWeakSetConstructor),
         "__turboModuleProxy" => ScalarValue::Function(ScalarFunctionHandle::NativeTurboModuleProxy),
         "nativePerformanceNow" => ScalarValue::Function(ScalarFunctionHandle::NativePerformanceNow),
-        name if state.declared_globals.contains(&name) => ScalarValue::Undefined,
+        name if state
+            .declared_globals
+            .iter()
+            .any(|declared| scalar_property_name_matches(declared, name)) =>
+        {
+            ScalarValue::Undefined
+        }
         _ => ScalarValue::Undefined,
     }
 }

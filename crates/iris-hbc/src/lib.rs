@@ -3315,6 +3315,21 @@ fn execute_scalar_function_with_state_and_environment<'a>(
                             instruction_index = next_instruction_index;
                             continue;
                         }
+                        if let Some(next_instruction_index) =
+                            try_execute_scalar_uint8_global_index_mod_put_candidate(
+                                bytecode,
+                                state,
+                                &mut registers,
+                                function_id,
+                                &instructions,
+                                &instruction_bytes,
+                                &mut string_operand_cache,
+                                instruction_index,
+                            )?
+                        {
+                            instruction_index = next_instruction_index;
+                            continue;
+                        }
                     }
                     ScalarFastPathCandidate::None => {}
                 }
@@ -3570,6 +3585,98 @@ fn scalar_fast_path_candidates<'a>(
             let candidates = candidates
                 .get_or_insert_with(|| vec![ScalarFastPathCandidate::None; instructions.len()]);
             candidates[instruction_index] = ScalarFastPathCandidate::GlobalNumberAddModPut;
+        }
+    }
+
+    if instructions
+        .iter()
+        .any(|instruction| matches!(instruction.opcode, 96 | 97))
+    {
+        for instruction_index in 0..instructions.len().saturating_sub(4) {
+            let source_get_instruction = instructions[instruction_index];
+            let key_get_instruction = instructions[instruction_index + 1];
+            let value_get_instruction = instructions[instruction_index + 2];
+            let mod_instruction = instructions[instruction_index + 3];
+            let put_instruction = instructions[instruction_index + 4];
+            if source_get_instruction.opcode != 68
+                || key_get_instruction.opcode != 68
+                || value_get_instruction.opcode != 68
+                || mod_instruction.opcode != 37
+                || !matches!(put_instruction.opcode, 96 | 97)
+            {
+                continue;
+            }
+
+            let source_get_bytes = instruction_bytes[instruction_index];
+            let key_get_bytes = instruction_bytes[instruction_index + 1];
+            let value_get_bytes = instruction_bytes[instruction_index + 2];
+            let mod_bytes = instruction_bytes[instruction_index + 3];
+            let put_bytes = instruction_bytes[instruction_index + 4];
+            let global_base_register = read_unsigned_operand(source_get_bytes, 2, 1);
+            if read_unsigned_operand(key_get_bytes, 2, 1) != global_base_register
+                || read_unsigned_operand(value_get_bytes, 2, 1) != global_base_register
+            {
+                continue;
+            }
+
+            let source_object_register = read_unsigned_operand(source_get_bytes, 1, 1);
+            let key_register = read_unsigned_operand(key_get_bytes, 1, 1);
+            let value_source_register = read_unsigned_operand(value_get_bytes, 1, 1);
+            let value_register = read_unsigned_operand(mod_bytes, 1, 1);
+            let divisor_register = read_unsigned_operand(mod_bytes, 3, 1);
+            if read_unsigned_operand(mod_bytes, 2, 1) != value_source_register
+                || read_unsigned_operand(put_bytes, 1, 1) != source_object_register
+                || read_unsigned_operand(put_bytes, 2, 1) != key_register
+                || read_unsigned_operand(put_bytes, 3, 1) != value_register
+            {
+                continue;
+            }
+
+            if source_object_register == global_base_register
+                || key_register == global_base_register
+                || value_source_register == global_base_register
+                || value_register == global_base_register
+                || source_object_register == key_register
+                || source_object_register == value_source_register
+                || source_object_register == value_register
+                || key_register == value_source_register
+                || key_register == value_register
+                || value_source_register == value_register
+                || divisor_register == source_object_register
+                || divisor_register == key_register
+                || divisor_register == value_source_register
+                || divisor_register == value_register
+            {
+                continue;
+            }
+
+            let key_string_id = read_unsigned_operand(key_get_bytes, 4, 1);
+            let value_string_id = read_unsigned_operand(value_get_bytes, 4, 1);
+            let Ok(key_property_name) = read_scalar_string_operand(
+                bytecode,
+                function_id,
+                key_get_instruction,
+                key_string_id,
+            ) else {
+                continue;
+            };
+            let Ok(value_property_name) = read_scalar_string_operand(
+                bytecode,
+                function_id,
+                value_get_instruction,
+                value_string_id,
+            ) else {
+                continue;
+            };
+            if !scalar_property_name_matches(key_property_name, value_property_name) {
+                continue;
+            }
+
+            let candidates = candidates
+                .get_or_insert_with(|| vec![ScalarFastPathCandidate::None; instructions.len()]);
+            if candidates[instruction_index] == ScalarFastPathCandidate::None {
+                candidates[instruction_index] = ScalarFastPathCandidate::ObjectNumberAddModPut;
+            }
         }
     }
 
@@ -4622,6 +4729,170 @@ fn try_execute_scalar_object_number_add_mod_put_candidate<'a>(
         put_property_name,
         ScalarValue::Number(result),
     );
+    Ok(Some(put_instruction_index + 1))
+}
+
+fn try_execute_scalar_uint8_global_index_mod_put_candidate<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
+    registers: &mut [ScalarValue],
+    function_id: u32,
+    instructions: &[HermesInstruction],
+    instruction_bytes: &[&[u8]],
+    string_operand_cache: &mut ScalarStringOperandCache<'a>,
+    instruction_index: usize,
+) -> Result<Option<usize>, ScalarExecutionError> {
+    let Some(put_instruction_index) = instruction_index.checked_add(4) else {
+        return Ok(None);
+    };
+    let Some(source_get_instruction) = instructions.get(instruction_index).copied() else {
+        return Ok(None);
+    };
+    let Some(key_get_instruction) = instructions.get(instruction_index + 1).copied() else {
+        return Ok(None);
+    };
+    let Some(value_get_instruction) = instructions.get(instruction_index + 2).copied() else {
+        return Ok(None);
+    };
+    let Some(mod_instruction) = instructions.get(instruction_index + 3).copied() else {
+        return Ok(None);
+    };
+    let Some(put_instruction) = instructions.get(put_instruction_index).copied() else {
+        return Ok(None);
+    };
+    if source_get_instruction.opcode != 68
+        || key_get_instruction.opcode != 68
+        || value_get_instruction.opcode != 68
+        || mod_instruction.opcode != 37
+        || !matches!(put_instruction.opcode, 96 | 97)
+    {
+        return Ok(None);
+    }
+
+    let source_get_bytes = instruction_bytes[instruction_index];
+    let key_get_bytes = instruction_bytes[instruction_index + 1];
+    let value_get_bytes = instruction_bytes[instruction_index + 2];
+    let mod_bytes = instruction_bytes[instruction_index + 3];
+    let put_bytes = instruction_bytes[put_instruction_index];
+    let global_base_register = read_unsigned_operand(source_get_bytes, 2, 1);
+    if read_unsigned_operand(key_get_bytes, 2, 1) != global_base_register
+        || read_unsigned_operand(value_get_bytes, 2, 1) != global_base_register
+        || !matches!(
+            registers.get(global_base_register as usize),
+            Some(ScalarValue::Object(ScalarObjectHandle::Global))
+        )
+    {
+        return Ok(None);
+    }
+
+    let source_object_register = read_unsigned_operand(source_get_bytes, 1, 1);
+    let key_register = read_unsigned_operand(key_get_bytes, 1, 1);
+    let value_source_register = read_unsigned_operand(value_get_bytes, 1, 1);
+    let value_register = read_unsigned_operand(mod_bytes, 1, 1);
+    let divisor_register = read_unsigned_operand(mod_bytes, 3, 1);
+    if read_unsigned_operand(mod_bytes, 2, 1) != value_source_register
+        || read_unsigned_operand(put_bytes, 1, 1) != source_object_register
+        || read_unsigned_operand(put_bytes, 2, 1) != key_register
+        || read_unsigned_operand(put_bytes, 3, 1) != value_register
+    {
+        return Ok(None);
+    }
+
+    if source_object_register == global_base_register
+        || key_register == global_base_register
+        || value_source_register == global_base_register
+        || value_register == global_base_register
+        || source_object_register == key_register
+        || source_object_register == value_source_register
+        || source_object_register == value_register
+        || key_register == value_source_register
+        || key_register == value_register
+        || value_source_register == value_register
+        || divisor_register == source_object_register
+        || divisor_register == key_register
+        || divisor_register == value_source_register
+        || divisor_register == value_register
+    {
+        return Ok(None);
+    }
+
+    for register in [
+        source_object_register,
+        key_register,
+        value_source_register,
+        value_register,
+        divisor_register,
+    ] {
+        if registers.get(register as usize).is_none() {
+            return Ok(None);
+        }
+    }
+
+    let source_string_id = read_unsigned_operand(source_get_bytes, 4, 1);
+    let key_string_id = read_unsigned_operand(key_get_bytes, 4, 1);
+    let value_string_id = read_unsigned_operand(value_get_bytes, 4, 1);
+    let source_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        source_get_instruction,
+        source_string_id,
+    )?;
+    let key_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        key_get_instruction,
+        key_string_id,
+    )?;
+    let value_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        value_get_instruction,
+        value_string_id,
+    )?;
+    if !scalar_property_name_matches(key_property_name, value_property_name) {
+        return Ok(None);
+    }
+
+    let ScalarValue::Object(array @ ScalarObjectHandle::Uint8Array(object_id)) =
+        read_cached_scalar_global_property(state, source_string_id, source_property_name)
+    else {
+        return Ok(None);
+    };
+    let key_value = read_cached_scalar_global_property(state, key_string_id, key_property_name);
+    let value_source =
+        read_cached_scalar_global_property(state, value_string_id, value_property_name);
+    let Some(key_index) = scalar_value_to_u32(key_value) else {
+        return Ok(None);
+    };
+    let ScalarValue::Number(source_number) = value_source else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(divisor)) = registers.get(divisor_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+
+    let value = source_number % divisor;
+    registers[source_object_register as usize] = ScalarValue::Object(array);
+    registers[key_register as usize] = key_value;
+    registers[value_source_register as usize] = value_source;
+    registers[value_register as usize] = ScalarValue::Number(value);
+
+    let storage_index = usize::try_from(object_id).expect("Uint8Array id fits in usize");
+    if let Some(storage) = state
+        .uint8_array_storage
+        .get_mut(storage_index)
+        .and_then(Option::as_mut)
+    {
+        let key_index = usize::try_from(key_index).expect("Uint8Array index fits in usize");
+        if let Some(slot) = storage.get_mut(key_index) {
+            *slot = scalar_to_uint8(ScalarValue::Number(value));
+        }
+    }
+
     Ok(Some(put_instruction_index + 1))
 }
 
@@ -17212,6 +17483,124 @@ mod tests {
         );
         assert_eq!(
             try_execute_scalar_global_number_checksum_sequence_candidate(
+                &bytecode,
+                &mut state,
+                &mut registers,
+                1,
+                &instructions,
+                &instruction_bytes,
+                &mut string_operand_cache,
+                0,
+            ),
+            Ok(None),
+        );
+    }
+
+    #[test]
+    fn scalar_uint8_global_index_mod_put_candidate_updates_typed_array() {
+        let bytes = fixture_bytecode();
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid Hermes bytecode");
+        let mut state = ScalarExecutorState::default();
+        let array = allocate_scalar_uint8_array(&mut state, 8);
+        let mut registers = [
+            ScalarValue::Empty,
+            ScalarValue::Empty,
+            ScalarValue::Empty,
+            ScalarValue::Empty,
+            ScalarValue::Number(4.0),
+            ScalarValue::Object(ScalarObjectHandle::Global),
+        ];
+        let instructions = [
+            HermesInstruction {
+                offset: 100,
+                opcode: GET_BY_ID_SHORT_OPCODE,
+                width: 6,
+            },
+            HermesInstruction {
+                offset: 106,
+                opcode: GET_BY_ID_SHORT_OPCODE,
+                width: 6,
+            },
+            HermesInstruction {
+                offset: 112,
+                opcode: GET_BY_ID_SHORT_OPCODE,
+                width: 6,
+            },
+            HermesInstruction {
+                offset: 118,
+                opcode: 37,
+                width: 4,
+            },
+            HermesInstruction {
+                offset: 122,
+                opcode: PUT_BY_VAL_LOOSE_OPCODE,
+                width: 4,
+            },
+        ];
+        let source_get_bytes = [GET_BY_ID_SHORT_OPCODE, 0, 5, 0, 0, 0];
+        let key_get_bytes = [GET_BY_ID_SHORT_OPCODE, 1, 5, 0, 1, 0];
+        let value_get_bytes = [GET_BY_ID_SHORT_OPCODE, 2, 5, 0, 1, 0];
+        let mod_bytes = [37, 3, 2, 4];
+        let put_bytes = [PUT_BY_VAL_LOOSE_OPCODE, 0, 1, 3];
+        let instruction_bytes = [
+            &source_get_bytes[..],
+            &key_get_bytes[..],
+            &value_get_bytes[..],
+            &mod_bytes[..],
+            &put_bytes[..],
+        ];
+        let mut string_operand_cache = ScalarStringOperandCache::default();
+
+        write_cached_scalar_global_property(&mut state, 0, "ab", ScalarValue::Object(array));
+        write_cached_scalar_global_property(&mut state, 1, "cdef", ScalarValue::Number(5.0));
+        assert_eq!(
+            try_execute_scalar_uint8_global_index_mod_put_candidate(
+                &bytecode,
+                &mut state,
+                &mut registers,
+                1,
+                &instructions,
+                &instruction_bytes,
+                &mut string_operand_cache,
+                0,
+            ),
+            Ok(Some(5)),
+        );
+        assert_eq!(registers[0], ScalarValue::Object(array));
+        assert_eq!(registers[1], ScalarValue::Number(5.0));
+        assert_eq!(registers[2], ScalarValue::Number(5.0));
+        assert_eq!(registers[3], ScalarValue::Number(1.0));
+        assert_eq!(
+            read_scalar_array_element(&state, array, 5),
+            ScalarValue::Number(1.0),
+        );
+
+        let aliased_mod_bytes = [37, 3, 2, 1];
+        let aliased_instruction_bytes = [
+            &source_get_bytes[..],
+            &key_get_bytes[..],
+            &value_get_bytes[..],
+            &aliased_mod_bytes[..],
+            &put_bytes[..],
+        ];
+        assert_eq!(
+            try_execute_scalar_uint8_global_index_mod_put_candidate(
+                &bytecode,
+                &mut state,
+                &mut registers,
+                1,
+                &instructions,
+                &aliased_instruction_bytes,
+                &mut string_operand_cache,
+                0,
+            ),
+            Ok(None),
+        );
+
+        let object = allocate_scalar_object(&mut state);
+        write_cached_scalar_global_property(&mut state, 0, "ab", ScalarValue::Object(object));
+        assert_eq!(
+            try_execute_scalar_uint8_global_index_mod_put_candidate(
                 &bytecode,
                 &mut state,
                 &mut registers,

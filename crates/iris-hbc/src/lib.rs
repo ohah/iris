@@ -9553,26 +9553,36 @@ fn write_scalar_named_object_property_index<'a>(
             return property_index;
         }
     }
-    if let Some(property_index) = state
-        .object_property_indices
-        .get(&(object, property_name))
-        .copied()
-    {
-        state.object_properties[property_index].2 = value;
-        property_index
-    } else {
-        let property_index = state.object_properties.len();
-        state
+    let property_may_exist = state
+        .object_property_names
+        .get(&object)
+        .is_some_and(|names| {
+            names
+                .iter()
+                .any(|name| scalar_property_name_matches(name, property_name))
+        });
+    if property_may_exist {
+        if let Some(property_index) = state
             .object_property_indices
-            .insert((object, property_name), property_index);
-        state
-            .object_property_names
-            .entry(object)
-            .or_default()
-            .push(property_name);
-        state.object_properties.push((object, property_name, value));
-        property_index
+            .get(&(object, property_name))
+            .copied()
+        {
+            state.object_properties[property_index].2 = value;
+            return property_index;
+        }
     }
+
+    let property_index = state.object_properties.len();
+    state
+        .object_property_indices
+        .insert((object, property_name), property_index);
+    state
+        .object_property_names
+        .entry(object)
+        .or_default()
+        .push(property_name);
+    state.object_properties.push((object, property_name, value));
+    property_index
 }
 
 fn write_cached_scalar_named_object_property<'a>(

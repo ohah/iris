@@ -86,6 +86,7 @@ fn scalar_value_json(value: ScalarValue) -> String {
         ScalarValue::Environment(value) => format!("\"Environment({})\"", value.environment_id),
         ScalarValue::Function(value) => format!("\"{}\"", json_escape(&format!("{value:?}"))),
         ScalarValue::Null => "null".to_owned(),
+        ScalarValue::DynamicString(value) => format!("\"DynamicString({})\"", value.dynamic_id),
         ScalarValue::Number(value) if value.is_finite() => {
             if value.fract() == 0.0 {
                 format!("{value:.0}")
@@ -96,6 +97,7 @@ fn scalar_value_json(value: ScalarValue) -> String {
         ScalarValue::Number(value) => format!("\"{value}\""),
         ScalarValue::Object(value) => format!("\"{value:?}\""),
         ScalarValue::String(value) => format!("\"String({})\"", value.string_id),
+        ScalarValue::Symbol(value) => format!("\"Symbol({})\"", value.string_id),
         ScalarValue::Undefined => "\"undefined\"".to_owned(),
     }
 }

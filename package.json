@@ -34,6 +34,7 @@
     "bench:strict-hbc-call-targets": "bun run tools/bench/run-strict-hbc-engine-comparison.ts --case=js-compute --case=js-compute-lexical --case=math-call-diagnostic --case=math-call-bound-diagnostic --warmup=5 --iterations=15 --rounds=2 --output=artifacts/bench/strict-hbc-engine-comparison-call-targets.json",
     "bench:strict-hbc-compare-artifacts": "bun run tools/bench/compare-strict-hbc-engine-artifacts.ts",
     "bench:strict-hbc-compare-gate": "bun run tools/bench/compare-strict-hbc-engine-artifacts.ts --gate",
+    "bench:strict-hbc-global-access": "bun run tools/bench/run-strict-hbc-engine-comparison.ts --case=global-access-diagnostic --case=global-access-lexical-diagnostic --warmup=5 --iterations=15 --rounds=2 --output=artifacts/bench/strict-hbc-engine-comparison-global-access.json",
     "bench:strict-hbc-math-lookup": "bun run tools/bench/run-strict-hbc-engine-comparison.ts --case=math-lookup-diagnostic --case=math-lookup-bound-diagnostic --warmup=5 --iterations=15 --rounds=2 --output=artifacts/bench/strict-hbc-engine-comparison-math-lookup.json",
     "bench:strict-hbc-profile": "bun run tools/bench/run-strict-hbc-profile.ts",
     "bench:strict-hbc-source-shape": "bun run tools/bench/run-strict-hbc-engine-comparison.ts --case=numeric-loop --case=numeric-loop-lexical --case=js-compute --case=js-compute-lexical --case=property-loop --case=property-loop-lexical --case=typed-array-copy --case=typed-array-copy-lexical --warmup=5 --iterations=15 --rounds=2 --output=artifacts/bench/strict-hbc-engine-comparison-lexical-shape.json",

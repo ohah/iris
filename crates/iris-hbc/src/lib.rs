@@ -3061,6 +3061,13 @@ enum ScalarInstructionResult {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScalarFastPathCandidate {
+    None,
+    MathLookupPair,
+    NativeMathCall2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScalarTraceMode {
     Relaxed,
     Strict,
@@ -3188,10 +3195,10 @@ fn execute_scalar_function_with_state_and_environment<'a>(
         .collect::<Vec<_>>();
     let mut string_operand_cache = ScalarStringOperandCache::default();
     let enforce_step_limits = state.remaining_steps.is_some();
-    let math_lookup_pair_candidates = if enforce_step_limits {
+    let fast_path_candidates = if enforce_step_limits {
         None
     } else {
-        scalar_math_lookup_pair_candidates(bytecode, function_id, &instructions, &instruction_bytes)
+        scalar_fast_path_candidates(bytecode, function_id, &instructions, &instruction_bytes)
     };
     let step_limit = if enforce_step_limits {
         instructions
@@ -3205,24 +3212,40 @@ fn execute_scalar_function_with_state_and_environment<'a>(
     let mut step_count = 0_usize;
     let mut jump_index_cache = vec![None; instructions.len()];
 
-    if let Some(math_lookup_pair_candidates) = math_lookup_pair_candidates.as_ref() {
+    if let Some(fast_path_candidates) = fast_path_candidates.as_ref() {
         while instruction_index < instructions.len() {
             let instruction = instructions[instruction_index];
             let current_instruction_bytes = instruction_bytes[instruction_index];
-            if math_lookup_pair_candidates[instruction_index] {
-                if let Some(next_instruction_index) = try_execute_scalar_math_lookup_pair(
-                    bytecode,
-                    state,
-                    &mut registers,
-                    function_id,
-                    &instructions,
-                    &instruction_bytes,
-                    &mut string_operand_cache,
-                    instruction_index,
-                )? {
-                    instruction_index = next_instruction_index;
-                    continue;
+            match fast_path_candidates[instruction_index] {
+                ScalarFastPathCandidate::MathLookupPair => {
+                    if let Some(next_instruction_index) = try_execute_scalar_math_lookup_pair(
+                        bytecode,
+                        state,
+                        &mut registers,
+                        function_id,
+                        &instructions,
+                        &instruction_bytes,
+                        &mut string_operand_cache,
+                        instruction_index,
+                    )? {
+                        instruction_index = next_instruction_index;
+                        continue;
+                    }
                 }
+                ScalarFastPathCandidate::NativeMathCall2 => {
+                    if let Some(next_instruction_index) =
+                        try_execute_scalar_native_math_call2_candidate(
+                            &mut registers,
+                            instruction,
+                            current_instruction_bytes,
+                            instruction_index,
+                        )?
+                    {
+                        instruction_index = next_instruction_index;
+                        continue;
+                    }
+                }
+                ScalarFastPathCandidate::None => {}
             }
             match execute_scalar_instruction(
                 bytecode,
@@ -3334,12 +3357,12 @@ fn execute_scalar_function_with_state_and_environment<'a>(
     Err(ScalarExecutionError::MissingReturn { function_id })
 }
 
-fn scalar_math_lookup_pair_candidates<'a>(
+fn scalar_fast_path_candidates<'a>(
     bytecode: &HermesBytecode<'a>,
     function_id: u32,
     instructions: &[HermesInstruction],
     instruction_bytes: &[&[u8]],
-) -> Option<Vec<bool>> {
+) -> Option<Vec<ScalarFastPathCandidate>> {
     let mut candidates = None;
     for instruction_index in 0..instructions.len().saturating_sub(1) {
         let instruction = instructions[instruction_index];
@@ -3376,8 +3399,80 @@ fn scalar_math_lookup_pair_candidates<'a>(
             continue;
         };
         if read_scalar_math_intrinsic_property(intrinsic_property_name).is_some() {
-            let candidates = candidates.get_or_insert_with(|| vec![false; instructions.len()]);
-            candidates[instruction_index] = true;
+            let candidates = candidates
+                .get_or_insert_with(|| vec![ScalarFastPathCandidate::None; instructions.len()]);
+            candidates[instruction_index] = ScalarFastPathCandidate::MathLookupPair;
+        }
+    }
+
+    if candidates.is_none() {
+        return None;
+    }
+
+    for instruction_index in 0..instructions.len() {
+        let instruction = instructions[instruction_index];
+        if instruction.opcode != 110 {
+            continue;
+        }
+
+        let current_bytes = instruction_bytes[instruction_index];
+        let callee_register = read_unsigned_operand(current_bytes, 2, 1);
+        let search_start = instruction_index.saturating_sub(6);
+        let has_near_math_callee = instructions[search_start..instruction_index]
+            .iter()
+            .enumerate()
+            .any(|(relative_index, candidate_instruction)| {
+                if candidate_instruction.opcode != 68 {
+                    return false;
+                }
+                let candidate_index = search_start + relative_index;
+                let candidate_bytes = instruction_bytes[candidate_index];
+                if read_unsigned_operand(candidate_bytes, 1, 1) != callee_register {
+                    return false;
+                }
+                let Some(previous_index) = candidate_index.checked_sub(1) else {
+                    return false;
+                };
+                let previous_instruction = instructions[previous_index];
+                if previous_instruction.opcode != 72 {
+                    return false;
+                }
+                let previous_bytes = instruction_bytes[previous_index];
+                let math_destination = read_unsigned_operand(previous_bytes, 1, 1);
+                if read_unsigned_operand(candidate_bytes, 2, 1) != math_destination {
+                    return false;
+                }
+
+                let math_string_id = read_unsigned_operand(previous_bytes, 4, 2);
+                let Ok(math_property_name) = read_scalar_string_operand(
+                    bytecode,
+                    function_id,
+                    previous_instruction,
+                    math_string_id,
+                ) else {
+                    return false;
+                };
+                if math_property_name != "Math" {
+                    return false;
+                }
+
+                let intrinsic_string_id = read_unsigned_operand(candidate_bytes, 4, 1);
+                let Ok(intrinsic_property_name) = read_scalar_string_operand(
+                    bytecode,
+                    function_id,
+                    *candidate_instruction,
+                    intrinsic_string_id,
+                ) else {
+                    return false;
+                };
+                read_scalar_math_intrinsic_property(intrinsic_property_name).is_some()
+            });
+        if has_near_math_callee {
+            let candidates = candidates
+                .get_or_insert_with(|| vec![ScalarFastPathCandidate::None; instructions.len()]);
+            if candidates[instruction_index] == ScalarFastPathCandidate::None {
+                candidates[instruction_index] = ScalarFastPathCandidate::NativeMathCall2;
+            }
         }
     }
 
@@ -3470,6 +3565,44 @@ fn try_execute_scalar_math_lookup_pair<'a>(
         intrinsic_value,
     )?;
     Ok(Some(next_instruction_index + 1))
+}
+
+fn try_execute_scalar_native_math_call2_candidate(
+    registers: &mut [ScalarValue],
+    instruction: HermesInstruction,
+    instruction_bytes: &[u8],
+    instruction_index: usize,
+) -> Result<Option<usize>, ScalarExecutionError> {
+    if instruction.opcode != 110 {
+        return Ok(None);
+    }
+
+    let destination = read_unsigned_operand(instruction_bytes, 1, 1);
+    let callee_register = read_unsigned_operand(instruction_bytes, 2, 1);
+    let this_register = read_unsigned_operand(instruction_bytes, 3, 1);
+    let value_register = read_unsigned_operand(instruction_bytes, 4, 1);
+    let Some(ScalarValue::Function(function)) = registers.get(callee_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    if !matches!(
+        registers.get(this_register as usize),
+        Some(ScalarValue::Object(ScalarObjectHandle::Math))
+    ) {
+        return Ok(None);
+    }
+    let Some(ScalarValue::Number(value)) = registers.get(value_register as usize).copied() else {
+        return Ok(None);
+    };
+    let Some(result) = call_scalar_native_math_number(function, value) else {
+        return Ok(None);
+    };
+    let Some(destination_slot) = registers.get_mut(destination as usize) else {
+        return Ok(None);
+    };
+
+    *destination_slot = result;
+    Ok(Some(instruction_index + 1))
 }
 
 fn profile_scalar_function<'a>(
@@ -15689,6 +15822,46 @@ mod tests {
             ),
             Ok(ScalarValue::Number(3.0)),
         );
+    }
+
+    #[test]
+    fn scalar_native_math_call2_candidate_requires_math_this() {
+        let instruction = HermesInstruction {
+            offset: 123,
+            opcode: CALL2_OPCODE,
+            width: 5,
+        };
+        let instruction_bytes = [CALL2_OPCODE, 0, 1, 2, 3];
+        let mut registers = [
+            ScalarValue::Empty,
+            ScalarValue::Function(ScalarFunctionHandle::NativeMathSqrt),
+            ScalarValue::Object(ScalarObjectHandle::Math),
+            ScalarValue::Number(9.0),
+        ];
+
+        assert_eq!(
+            try_execute_scalar_native_math_call2_candidate(
+                &mut registers,
+                instruction,
+                &instruction_bytes,
+                7,
+            ),
+            Ok(Some(8)),
+        );
+        assert_eq!(registers[0], ScalarValue::Number(3.0));
+
+        registers[0] = ScalarValue::Empty;
+        registers[2] = ScalarValue::Undefined;
+        assert_eq!(
+            try_execute_scalar_native_math_call2_candidate(
+                &mut registers,
+                instruction,
+                &instruction_bytes,
+                7,
+            ),
+            Ok(None),
+        );
+        assert_eq!(registers[0], ScalarValue::Empty);
     }
 
     #[test]

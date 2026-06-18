@@ -6397,6 +6397,19 @@ fn scalar_math_argument_to_number(arguments: &[ScalarValue]) -> f64 {
     }
 }
 
+fn call_scalar_native_math_number(
+    function: ScalarFunctionHandle,
+    value: f64,
+) -> Option<ScalarValue> {
+    let value = match function {
+        ScalarFunctionHandle::NativeMathRound => value.round(),
+        ScalarFunctionHandle::NativeMathSin => value.sin(),
+        ScalarFunctionHandle::NativeMathSqrt => value.sqrt(),
+        _ => return None,
+    };
+    Some(ScalarValue::Number(value))
+}
+
 fn scalar_constructor_arguments(
     this_value: ScalarValue,
     registers: &[ScalarValue],
@@ -7761,22 +7774,28 @@ fn call_scalar_direct_function<'a>(
             )
         }
         110 => {
-            let arguments = [
-                read_scalar_call_argument_operand(
-                    registers,
-                    function_id,
-                    instruction,
-                    instruction_bytes,
-                    0,
-                )?,
-                read_scalar_call_argument_operand(
-                    registers,
-                    function_id,
-                    instruction,
-                    instruction_bytes,
-                    1,
-                )?,
-            ];
+            let this_argument = read_scalar_call_argument_operand(
+                registers,
+                function_id,
+                instruction,
+                instruction_bytes,
+                0,
+            )?;
+            let value_argument = read_scalar_call_argument_operand(
+                registers,
+                function_id,
+                instruction,
+                instruction_bytes,
+                1,
+            )?;
+            if let (ScalarValue::Function(function), ScalarValue::Number(value)) =
+                (callee, value_argument)
+            {
+                if let Some(value) = call_scalar_native_math_number(function, value) {
+                    return Ok(value);
+                }
+            }
+            let arguments = [this_argument, value_argument];
             call_scalar_function(
                 bytecode,
                 state,
@@ -15428,6 +15447,37 @@ mod tests {
                 &[ScalarValue::Undefined, ScalarValue::Number(3.5)],
             ),
             Ok(ScalarValue::Number(4.0)),
+        );
+    }
+
+    #[test]
+    fn scalar_direct_call_fast_paths_native_math_number_argument() {
+        let bytes = fixture_bytecode();
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid Hermes bytecode");
+        let mut state = ScalarExecutorState::default();
+        let registers = [
+            ScalarValue::Function(ScalarFunctionHandle::NativeMathSqrt),
+            ScalarValue::Undefined,
+            ScalarValue::Number(9.0),
+        ];
+        let instruction = HermesInstruction {
+            offset: 123,
+            opcode: CALL2_OPCODE,
+            width: 5,
+        };
+
+        assert_eq!(
+            call_scalar_direct_function(
+                &bytecode,
+                &mut state,
+                &registers,
+                1,
+                instruction,
+                &[CALL2_OPCODE, 0, 0, 1, 2],
+                0,
+                ScalarValue::Function(ScalarFunctionHandle::NativeMathSqrt),
+            ),
+            Ok(ScalarValue::Number(3.0)),
         );
     }
 

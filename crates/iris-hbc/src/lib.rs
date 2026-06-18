@@ -3066,6 +3066,7 @@ enum ScalarFastPathCandidate {
     GlobalNumberAddPut,
     MathLookupPair,
     NativeMathCall2,
+    ObjectNumberAddModPut,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3263,6 +3264,23 @@ fn execute_scalar_function_with_state_and_environment<'a>(
                         continue;
                     }
                 }
+                ScalarFastPathCandidate::ObjectNumberAddModPut => {
+                    if let Some(next_instruction_index) =
+                        try_execute_scalar_object_number_add_mod_put_candidate(
+                            bytecode,
+                            state,
+                            &mut registers,
+                            function_id,
+                            &instructions,
+                            &instruction_bytes,
+                            &mut string_operand_cache,
+                            instruction_index,
+                        )?
+                    {
+                        instruction_index = next_instruction_index;
+                        continue;
+                    }
+                }
                 ScalarFastPathCandidate::None => {}
             }
             match execute_scalar_instruction(
@@ -3431,6 +3449,139 @@ fn scalar_fast_path_candidates<'a>(
         let candidates = candidates
             .get_or_insert_with(|| vec![ScalarFastPathCandidate::None; instructions.len()]);
         candidates[instruction_index] = ScalarFastPathCandidate::GlobalNumberAddPut;
+    }
+
+    for instruction_index in 0..instructions.len().saturating_sub(7) {
+        let first_object_instruction = instructions[instruction_index];
+        let second_object_instruction = instructions[instruction_index + 1];
+        let left_property_instruction = instructions[instruction_index + 2];
+        let third_object_instruction = instructions[instruction_index + 3];
+        let right_property_instruction = instructions[instruction_index + 4];
+        let add_instruction = instructions[instruction_index + 5];
+        let mod_instruction = instructions[instruction_index + 6];
+        let put_instruction = instructions[instruction_index + 7];
+        if first_object_instruction.opcode != 68
+            || second_object_instruction.opcode != 68
+            || left_property_instruction.opcode != 68
+            || third_object_instruction.opcode != 68
+            || right_property_instruction.opcode != 68
+            || add_instruction.opcode != 30
+            || mod_instruction.opcode != 37
+            || !matches!(put_instruction.opcode, 74 | 75)
+        {
+            continue;
+        }
+
+        let first_object_bytes = instruction_bytes[instruction_index];
+        let second_object_bytes = instruction_bytes[instruction_index + 1];
+        let left_property_bytes = instruction_bytes[instruction_index + 2];
+        let third_object_bytes = instruction_bytes[instruction_index + 3];
+        let right_property_bytes = instruction_bytes[instruction_index + 4];
+        let add_bytes = instruction_bytes[instruction_index + 5];
+        let mod_bytes = instruction_bytes[instruction_index + 6];
+        let put_bytes = instruction_bytes[instruction_index + 7];
+        let global_base_register = read_unsigned_operand(first_object_bytes, 2, 1);
+        if read_unsigned_operand(second_object_bytes, 2, 1) != global_base_register
+            || read_unsigned_operand(third_object_bytes, 2, 1) != global_base_register
+        {
+            continue;
+        }
+
+        let first_object_register = read_unsigned_operand(first_object_bytes, 1, 1);
+        let scratch_object_register = read_unsigned_operand(second_object_bytes, 1, 1);
+        let left_value_register = read_unsigned_operand(left_property_bytes, 1, 1);
+        let third_object_register = read_unsigned_operand(third_object_bytes, 1, 1);
+        let right_value_register = read_unsigned_operand(right_property_bytes, 1, 1);
+        let add_destination = read_unsigned_operand(add_bytes, 1, 1);
+        let add_left_register = read_unsigned_operand(add_bytes, 2, 1);
+        let add_right_register = read_unsigned_operand(add_bytes, 3, 1);
+        let mod_destination = read_unsigned_operand(mod_bytes, 1, 1);
+        let mod_left_register = read_unsigned_operand(mod_bytes, 2, 1);
+        let put_base_register = read_unsigned_operand(put_bytes, 1, 1);
+        let put_value_register = read_unsigned_operand(put_bytes, 2, 1);
+        if scratch_object_register != third_object_register
+            || scratch_object_register != right_value_register
+            || scratch_object_register != add_destination
+            || read_unsigned_operand(left_property_bytes, 2, 1) != scratch_object_register
+            || read_unsigned_operand(right_property_bytes, 2, 1) != scratch_object_register
+            || !((add_left_register == left_value_register
+                && add_right_register == right_value_register)
+                || (add_left_register == right_value_register
+                    && add_right_register == left_value_register))
+            || mod_left_register != add_destination
+            || put_base_register != first_object_register
+            || put_value_register != mod_destination
+        {
+            continue;
+        }
+        if first_object_register == global_base_register
+            || first_object_register == scratch_object_register
+            || first_object_register == left_value_register
+            || first_object_register == mod_destination
+            || scratch_object_register == global_base_register
+            || scratch_object_register == left_value_register
+            || scratch_object_register == mod_destination
+            || left_value_register == global_base_register
+            || mod_destination == global_base_register
+        {
+            continue;
+        }
+
+        let object_string_id = read_unsigned_operand(first_object_bytes, 4, 1);
+        let second_object_string_id = read_unsigned_operand(second_object_bytes, 4, 1);
+        let third_object_string_id = read_unsigned_operand(third_object_bytes, 4, 1);
+        let Ok(object_property_name) = read_scalar_string_operand(
+            bytecode,
+            function_id,
+            first_object_instruction,
+            object_string_id,
+        ) else {
+            continue;
+        };
+        let Ok(second_object_property_name) = read_scalar_string_operand(
+            bytecode,
+            function_id,
+            second_object_instruction,
+            second_object_string_id,
+        ) else {
+            continue;
+        };
+        let Ok(third_object_property_name) = read_scalar_string_operand(
+            bytecode,
+            function_id,
+            third_object_instruction,
+            third_object_string_id,
+        ) else {
+            continue;
+        };
+        if !scalar_property_name_matches(object_property_name, second_object_property_name)
+            || !scalar_property_name_matches(object_property_name, third_object_property_name)
+        {
+            continue;
+        }
+
+        let left_string_id = read_unsigned_operand(left_property_bytes, 4, 1);
+        let put_string_id = read_unsigned_operand(put_bytes, 4, 2);
+        let Ok(left_property_name) = read_scalar_string_operand(
+            bytecode,
+            function_id,
+            left_property_instruction,
+            left_string_id,
+        ) else {
+            continue;
+        };
+        let Ok(put_property_name) =
+            read_scalar_string_operand(bytecode, function_id, put_instruction, put_string_id)
+        else {
+            continue;
+        };
+        if !scalar_property_name_matches(left_property_name, put_property_name) {
+            continue;
+        }
+
+        let candidates = candidates
+            .get_or_insert_with(|| vec![ScalarFastPathCandidate::None; instructions.len()]);
+        candidates[instruction_index] = ScalarFastPathCandidate::ObjectNumberAddModPut;
     }
 
     for instruction_index in 0..instructions.len().saturating_sub(1) {
@@ -3638,6 +3789,227 @@ fn try_execute_scalar_global_number_add_put_candidate<'a>(
     };
     *destination_slot = value;
     write_cached_scalar_global_property(state, get_string_id, property_name, value);
+    Ok(Some(put_instruction_index + 1))
+}
+
+fn try_execute_scalar_object_number_add_mod_put_candidate<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
+    registers: &mut [ScalarValue],
+    function_id: u32,
+    instructions: &[HermesInstruction],
+    instruction_bytes: &[&[u8]],
+    string_operand_cache: &mut ScalarStringOperandCache<'a>,
+    instruction_index: usize,
+) -> Result<Option<usize>, ScalarExecutionError> {
+    let Some(put_instruction_index) = instruction_index.checked_add(7) else {
+        return Ok(None);
+    };
+    let Some(first_object_instruction) = instructions.get(instruction_index).copied() else {
+        return Ok(None);
+    };
+    let Some(second_object_instruction) = instructions.get(instruction_index + 1).copied() else {
+        return Ok(None);
+    };
+    let Some(left_property_instruction) = instructions.get(instruction_index + 2).copied() else {
+        return Ok(None);
+    };
+    let Some(third_object_instruction) = instructions.get(instruction_index + 3).copied() else {
+        return Ok(None);
+    };
+    let Some(right_property_instruction) = instructions.get(instruction_index + 4).copied() else {
+        return Ok(None);
+    };
+    let Some(add_instruction) = instructions.get(instruction_index + 5).copied() else {
+        return Ok(None);
+    };
+    let Some(mod_instruction) = instructions.get(instruction_index + 6).copied() else {
+        return Ok(None);
+    };
+    let Some(put_instruction) = instructions.get(put_instruction_index).copied() else {
+        return Ok(None);
+    };
+    if first_object_instruction.opcode != 68
+        || second_object_instruction.opcode != 68
+        || left_property_instruction.opcode != 68
+        || third_object_instruction.opcode != 68
+        || right_property_instruction.opcode != 68
+        || add_instruction.opcode != 30
+        || mod_instruction.opcode != 37
+        || !matches!(put_instruction.opcode, 74 | 75)
+    {
+        return Ok(None);
+    }
+
+    let first_object_bytes = instruction_bytes[instruction_index];
+    let second_object_bytes = instruction_bytes[instruction_index + 1];
+    let left_property_bytes = instruction_bytes[instruction_index + 2];
+    let third_object_bytes = instruction_bytes[instruction_index + 3];
+    let right_property_bytes = instruction_bytes[instruction_index + 4];
+    let add_bytes = instruction_bytes[instruction_index + 5];
+    let mod_bytes = instruction_bytes[instruction_index + 6];
+    let put_bytes = instruction_bytes[put_instruction_index];
+    let global_base_register = read_unsigned_operand(first_object_bytes, 2, 1);
+    if read_unsigned_operand(second_object_bytes, 2, 1) != global_base_register
+        || read_unsigned_operand(third_object_bytes, 2, 1) != global_base_register
+        || !matches!(
+            registers.get(global_base_register as usize),
+            Some(ScalarValue::Object(ScalarObjectHandle::Global))
+        )
+    {
+        return Ok(None);
+    }
+
+    let first_object_register = read_unsigned_operand(first_object_bytes, 1, 1);
+    let scratch_object_register = read_unsigned_operand(second_object_bytes, 1, 1);
+    let left_value_register = read_unsigned_operand(left_property_bytes, 1, 1);
+    let third_object_register = read_unsigned_operand(third_object_bytes, 1, 1);
+    let right_value_register = read_unsigned_operand(right_property_bytes, 1, 1);
+    let add_destination = read_unsigned_operand(add_bytes, 1, 1);
+    let add_left_register = read_unsigned_operand(add_bytes, 2, 1);
+    let add_right_register = read_unsigned_operand(add_bytes, 3, 1);
+    let mod_destination = read_unsigned_operand(mod_bytes, 1, 1);
+    let mod_left_register = read_unsigned_operand(mod_bytes, 2, 1);
+    let mod_right_register = read_unsigned_operand(mod_bytes, 3, 1);
+    let put_base_register = read_unsigned_operand(put_bytes, 1, 1);
+    let put_value_register = read_unsigned_operand(put_bytes, 2, 1);
+    if scratch_object_register != third_object_register
+        || scratch_object_register != right_value_register
+        || scratch_object_register != add_destination
+        || read_unsigned_operand(left_property_bytes, 2, 1) != scratch_object_register
+        || read_unsigned_operand(right_property_bytes, 2, 1) != scratch_object_register
+        || !((add_left_register == left_value_register
+            && add_right_register == right_value_register)
+            || (add_left_register == right_value_register
+                && add_right_register == left_value_register))
+        || mod_left_register != add_destination
+        || put_base_register != first_object_register
+        || put_value_register != mod_destination
+    {
+        return Ok(None);
+    }
+    if first_object_register == global_base_register
+        || first_object_register == scratch_object_register
+        || first_object_register == left_value_register
+        || first_object_register == mod_destination
+        || scratch_object_register == global_base_register
+        || scratch_object_register == left_value_register
+        || scratch_object_register == mod_destination
+        || left_value_register == global_base_register
+        || mod_destination == global_base_register
+    {
+        return Ok(None);
+    }
+    for register in [
+        first_object_register,
+        scratch_object_register,
+        left_value_register,
+        mod_destination,
+        mod_right_register,
+    ] {
+        if registers.get(register as usize).is_none() {
+            return Ok(None);
+        }
+    }
+
+    let object_string_id = read_unsigned_operand(first_object_bytes, 4, 1);
+    let second_object_string_id = read_unsigned_operand(second_object_bytes, 4, 1);
+    let third_object_string_id = read_unsigned_operand(third_object_bytes, 4, 1);
+    let object_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        first_object_instruction,
+        object_string_id,
+    )?;
+    let second_object_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        second_object_instruction,
+        second_object_string_id,
+    )?;
+    let third_object_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        third_object_instruction,
+        third_object_string_id,
+    )?;
+    if !scalar_property_name_matches(object_property_name, second_object_property_name)
+        || !scalar_property_name_matches(object_property_name, third_object_property_name)
+    {
+        return Ok(None);
+    }
+
+    let ScalarValue::Object(object @ ScalarObjectHandle::Object(_)) =
+        read_cached_scalar_global_property(state, object_string_id, object_property_name)
+    else {
+        return Ok(None);
+    };
+    if !state.object_getters.is_empty() || read_scalar_object_prototype(state, object).is_some() {
+        return Ok(None);
+    }
+
+    let left_string_id = read_unsigned_operand(left_property_bytes, 4, 1);
+    let right_string_id = read_unsigned_operand(right_property_bytes, 4, 1);
+    let put_string_id = read_unsigned_operand(put_bytes, 4, 2);
+    let left_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        left_property_instruction,
+        left_string_id,
+    )?;
+    let right_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        right_property_instruction,
+        right_string_id,
+    )?;
+    let put_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        put_instruction,
+        put_string_id,
+    )?;
+    if !scalar_property_name_matches(left_property_name, put_property_name) {
+        return Ok(None);
+    }
+
+    let Some(ScalarValue::Number(left)) =
+        read_cached_scalar_own_object_property(state, object, left_string_id, left_property_name)
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(right)) =
+        read_cached_scalar_own_object_property(state, object, right_string_id, right_property_name)
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(divisor)) = registers.get(mod_right_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+
+    let sum = left + right;
+    let result = sum % divisor;
+    registers[first_object_register as usize] = ScalarValue::Object(object);
+    registers[scratch_object_register as usize] = ScalarValue::Object(object);
+    registers[left_value_register as usize] = ScalarValue::Number(left);
+    registers[scratch_object_register as usize] = ScalarValue::Object(object);
+    registers[scratch_object_register as usize] = ScalarValue::Number(right);
+    registers[scratch_object_register as usize] = ScalarValue::Number(sum);
+    registers[mod_destination as usize] = ScalarValue::Number(result);
+    write_cached_scalar_named_object_property(
+        state,
+        object,
+        put_string_id,
+        put_property_name,
+        ScalarValue::Number(result),
+    );
     Ok(Some(put_instruction_index + 1))
 }
 
@@ -16083,6 +16455,206 @@ mod tests {
             Ok(None),
         );
         assert_eq!(registers[0], ScalarValue::Empty);
+    }
+
+    #[test]
+    fn scalar_object_number_add_mod_put_candidate_updates_plain_object_number() {
+        let bytes = fixture_bytecode();
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid Hermes bytecode");
+        let mut state = ScalarExecutorState::default();
+        let object = allocate_scalar_object(&mut state);
+        let mut registers = [
+            ScalarValue::Empty,
+            ScalarValue::Empty,
+            ScalarValue::Empty,
+            ScalarValue::Empty,
+            ScalarValue::Object(ScalarObjectHandle::Global),
+            ScalarValue::Number(5.0),
+        ];
+        let instructions = [
+            HermesInstruction {
+                offset: 100,
+                opcode: GET_BY_ID_SHORT_OPCODE,
+                width: 6,
+            },
+            HermesInstruction {
+                offset: 106,
+                opcode: GET_BY_ID_SHORT_OPCODE,
+                width: 6,
+            },
+            HermesInstruction {
+                offset: 112,
+                opcode: GET_BY_ID_SHORT_OPCODE,
+                width: 6,
+            },
+            HermesInstruction {
+                offset: 118,
+                opcode: GET_BY_ID_SHORT_OPCODE,
+                width: 6,
+            },
+            HermesInstruction {
+                offset: 124,
+                opcode: GET_BY_ID_SHORT_OPCODE,
+                width: 6,
+            },
+            HermesInstruction {
+                offset: 130,
+                opcode: 30,
+                width: 4,
+            },
+            HermesInstruction {
+                offset: 134,
+                opcode: 37,
+                width: 4,
+            },
+            HermesInstruction {
+                offset: 138,
+                opcode: PUT_BY_ID_LOOSE_OPCODE,
+                width: 6,
+            },
+        ];
+        let first_object_bytes = [GET_BY_ID_SHORT_OPCODE, 0, 4, 0, 1, 0];
+        let second_object_bytes = [GET_BY_ID_SHORT_OPCODE, 1, 4, 0, 1, 0];
+        let left_property_bytes = [GET_BY_ID_SHORT_OPCODE, 2, 1, 0, 1, 0];
+        let third_object_bytes = [GET_BY_ID_SHORT_OPCODE, 1, 4, 0, 1, 0];
+        let right_property_bytes = [GET_BY_ID_SHORT_OPCODE, 1, 1, 0, 1, 0];
+        let add_bytes = [30, 1, 2, 1];
+        let mod_bytes = [37, 3, 1, 5];
+        let put_bytes = [PUT_BY_ID_LOOSE_OPCODE, 0, 3, 0, 1, 0];
+        let instruction_bytes = [
+            &first_object_bytes[..],
+            &second_object_bytes[..],
+            &left_property_bytes[..],
+            &third_object_bytes[..],
+            &right_property_bytes[..],
+            &add_bytes[..],
+            &mod_bytes[..],
+            &put_bytes[..],
+        ];
+        let mut string_operand_cache = ScalarStringOperandCache::default();
+
+        write_cached_scalar_global_property(&mut state, 1, "cdef", ScalarValue::Object(object));
+        write_scalar_named_object_property(&mut state, object, "cdef", ScalarValue::Number(6.0));
+        assert_eq!(
+            try_execute_scalar_object_number_add_mod_put_candidate(
+                &bytecode,
+                &mut state,
+                &mut registers,
+                1,
+                &instructions,
+                &instruction_bytes,
+                &mut string_operand_cache,
+                0,
+            ),
+            Ok(Some(8)),
+        );
+        assert_eq!(registers[0], ScalarValue::Object(object));
+        assert_eq!(registers[1], ScalarValue::Number(12.0));
+        assert_eq!(registers[2], ScalarValue::Number(6.0));
+        assert_eq!(registers[3], ScalarValue::Number(2.0));
+        assert_eq!(
+            read_scalar_own_object_property(&state, object, "cdef"),
+            Some(ScalarValue::Number(2.0)),
+        );
+    }
+
+    #[test]
+    fn scalar_object_number_add_mod_put_candidate_requires_plain_data_property() {
+        let bytes = fixture_bytecode();
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid Hermes bytecode");
+        let mut state = ScalarExecutorState::default();
+        let object = allocate_scalar_object(&mut state);
+        let prototype = allocate_scalar_object(&mut state);
+        let mut registers = [
+            ScalarValue::Empty,
+            ScalarValue::Empty,
+            ScalarValue::Empty,
+            ScalarValue::Empty,
+            ScalarValue::Object(ScalarObjectHandle::Global),
+            ScalarValue::Number(5.0),
+        ];
+        let instructions = [
+            HermesInstruction {
+                offset: 100,
+                opcode: GET_BY_ID_SHORT_OPCODE,
+                width: 6,
+            },
+            HermesInstruction {
+                offset: 106,
+                opcode: GET_BY_ID_SHORT_OPCODE,
+                width: 6,
+            },
+            HermesInstruction {
+                offset: 112,
+                opcode: GET_BY_ID_SHORT_OPCODE,
+                width: 6,
+            },
+            HermesInstruction {
+                offset: 118,
+                opcode: GET_BY_ID_SHORT_OPCODE,
+                width: 6,
+            },
+            HermesInstruction {
+                offset: 124,
+                opcode: GET_BY_ID_SHORT_OPCODE,
+                width: 6,
+            },
+            HermesInstruction {
+                offset: 130,
+                opcode: 30,
+                width: 4,
+            },
+            HermesInstruction {
+                offset: 134,
+                opcode: 37,
+                width: 4,
+            },
+            HermesInstruction {
+                offset: 138,
+                opcode: PUT_BY_ID_LOOSE_OPCODE,
+                width: 6,
+            },
+        ];
+        let first_object_bytes = [GET_BY_ID_SHORT_OPCODE, 0, 4, 0, 1, 0];
+        let second_object_bytes = [GET_BY_ID_SHORT_OPCODE, 1, 4, 0, 1, 0];
+        let left_property_bytes = [GET_BY_ID_SHORT_OPCODE, 2, 1, 0, 1, 0];
+        let third_object_bytes = [GET_BY_ID_SHORT_OPCODE, 1, 4, 0, 1, 0];
+        let right_property_bytes = [GET_BY_ID_SHORT_OPCODE, 1, 1, 0, 1, 0];
+        let add_bytes = [30, 1, 2, 1];
+        let mod_bytes = [37, 3, 1, 5];
+        let put_bytes = [PUT_BY_ID_LOOSE_OPCODE, 0, 3, 0, 1, 0];
+        let instruction_bytes = [
+            &first_object_bytes[..],
+            &second_object_bytes[..],
+            &left_property_bytes[..],
+            &third_object_bytes[..],
+            &right_property_bytes[..],
+            &add_bytes[..],
+            &mod_bytes[..],
+            &put_bytes[..],
+        ];
+        let mut string_operand_cache = ScalarStringOperandCache::default();
+
+        write_cached_scalar_global_property(&mut state, 1, "cdef", ScalarValue::Object(object));
+        write_scalar_named_object_property(&mut state, object, "cdef", ScalarValue::Number(6.0));
+        write_scalar_object_prototype(&mut state, object, ScalarValue::Object(prototype));
+        assert_eq!(
+            try_execute_scalar_object_number_add_mod_put_candidate(
+                &bytecode,
+                &mut state,
+                &mut registers,
+                1,
+                &instructions,
+                &instruction_bytes,
+                &mut string_operand_cache,
+                0,
+            ),
+            Ok(None),
+        );
+        assert_eq!(
+            read_scalar_own_object_property(&state, object, "cdef"),
+            Some(ScalarValue::Number(6.0)),
+        );
     }
 
     #[test]

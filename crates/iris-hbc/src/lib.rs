@@ -3188,6 +3188,11 @@ fn execute_scalar_function_with_state_and_environment<'a>(
         .collect::<Vec<_>>();
     let mut string_operand_cache = ScalarStringOperandCache::default();
     let enforce_step_limits = state.remaining_steps.is_some();
+    let math_lookup_pair_candidates = if enforce_step_limits {
+        None
+    } else {
+        scalar_math_lookup_pair_candidates(bytecode, function_id, &instructions, &instruction_bytes)
+    };
     let step_limit = if enforce_step_limits {
         instructions
             .len()
@@ -3200,72 +3205,271 @@ fn execute_scalar_function_with_state_and_environment<'a>(
     let mut step_count = 0_usize;
     let mut jump_index_cache = vec![None; instructions.len()];
 
-    while instruction_index < instructions.len() {
-        if enforce_step_limits {
-            let remaining_steps = state
-                .remaining_steps
-                .as_mut()
-                .expect("step limits are enabled");
-            if *remaining_steps == 0 {
-                return Err(ScalarExecutionError::StepLimitExceeded {
+    if let Some(math_lookup_pair_candidates) = math_lookup_pair_candidates.as_ref() {
+        while instruction_index < instructions.len() {
+            let instruction = instructions[instruction_index];
+            let current_instruction_bytes = instruction_bytes[instruction_index];
+            if math_lookup_pair_candidates[instruction_index] {
+                if let Some(next_instruction_index) = try_execute_scalar_math_lookup_pair(
+                    bytecode,
+                    state,
+                    &mut registers,
                     function_id,
-                    step_limit: SCALAR_EXECUTION_GLOBAL_STEP_LIMIT,
-                });
-            }
-            *remaining_steps -= 1;
-            if step_count >= step_limit {
-                return Err(ScalarExecutionError::StepLimitExceeded {
-                    function_id,
-                    step_limit,
-                });
-            }
-            step_count += 1;
-        }
-
-        let instruction = instructions[instruction_index];
-        let current_instruction_bytes = instruction_bytes[instruction_index];
-        match execute_scalar_instruction(
-            bytecode,
-            state,
-            &mut registers,
-            arguments,
-            function_id,
-            current_instruction_bytes,
-            &mut string_operand_cache,
-            instruction,
-            closure_environment,
-        )? {
-            ScalarInstructionResult::Continue => {
-                instruction_index += 1;
-            }
-            ScalarInstructionResult::Jump(target) => {
-                if let Some(target_index) = jump_index_cache[instruction_index] {
-                    instruction_index = target_index;
-                } else {
-                    let target_index = instructions
-                        .binary_search_by_key(&target, |instruction| instruction.offset)
-                        .map_err(|_| ParseError::InvalidJumpTarget {
-                            function_id,
-                            offset: instruction.offset,
-                            opcode: instruction.opcode,
-                            target: i64::from(target),
-                            body_start: body.offset,
-                            body_end: body.offset + body.len(),
-                        })?;
-                    jump_index_cache[instruction_index] = Some(target_index);
-                    instruction_index = target_index;
+                    &instructions,
+                    &instruction_bytes,
+                    &mut string_operand_cache,
+                    instruction_index,
+                )? {
+                    instruction_index = next_instruction_index;
+                    continue;
                 }
             }
-            ScalarInstructionResult::Return(value) => {
-                return Ok(ScalarExecutionReport {
-                    value,
-                    declared_globals: state.declared_globals.clone(),
-                });
+            match execute_scalar_instruction(
+                bytecode,
+                state,
+                &mut registers,
+                arguments,
+                function_id,
+                current_instruction_bytes,
+                &mut string_operand_cache,
+                instruction,
+                closure_environment,
+            )? {
+                ScalarInstructionResult::Continue => {
+                    instruction_index += 1;
+                }
+                ScalarInstructionResult::Jump(target) => {
+                    if let Some(target_index) = jump_index_cache[instruction_index] {
+                        instruction_index = target_index;
+                    } else {
+                        let target_index = instructions
+                            .binary_search_by_key(&target, |instruction| instruction.offset)
+                            .map_err(|_| ParseError::InvalidJumpTarget {
+                                function_id,
+                                offset: instruction.offset,
+                                opcode: instruction.opcode,
+                                target: i64::from(target),
+                                body_start: body.offset,
+                                body_end: body.offset + body.len(),
+                            })?;
+                        jump_index_cache[instruction_index] = Some(target_index);
+                        instruction_index = target_index;
+                    }
+                }
+                ScalarInstructionResult::Return(value) => {
+                    return Ok(ScalarExecutionReport {
+                        value,
+                        declared_globals: state.declared_globals.clone(),
+                    });
+                }
+            }
+        }
+    } else {
+        while instruction_index < instructions.len() {
+            if enforce_step_limits {
+                let remaining_steps = state
+                    .remaining_steps
+                    .as_mut()
+                    .expect("step limits are enabled");
+                if *remaining_steps == 0 {
+                    return Err(ScalarExecutionError::StepLimitExceeded {
+                        function_id,
+                        step_limit: SCALAR_EXECUTION_GLOBAL_STEP_LIMIT,
+                    });
+                }
+                *remaining_steps -= 1;
+                if step_count >= step_limit {
+                    return Err(ScalarExecutionError::StepLimitExceeded {
+                        function_id,
+                        step_limit,
+                    });
+                }
+                step_count += 1;
+            }
+
+            let instruction = instructions[instruction_index];
+            let current_instruction_bytes = instruction_bytes[instruction_index];
+            match execute_scalar_instruction(
+                bytecode,
+                state,
+                &mut registers,
+                arguments,
+                function_id,
+                current_instruction_bytes,
+                &mut string_operand_cache,
+                instruction,
+                closure_environment,
+            )? {
+                ScalarInstructionResult::Continue => {
+                    instruction_index += 1;
+                }
+                ScalarInstructionResult::Jump(target) => {
+                    if let Some(target_index) = jump_index_cache[instruction_index] {
+                        instruction_index = target_index;
+                    } else {
+                        let target_index = instructions
+                            .binary_search_by_key(&target, |instruction| instruction.offset)
+                            .map_err(|_| ParseError::InvalidJumpTarget {
+                                function_id,
+                                offset: instruction.offset,
+                                opcode: instruction.opcode,
+                                target: i64::from(target),
+                                body_start: body.offset,
+                                body_end: body.offset + body.len(),
+                            })?;
+                        jump_index_cache[instruction_index] = Some(target_index);
+                        instruction_index = target_index;
+                    }
+                }
+                ScalarInstructionResult::Return(value) => {
+                    return Ok(ScalarExecutionReport {
+                        value,
+                        declared_globals: state.declared_globals.clone(),
+                    });
+                }
             }
         }
     }
 
     Err(ScalarExecutionError::MissingReturn { function_id })
+}
+
+fn scalar_math_lookup_pair_candidates<'a>(
+    bytecode: &HermesBytecode<'a>,
+    function_id: u32,
+    instructions: &[HermesInstruction],
+    instruction_bytes: &[&[u8]],
+) -> Option<Vec<bool>> {
+    let mut candidates = None;
+    for instruction_index in 0..instructions.len().saturating_sub(1) {
+        let instruction = instructions[instruction_index];
+        let next_instruction = instructions[instruction_index + 1];
+        if instruction.opcode != 72 || next_instruction.opcode != 68 {
+            continue;
+        }
+
+        let current_bytes = instruction_bytes[instruction_index];
+        let next_bytes = instruction_bytes[instruction_index + 1];
+        let math_destination = read_unsigned_operand(current_bytes, 1, 1);
+        let next_base_register = read_unsigned_operand(next_bytes, 2, 1);
+        if next_base_register != math_destination {
+            continue;
+        }
+
+        let math_string_id = read_unsigned_operand(current_bytes, 4, 2);
+        let Ok(math_property_name) =
+            read_scalar_string_operand(bytecode, function_id, instruction, math_string_id)
+        else {
+            continue;
+        };
+        if math_property_name != "Math" {
+            continue;
+        }
+
+        let intrinsic_string_id = read_unsigned_operand(next_bytes, 4, 1);
+        let Ok(intrinsic_property_name) = read_scalar_string_operand(
+            bytecode,
+            function_id,
+            next_instruction,
+            intrinsic_string_id,
+        ) else {
+            continue;
+        };
+        if read_scalar_math_intrinsic_property(intrinsic_property_name).is_some() {
+            let candidates = candidates.get_or_insert_with(|| vec![false; instructions.len()]);
+            candidates[instruction_index] = true;
+        }
+    }
+
+    candidates
+}
+
+fn try_execute_scalar_math_lookup_pair<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
+    registers: &mut [ScalarValue],
+    function_id: u32,
+    instructions: &[HermesInstruction],
+    instruction_bytes: &[&[u8]],
+    string_operand_cache: &mut ScalarStringOperandCache<'a>,
+    instruction_index: usize,
+) -> Result<Option<usize>, ScalarExecutionError> {
+    let Some(next_instruction_index) = instruction_index.checked_add(1) else {
+        return Ok(None);
+    };
+    let Some(next_instruction) = instructions.get(next_instruction_index).copied() else {
+        return Ok(None);
+    };
+
+    let instruction = instructions[instruction_index];
+    if instruction.opcode != 72 || next_instruction.opcode != 68 {
+        return Ok(None);
+    }
+
+    let current_bytes = instruction_bytes[instruction_index];
+    let next_bytes = instruction_bytes[next_instruction_index];
+    let math_destination = read_unsigned_operand(current_bytes, 1, 1);
+    let global_register = read_unsigned_operand(current_bytes, 2, 1);
+    let math_string_id = read_unsigned_operand(current_bytes, 4, 2);
+    let math_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instruction,
+        math_string_id,
+    )?;
+    if math_property_name != "Math"
+        || !matches!(
+            registers.get(global_register as usize),
+            Some(ScalarValue::Object(ScalarObjectHandle::Global))
+        )
+    {
+        return Ok(None);
+    }
+
+    let next_destination = read_unsigned_operand(next_bytes, 1, 1);
+    let next_base_register = read_unsigned_operand(next_bytes, 2, 1);
+    if next_base_register != math_destination {
+        return Ok(None);
+    }
+
+    let intrinsic_string_id = read_unsigned_operand(next_bytes, 4, 1);
+    let intrinsic_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        next_instruction,
+        intrinsic_string_id,
+    )?;
+    let Some(intrinsic_value) = read_scalar_math_intrinsic_property(intrinsic_property_name) else {
+        return Ok(None);
+    };
+
+    let math_value = read_cached_scalar_global_property(state, math_string_id, math_property_name);
+    if math_value != ScalarValue::Object(ScalarObjectHandle::Math)
+        || !state.object_getters.is_empty()
+        || read_scalar_object_prototype(state, ScalarObjectHandle::Math).is_some()
+        || read_scalar_own_object_property(state, ScalarObjectHandle::Math, intrinsic_property_name)
+            .is_some()
+    {
+        return Ok(None);
+    }
+
+    write_scalar_register(
+        registers,
+        function_id,
+        instruction,
+        math_destination,
+        math_value,
+    )?;
+    write_scalar_register(
+        registers,
+        function_id,
+        next_instruction,
+        next_destination,
+        intrinsic_value,
+    )?;
+    Ok(Some(next_instruction_index + 1))
 }
 
 fn profile_scalar_function<'a>(
@@ -9875,6 +10079,15 @@ fn read_scalar_builtin_global_property(
     }
 }
 
+fn read_scalar_math_intrinsic_property(property_name: &str) -> Option<ScalarValue> {
+    match property_name {
+        "round" => Some(ScalarValue::Function(ScalarFunctionHandle::NativeMathRound)),
+        "sin" => Some(ScalarValue::Function(ScalarFunctionHandle::NativeMathSin)),
+        "sqrt" => Some(ScalarValue::Function(ScalarFunctionHandle::NativeMathSqrt)),
+        _ => None,
+    }
+}
+
 fn read_scalar_object_property(
     state: &ScalarExecutorState<'_>,
     handle: ScalarObjectHandle,
@@ -9933,11 +10146,8 @@ fn read_scalar_intrinsic_object_property(
         ));
     }
     if handle == ScalarObjectHandle::Math {
-        match property_name {
-            "round" => return Some(ScalarValue::Function(ScalarFunctionHandle::NativeMathRound)),
-            "sin" => return Some(ScalarValue::Function(ScalarFunctionHandle::NativeMathSin)),
-            "sqrt" => return Some(ScalarValue::Function(ScalarFunctionHandle::NativeMathSqrt)),
-            _ => {}
+        if let Some(value) = read_scalar_math_intrinsic_property(property_name) {
+            return Some(value);
         }
     }
     if handle == ScalarObjectHandle::Json {

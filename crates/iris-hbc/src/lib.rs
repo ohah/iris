@@ -3010,6 +3010,8 @@ struct ScalarExecutorState<'a> {
     next_environment_id: u32,
     next_object_id: u32,
     object_getters: Vec<(ScalarObjectHandle, &'a str, ScalarValue)>,
+    object_property_operand_cache:
+        [Option<(ScalarObjectHandle, u32, usize)>; SCALAR_STRING_OPERAND_CACHE_SLOTS],
     object_property_indices: HashMap<(ScalarObjectHandle, &'a str), usize>,
     object_property_names: HashMap<ScalarObjectHandle, Vec<&'a str>>,
     object_prototypes: Vec<(ScalarObjectHandle, ScalarValue)>,
@@ -5034,13 +5036,14 @@ fn execute_scalar_instruction<'a>(
                 write_scalar_register(registers, function_id, instruction, destination, value)?;
                 return Ok(ScalarInstructionResult::Continue);
             }
-            let value = read_scalar_property(
+            let value = read_cached_scalar_property(
                 bytecode,
                 state,
                 registers,
                 function_id,
                 instruction,
                 base_register,
+                string_id,
                 property_name,
             )?;
             write_scalar_register(registers, function_id, instruction, destination, value)?;
@@ -5068,13 +5071,14 @@ fn execute_scalar_instruction<'a>(
                 write_scalar_register(registers, function_id, instruction, destination, value)?;
                 return Ok(ScalarInstructionResult::Continue);
             }
-            let value = read_scalar_property(
+            let value = read_cached_scalar_property(
                 bytecode,
                 state,
                 registers,
                 function_id,
                 instruction,
                 base_register,
+                string_id,
                 property_name,
             )?;
             write_scalar_register(registers, function_id, instruction, destination, value)?;
@@ -5097,6 +5101,30 @@ fn execute_scalar_instruction<'a>(
                 Some(ScalarValue::Object(ScalarObjectHandle::Global))
             ) {
                 write_cached_scalar_global_property(state, string_id, property_name, value);
+                return Ok(ScalarInstructionResult::Continue);
+            }
+            if let Some(ScalarValue::Object(
+                handle @ (ScalarObjectHandle::HermesInternal
+                | ScalarObjectHandle::Console
+                | ScalarObjectHandle::Json
+                | ScalarObjectHandle::Object(_)
+                | ScalarObjectHandle::NativePrototype(_)
+                | ScalarObjectHandle::Array(_)
+                | ScalarObjectHandle::Uint8Array(_)
+                | ScalarObjectHandle::Map(_)
+                | ScalarObjectHandle::Set(_)
+                | ScalarObjectHandle::WeakMap(_)
+                | ScalarObjectHandle::WeakSet(_)
+                | ScalarObjectHandle::NativeModule(_)),
+            )) = registers.get(base_register as usize).copied()
+            {
+                write_cached_scalar_named_object_property(
+                    state,
+                    handle,
+                    string_id,
+                    property_name,
+                    value,
+                );
                 return Ok(ScalarInstructionResult::Continue);
             }
             write_scalar_property(
@@ -8720,6 +8748,55 @@ fn read_scalar_property<'a>(
     }
 }
 
+fn read_cached_scalar_property<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
+    registers: &[ScalarValue],
+    function_id: u32,
+    instruction: HermesInstruction,
+    base_register: u32,
+    string_id: u32,
+    property_name: &'a str,
+) -> Result<ScalarValue, ScalarExecutionError> {
+    let Some(ScalarValue::Object(
+        handle @ (ScalarObjectHandle::HermesInternal
+        | ScalarObjectHandle::Console
+        | ScalarObjectHandle::Math
+        | ScalarObjectHandle::Json
+        | ScalarObjectHandle::Object(_)
+        | ScalarObjectHandle::NativePrototype(_)
+        | ScalarObjectHandle::Array(_)
+        | ScalarObjectHandle::Uint8Array(_)
+        | ScalarObjectHandle::Map(_)
+        | ScalarObjectHandle::Set(_)
+        | ScalarObjectHandle::WeakMap(_)
+        | ScalarObjectHandle::WeakSet(_)
+        | ScalarObjectHandle::NativeModule(_)),
+    )) = registers.get(base_register as usize).copied()
+    else {
+        return read_scalar_property(
+            bytecode,
+            state,
+            registers,
+            function_id,
+            instruction,
+            base_register,
+            property_name,
+        );
+    };
+
+    read_cached_scalar_object_property_for_get(
+        bytecode,
+        state,
+        function_id,
+        instruction,
+        ScalarValue::Object(handle),
+        handle,
+        string_id,
+        property_name,
+    )
+}
+
 fn read_scalar_object_property_for_get<'a>(
     bytecode: &HermesBytecode<'a>,
     state: &mut ScalarExecutorState<'a>,
@@ -8764,6 +8841,38 @@ fn read_scalar_object_property_for_get<'a>(
             Ok(read_scalar_object_property(state, handle, property_name))
         }
     }
+}
+
+fn read_cached_scalar_object_property_for_get<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
+    function_id: u32,
+    instruction: HermesInstruction,
+    receiver: ScalarValue,
+    handle: ScalarObjectHandle,
+    string_id: u32,
+    property_name: &'a str,
+) -> Result<ScalarValue, ScalarExecutionError> {
+    if state.object_getters.is_empty() && read_scalar_object_prototype(state, handle).is_none() {
+        if let Some(value) =
+            read_cached_scalar_own_object_property(state, handle, string_id, property_name)
+        {
+            return Ok(value);
+        }
+        if let Some(value) = read_scalar_intrinsic_object_property(state, handle, property_name) {
+            return Ok(value);
+        }
+    }
+
+    read_scalar_object_property_for_get(
+        bytecode,
+        state,
+        function_id,
+        instruction,
+        receiver,
+        handle,
+        property_name,
+    )
 }
 
 fn read_scalar_property_key<'a>(
@@ -9418,20 +9527,30 @@ fn write_scalar_named_object_property<'a>(
     property_name: &'a str,
     value: ScalarValue,
 ) {
+    write_scalar_named_object_property_index(state, object, property_name, value);
+}
+
+fn write_scalar_named_object_property_index<'a>(
+    state: &mut ScalarExecutorState<'a>,
+    object: ScalarObjectHandle,
+    property_name: &'a str,
+    value: ScalarValue,
+) -> usize {
     if !state.object_getters.is_empty() {
         state.object_getters.retain(|(stored_object, name, _)| {
             !(*stored_object == object && *name == property_name)
         });
     }
     if state.object_properties.len() <= SCALAR_LINEAR_OBJECT_PROPERTY_LIMIT {
-        if let Some((_, _, stored_value)) = state
-            .object_properties
-            .iter_mut()
-            .rev()
-            .find(|(stored_object, name, _)| *stored_object == object && *name == property_name)
+        if let Some((property_index, (_, _, stored_value))) =
+            state.object_properties.iter_mut().enumerate().rev().find(
+                |(_, (stored_object, name, _))| {
+                    *stored_object == object && scalar_property_name_matches(name, property_name)
+                },
+            )
         {
             *stored_value = value;
-            return;
+            return property_index;
         }
     }
     if let Some(property_index) = state
@@ -9440,6 +9559,7 @@ fn write_scalar_named_object_property<'a>(
         .copied()
     {
         state.object_properties[property_index].2 = value;
+        property_index
     } else {
         let property_index = state.object_properties.len();
         state
@@ -9451,7 +9571,20 @@ fn write_scalar_named_object_property<'a>(
             .or_default()
             .push(property_name);
         state.object_properties.push((object, property_name, value));
+        property_index
     }
+}
+
+fn write_cached_scalar_named_object_property<'a>(
+    state: &mut ScalarExecutorState<'a>,
+    object: ScalarObjectHandle,
+    string_id: u32,
+    property_name: &'a str,
+    value: ScalarValue,
+) {
+    let index = write_scalar_named_object_property_index(state, object, property_name, value);
+    state.object_property_operand_cache[scalar_string_operand_cache_slot(string_id)] =
+        Some((object, string_id, index));
 }
 
 fn write_scalar_named_object_getter_property<'a>(
@@ -9477,6 +9610,7 @@ fn write_scalar_named_object_getter_property<'a>(
 }
 
 fn reindex_scalar_object_properties<'a>(state: &mut ScalarExecutorState<'a>) {
+    clear_scalar_object_property_operand_cache(state);
     state.object_property_indices.clear();
     state.object_property_names.clear();
     for (index, (object, name, _)) in state.object_properties.iter().enumerate() {
@@ -9523,6 +9657,10 @@ fn scalar_string_operand_cache_slot(string_id: u32) -> usize {
 
 fn clear_scalar_global_property_operand_cache(state: &mut ScalarExecutorState<'_>) {
     state.global_property_operand_cache = [None; SCALAR_STRING_OPERAND_CACHE_SLOTS];
+}
+
+fn clear_scalar_object_property_operand_cache(state: &mut ScalarExecutorState<'_>) {
+    state.object_property_operand_cache = [None; SCALAR_STRING_OPERAND_CACHE_SLOTS];
 }
 
 fn scalar_global_property_index(
@@ -9587,6 +9725,53 @@ fn write_scalar_global_property<'a>(
     let index = state.global_properties.len();
     state.global_properties.push((property_name, value));
     index
+}
+
+fn scalar_own_object_property_index(
+    state: &ScalarExecutorState<'_>,
+    object: ScalarObjectHandle,
+    property_name: &str,
+) -> Option<usize> {
+    if state.object_properties.len() <= SCALAR_LINEAR_OBJECT_PROPERTY_LIMIT {
+        return state
+            .object_properties
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, (stored_object, name, _))| {
+                *stored_object == object && scalar_property_name_matches(name, property_name)
+            })
+            .map(|(index, _)| index);
+    }
+
+    state
+        .object_property_indices
+        .get(&(object, property_name))
+        .copied()
+}
+
+fn read_cached_scalar_own_object_property<'a>(
+    state: &mut ScalarExecutorState<'a>,
+    object: ScalarObjectHandle,
+    string_id: u32,
+    property_name: &'a str,
+) -> Option<ScalarValue> {
+    let slot = scalar_string_operand_cache_slot(string_id);
+    if let Some((cached_object, cached_id, index)) = state.object_property_operand_cache[slot] {
+        if cached_object == object && cached_id == string_id {
+            if let Some((stored_object, stored_name, value)) = state.object_properties.get(index) {
+                if *stored_object == object
+                    && scalar_property_name_matches(stored_name, property_name)
+                {
+                    return Some(*value);
+                }
+            }
+        }
+    }
+
+    let index = scalar_own_object_property_index(state, object, property_name)?;
+    state.object_property_operand_cache[slot] = Some((object, string_id, index));
+    Some(state.object_properties[index].2)
 }
 
 fn read_scalar_global_property(

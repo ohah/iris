@@ -29,6 +29,7 @@ mise run bench-strict-hbc-engine-compare-repeat
 mise run bench-strict-hbc-compare-artifacts
 mise run bench-strict-hbc-compare-gate
 mise run bench-strict-hbc-call-targets
+mise run bench-strict-hbc-global-access
 mise run bench-strict-hbc-math-lookup
 mise run bench-strict-hbc-profile
 mise run bench-strict-hbc-source-shape
@@ -85,6 +86,7 @@ mise run check
 - `bench-strict-hbc-engine-compare-repeat`는 같은 strict HBC 비교를 여러 번 실행하고 첫 noisy run을 제외한 stability summary를 만든다.
 - `bench-strict-hbc-compare-artifacts`는 이미 생성된 strict HBC single artifact 또는 repeat summary 두 개를 비교해 Iris p50/p95와 Hermes 대비 ratio 변화를 출력한다.
 - `bench-strict-hbc-compare-gate`는 같은 비교를 수행하되 checksum mismatch, unstable repeat summary, threshold 초과 회귀를 exit code 실패로 만든다.
+- `bench-strict-hbc-global-access`는 같은 계산을 전역 `var` read/write와 top-level lexical binding으로 각각 실행해 global property 접근 비용만 분리하는 diagnostic 비교다.
 - `bench-strict-hbc-math-lookup`은 native Math call 없이 반복 `Math.sin/sqrt` lookup 비용만 분리하는 diagnostic 비교다.
 - `bench-strict-hbc-profile`은 strict HBC case별 Iris scalar executor 동적 opcode/property/call hot path를 텍스트와 JSON으로 출력한다. 기본 JSON 출력은 `artifacts/bench/strict-hbc-profile.json`이며 `--json-output=...`으로 바꿀 수 있다. 성능 ratio가 아니라 최적화 후보 선정용 계측이다.
 - `bench-strict-hbc-source-shape`는 전역 `var` 기반 case와 top-level lexical binding case를 같은 HBC 비교 하네스에서 실행해 source shape가 Iris/Hermes ratio에 주는 영향을 분리한다. 기본 strict 비교에는 lexical diagnostic case를 자동 포함하지 않는다.

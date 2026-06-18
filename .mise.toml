@@ -169,6 +169,10 @@ run = "bun run bench:strict-hbc-compare-artifacts"
 description = "Fail when a strict HBC candidate artifact regresses beyond the configured threshold"
 run = "bun run bench:strict-hbc-compare-gate"
 
+[tasks.bench-strict-hbc-global-access]
+description = "Compare strict Hermes bytecode global property access against lexical locals"
+run = "bun run bench:strict-hbc-global-access"
+
 [tasks.bench-strict-hbc-math-lookup]
 description = "Compare strict Hermes bytecode Math lookup-only variants"
 run = "bun run bench:strict-hbc-math-lookup"

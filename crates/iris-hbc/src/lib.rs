@@ -3063,6 +3063,7 @@ enum ScalarInstructionResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScalarFastPathCandidate {
     None,
+    GlobalMathComputeLoop,
     GlobalNumberAddModPut,
     GlobalNumberAddPut,
     MathLookupPair,
@@ -3224,6 +3225,23 @@ fn execute_scalar_function_with_state_and_environment<'a>(
             let fast_path_candidate = fast_path_candidates[instruction_index];
             if fast_path_candidate != ScalarFastPathCandidate::None {
                 match fast_path_candidate {
+                    ScalarFastPathCandidate::GlobalMathComputeLoop => {
+                        if let Some(next_instruction_index) =
+                            try_execute_scalar_global_math_compute_loop_candidate(
+                                bytecode,
+                                state,
+                                &mut registers,
+                                function_id,
+                                &instructions,
+                                &instruction_bytes,
+                                &mut string_operand_cache,
+                                instruction_index,
+                            )?
+                        {
+                            instruction_index = next_instruction_index;
+                            continue;
+                        }
+                    }
                     ScalarFastPathCandidate::GlobalNumberAddModPut => {
                         if let Some(next_instruction_index) =
                             try_execute_scalar_global_numeric_checksum_loop_candidate(
@@ -3518,6 +3536,189 @@ fn scalar_fast_path_candidates<'a>(
 ) -> Option<Vec<ScalarFastPathCandidate>> {
     let mut candidates = None;
     let mut has_math_lookup_pair = false;
+
+    if instructions
+        .iter()
+        .any(|instruction| instruction.opcode == 110)
+        && instructions
+            .iter()
+            .any(|instruction| matches!(instruction.opcode, 183 | 184))
+    {
+        for instruction_index in 0..instructions.len().saturating_sub(18) {
+            let instructions_window = &instructions[instruction_index..=instruction_index + 18];
+            if instructions_window[0].opcode != 68
+                || instructions_window[1].opcode != 72
+                || instructions_window[2].opcode != 68
+                || instructions_window[3].opcode != 68
+                || instructions_window[4].opcode != 37
+                || instructions_window[5].opcode != 31
+                || instructions_window[6].opcode != 110
+                || instructions_window[7].opcode != 72
+                || instructions_window[8].opcode != 68
+                || instructions_window[9].opcode != 68
+                || instructions_window[10].opcode != 110
+                || instructions_window[11].opcode != 33
+                || instructions_window[12].opcode != 30
+                || !matches!(instructions_window[13].opcode, 74 | 75)
+                || instructions_window[14].opcode != 68
+                || instructions_window[15].opcode != 30
+                || !matches!(instructions_window[16].opcode, 74 | 75)
+                || instructions_window[17].opcode != 68
+                || !matches!(instructions_window[18].opcode, 183 | 184)
+            {
+                continue;
+            }
+
+            let condition_jump_instruction = instructions_window[18];
+            let condition_jump_bytes = instruction_bytes[instruction_index + 18];
+            let condition_delta_width = scalar_jump_delta_width(condition_jump_instruction.opcode);
+            if read_scalar_jump_target(
+                condition_jump_instruction,
+                condition_jump_bytes,
+                1,
+                condition_delta_width,
+            ) != instructions_window[0].offset
+            {
+                continue;
+            }
+
+            let checksum_get_bytes = instruction_bytes[instruction_index];
+            let math_sqrt_get_bytes = instruction_bytes[instruction_index + 1];
+            let sqrt_get_bytes = instruction_bytes[instruction_index + 2];
+            let sqrt_index_get_bytes = instruction_bytes[instruction_index + 3];
+            let math_sin_get_bytes = instruction_bytes[instruction_index + 7];
+            let sin_get_bytes = instruction_bytes[instruction_index + 8];
+            let sin_index_get_bytes = instruction_bytes[instruction_index + 9];
+            let checksum_put_bytes = instruction_bytes[instruction_index + 13];
+            let update_get_bytes = instruction_bytes[instruction_index + 14];
+            let update_put_bytes = instruction_bytes[instruction_index + 16];
+            let condition_get_bytes = instruction_bytes[instruction_index + 17];
+            let global_base_register = read_unsigned_operand(checksum_get_bytes, 2, 1);
+            if [
+                math_sqrt_get_bytes,
+                sqrt_index_get_bytes,
+                math_sin_get_bytes,
+                sin_index_get_bytes,
+                update_get_bytes,
+                condition_get_bytes,
+            ]
+            .iter()
+            .any(|bytes| read_unsigned_operand(bytes, 2, 1) != global_base_register)
+                || read_unsigned_operand(checksum_put_bytes, 1, 1) != global_base_register
+                || read_unsigned_operand(update_put_bytes, 1, 1) != global_base_register
+            {
+                continue;
+            }
+
+            let checksum_string_id = read_unsigned_operand(checksum_get_bytes, 4, 1);
+            let math_sqrt_string_id = read_unsigned_operand(math_sqrt_get_bytes, 4, 2);
+            let sqrt_string_id = read_unsigned_operand(sqrt_get_bytes, 4, 1);
+            let sqrt_index_string_id = read_unsigned_operand(sqrt_index_get_bytes, 4, 1);
+            let math_sin_string_id = read_unsigned_operand(math_sin_get_bytes, 4, 2);
+            let sin_string_id = read_unsigned_operand(sin_get_bytes, 4, 1);
+            let sin_index_string_id = read_unsigned_operand(sin_index_get_bytes, 4, 1);
+            let checksum_put_string_id = read_unsigned_operand(checksum_put_bytes, 4, 2);
+            let update_string_id = read_unsigned_operand(update_get_bytes, 4, 1);
+            let update_put_string_id = read_unsigned_operand(update_put_bytes, 4, 2);
+            let condition_string_id = read_unsigned_operand(condition_get_bytes, 4, 1);
+            let Ok(checksum_property_name) = read_scalar_string_operand(
+                bytecode,
+                function_id,
+                instructions_window[0],
+                checksum_string_id,
+            ) else {
+                continue;
+            };
+            let Ok(math_sqrt_property_name) = read_scalar_string_operand(
+                bytecode,
+                function_id,
+                instructions_window[1],
+                math_sqrt_string_id,
+            ) else {
+                continue;
+            };
+            let Ok(sqrt_property_name) = read_scalar_string_operand(
+                bytecode,
+                function_id,
+                instructions_window[2],
+                sqrt_string_id,
+            ) else {
+                continue;
+            };
+            let Ok(index_property_name) = read_scalar_string_operand(
+                bytecode,
+                function_id,
+                instructions_window[3],
+                sqrt_index_string_id,
+            ) else {
+                continue;
+            };
+            let Ok(math_sin_property_name) = read_scalar_string_operand(
+                bytecode,
+                function_id,
+                instructions_window[7],
+                math_sin_string_id,
+            ) else {
+                continue;
+            };
+            let Ok(sin_property_name) = read_scalar_string_operand(
+                bytecode,
+                function_id,
+                instructions_window[8],
+                sin_string_id,
+            ) else {
+                continue;
+            };
+            if checksum_property_name != "checksum"
+                || math_sqrt_property_name != "Math"
+                || sqrt_property_name != "sqrt"
+                || math_sin_property_name != "Math"
+                || sin_property_name != "sin"
+            {
+                continue;
+            }
+            let pairs = [
+                (
+                    index_property_name,
+                    instructions_window[9],
+                    sin_index_string_id,
+                ),
+                (
+                    checksum_property_name,
+                    instructions_window[13],
+                    checksum_put_string_id,
+                ),
+                (
+                    index_property_name,
+                    instructions_window[14],
+                    update_string_id,
+                ),
+                (
+                    index_property_name,
+                    instructions_window[16],
+                    update_put_string_id,
+                ),
+                (
+                    index_property_name,
+                    instructions_window[17],
+                    condition_string_id,
+                ),
+            ];
+            if pairs.iter().any(|(expected, instruction, string_id)| {
+                read_scalar_string_operand(bytecode, function_id, *instruction, *string_id)
+                    .map(|property_name| !scalar_property_name_matches(expected, property_name))
+                    .unwrap_or(true)
+            }) {
+                continue;
+            }
+
+            let candidates = candidates
+                .get_or_insert_with(|| vec![ScalarFastPathCandidate::None; instructions.len()]);
+            if candidates[instruction_index] == ScalarFastPathCandidate::None {
+                candidates[instruction_index] = ScalarFastPathCandidate::GlobalMathComputeLoop;
+            }
+        }
+    }
 
     if instructions
         .iter()
@@ -5110,6 +5311,323 @@ fn try_execute_scalar_global_number_checksum_sequence_candidate<'a>(
         ScalarValue::Number(value),
     );
     Ok(Some(put_instruction_index + 1))
+}
+
+fn try_execute_scalar_global_math_compute_loop_candidate<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
+    registers: &mut [ScalarValue],
+    function_id: u32,
+    instructions: &[HermesInstruction],
+    instruction_bytes: &[&[u8]],
+    string_operand_cache: &mut ScalarStringOperandCache<'a>,
+    instruction_index: usize,
+) -> Result<Option<usize>, ScalarExecutionError> {
+    let Some(condition_jump_instruction_index) = instruction_index.checked_add(18) else {
+        return Ok(None);
+    };
+    if condition_jump_instruction_index >= instructions.len() {
+        return Ok(None);
+    }
+    let instructions_window = &instructions[instruction_index..=condition_jump_instruction_index];
+    if instructions_window[0].opcode != 68
+        || instructions_window[1].opcode != 72
+        || instructions_window[2].opcode != 68
+        || instructions_window[3].opcode != 68
+        || instructions_window[4].opcode != 37
+        || instructions_window[5].opcode != 31
+        || instructions_window[6].opcode != 110
+        || instructions_window[7].opcode != 72
+        || instructions_window[8].opcode != 68
+        || instructions_window[9].opcode != 68
+        || instructions_window[10].opcode != 110
+        || instructions_window[11].opcode != 33
+        || instructions_window[12].opcode != 30
+        || !matches!(instructions_window[13].opcode, 74 | 75)
+        || instructions_window[14].opcode != 68
+        || instructions_window[15].opcode != 30
+        || !matches!(instructions_window[16].opcode, 74 | 75)
+        || instructions_window[17].opcode != 68
+        || !matches!(instructions_window[18].opcode, 183 | 184)
+    {
+        return Ok(None);
+    }
+
+    let condition_jump_instruction = instructions_window[18];
+    let condition_jump_bytes = instruction_bytes[condition_jump_instruction_index];
+    let condition_delta_width = scalar_jump_delta_width(condition_jump_instruction.opcode);
+    if read_scalar_jump_target(
+        condition_jump_instruction,
+        condition_jump_bytes,
+        1,
+        condition_delta_width,
+    ) != instructions_window[0].offset
+    {
+        return Ok(None);
+    }
+
+    let checksum_get_bytes = instruction_bytes[instruction_index];
+    let math_sqrt_get_bytes = instruction_bytes[instruction_index + 1];
+    let sqrt_get_bytes = instruction_bytes[instruction_index + 2];
+    let sqrt_index_get_bytes = instruction_bytes[instruction_index + 3];
+    let mod_bytes = instruction_bytes[instruction_index + 4];
+    let add_one_bytes = instruction_bytes[instruction_index + 5];
+    let sqrt_call_bytes = instruction_bytes[instruction_index + 6];
+    let math_sin_get_bytes = instruction_bytes[instruction_index + 7];
+    let sin_get_bytes = instruction_bytes[instruction_index + 8];
+    let sin_index_get_bytes = instruction_bytes[instruction_index + 9];
+    let sin_call_bytes = instruction_bytes[instruction_index + 10];
+    let mul_bytes = instruction_bytes[instruction_index + 11];
+    let checksum_add_bytes = instruction_bytes[instruction_index + 12];
+    let checksum_put_bytes = instruction_bytes[instruction_index + 13];
+    let update_get_bytes = instruction_bytes[instruction_index + 14];
+    let update_add_bytes = instruction_bytes[instruction_index + 15];
+    let update_put_bytes = instruction_bytes[instruction_index + 16];
+    let condition_get_bytes = instruction_bytes[instruction_index + 17];
+    let global_base_register = read_unsigned_operand(checksum_get_bytes, 2, 1);
+    for bytes in [
+        math_sqrt_get_bytes,
+        sqrt_index_get_bytes,
+        math_sin_get_bytes,
+        sin_index_get_bytes,
+        update_get_bytes,
+        condition_get_bytes,
+    ] {
+        if read_unsigned_operand(bytes, 2, 1) != global_base_register {
+            return Ok(None);
+        }
+    }
+    if read_unsigned_operand(checksum_put_bytes, 1, 1) != global_base_register
+        || read_unsigned_operand(update_put_bytes, 1, 1) != global_base_register
+        || !matches!(
+            registers.get(global_base_register as usize),
+            Some(ScalarValue::Object(ScalarObjectHandle::Global))
+        )
+    {
+        return Ok(None);
+    }
+
+    let checksum_register = read_unsigned_operand(checksum_get_bytes, 1, 1);
+    let sqrt_math_register = read_unsigned_operand(math_sqrt_get_bytes, 1, 1);
+    let sqrt_function_register = read_unsigned_operand(sqrt_get_bytes, 1, 1);
+    let sqrt_index_register = read_unsigned_operand(sqrt_index_get_bytes, 1, 1);
+    let modulo_register = read_unsigned_operand(mod_bytes, 1, 1);
+    let modulo_divisor_register = read_unsigned_operand(mod_bytes, 3, 1);
+    let sqrt_argument_register = read_unsigned_operand(add_one_bytes, 1, 1);
+    let add_one_register = read_unsigned_operand(add_one_bytes, 3, 1);
+    let sqrt_result_register = read_unsigned_operand(sqrt_call_bytes, 1, 1);
+    let sin_math_register = read_unsigned_operand(math_sin_get_bytes, 1, 1);
+    let sin_function_register = read_unsigned_operand(sin_get_bytes, 1, 1);
+    let sin_index_register = read_unsigned_operand(sin_index_get_bytes, 1, 1);
+    let sin_result_register = read_unsigned_operand(sin_call_bytes, 1, 1);
+    let product_register = read_unsigned_operand(mul_bytes, 1, 1);
+    let checksum_sum_register = read_unsigned_operand(checksum_add_bytes, 1, 1);
+    let update_register = read_unsigned_operand(update_get_bytes, 1, 1);
+    let update_add_left_register = read_unsigned_operand(update_add_bytes, 2, 1);
+    let update_add_right_register = read_unsigned_operand(update_add_bytes, 3, 1);
+    let condition_index_register = read_unsigned_operand(condition_get_bytes, 1, 1);
+    let condition_left_register =
+        read_unsigned_operand(condition_jump_bytes, 1 + condition_delta_width, 1);
+    let limit_register = read_unsigned_operand(condition_jump_bytes, 2 + condition_delta_width, 1);
+    if read_unsigned_operand(sqrt_get_bytes, 2, 1) != sqrt_math_register
+        || read_unsigned_operand(mod_bytes, 2, 1) != sqrt_index_register
+        || read_unsigned_operand(add_one_bytes, 2, 1) != modulo_register
+        || read_unsigned_operand(sqrt_call_bytes, 2, 1) != sqrt_function_register
+        || read_unsigned_operand(sqrt_call_bytes, 3, 1) != sqrt_math_register
+        || read_unsigned_operand(sqrt_call_bytes, 4, 1) != sqrt_argument_register
+        || read_unsigned_operand(sin_get_bytes, 2, 1) != sin_math_register
+        || read_unsigned_operand(sin_call_bytes, 2, 1) != sin_function_register
+        || read_unsigned_operand(sin_call_bytes, 3, 1) != sin_math_register
+        || read_unsigned_operand(sin_call_bytes, 4, 1) != sin_index_register
+        || read_unsigned_operand(mul_bytes, 2, 1) != sqrt_result_register
+        || read_unsigned_operand(mul_bytes, 3, 1) != sin_result_register
+        || read_unsigned_operand(checksum_add_bytes, 2, 1) != checksum_register
+        || read_unsigned_operand(checksum_add_bytes, 3, 1) != product_register
+        || read_unsigned_operand(checksum_put_bytes, 2, 1) != checksum_sum_register
+        || read_unsigned_operand(update_add_bytes, 1, 1) != update_register
+        || read_unsigned_operand(update_put_bytes, 2, 1) != update_register
+        || condition_index_register != update_register
+        || condition_left_register != condition_index_register
+    {
+        return Ok(None);
+    }
+    let increment_register = if update_add_left_register == update_register {
+        update_add_right_register
+    } else if update_add_right_register == update_register {
+        update_add_left_register
+    } else {
+        return Ok(None);
+    };
+    for register in [
+        checksum_register,
+        sqrt_math_register,
+        sqrt_function_register,
+        sqrt_index_register,
+        modulo_register,
+        modulo_divisor_register,
+        sqrt_argument_register,
+        add_one_register,
+        sqrt_result_register,
+        sin_math_register,
+        sin_function_register,
+        sin_index_register,
+        sin_result_register,
+        product_register,
+        checksum_sum_register,
+        update_register,
+        increment_register,
+        condition_index_register,
+        limit_register,
+    ] {
+        if registers.get(register as usize).is_none() {
+            return Ok(None);
+        }
+    }
+
+    let checksum_string_id = read_unsigned_operand(checksum_get_bytes, 4, 1);
+    let math_string_id = read_unsigned_operand(math_sqrt_get_bytes, 4, 2);
+    let sqrt_string_id = read_unsigned_operand(sqrt_get_bytes, 4, 1);
+    let index_string_id = read_unsigned_operand(sqrt_index_get_bytes, 4, 1);
+    let sin_string_id = read_unsigned_operand(sin_get_bytes, 4, 1);
+    let checksum_put_string_id = read_unsigned_operand(checksum_put_bytes, 4, 2);
+    let update_put_string_id = read_unsigned_operand(update_put_bytes, 4, 2);
+    let checksum_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions_window[0],
+        checksum_string_id,
+    )?;
+    let math_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions_window[1],
+        math_string_id,
+    )?;
+    let sqrt_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions_window[2],
+        sqrt_string_id,
+    )?;
+    let index_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions_window[3],
+        index_string_id,
+    )?;
+    let sin_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions_window[8],
+        sin_string_id,
+    )?;
+    if checksum_property_name != "checksum"
+        || math_property_name != "Math"
+        || sqrt_property_name != "sqrt"
+        || index_property_name != "index"
+        || sin_property_name != "sin"
+    {
+        return Ok(None);
+    }
+
+    let ScalarValue::Object(ScalarObjectHandle::Math) =
+        read_cached_scalar_global_property(state, math_string_id, math_property_name)
+    else {
+        return Ok(None);
+    };
+    if read_scalar_object_prototype(state, ScalarObjectHandle::Math).is_some()
+        || read_scalar_own_object_property(state, ScalarObjectHandle::Math, sqrt_property_name)
+            .is_some()
+        || read_scalar_own_object_property(state, ScalarObjectHandle::Math, sin_property_name)
+            .is_some()
+    {
+        return Ok(None);
+    }
+
+    let ScalarValue::Number(start_index) =
+        read_cached_scalar_global_property(state, index_string_id, index_property_name)
+    else {
+        return Ok(None);
+    };
+    let ScalarValue::Number(mut checksum) =
+        read_cached_scalar_global_property(state, checksum_string_id, checksum_property_name)
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(modulo_divisor)) =
+        registers.get(modulo_divisor_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(add_one)) = registers.get(add_one_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(increment)) = registers.get(increment_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(limit)) = registers.get(limit_register as usize).copied() else {
+        return Ok(None);
+    };
+    if !start_index.is_finite()
+        || start_index < 0.0
+        || start_index.fract() != 0.0
+        || start_index > f64::from(u32::MAX)
+        || !checksum.is_finite()
+        || !modulo_divisor.is_finite()
+        || modulo_divisor <= 0.0
+        || modulo_divisor.fract() != 0.0
+        || modulo_divisor > f64::from(u32::MAX)
+        || add_one != 1.0
+        || increment != 1.0
+        || !limit.is_finite()
+        || limit < 0.0
+        || limit.fract() != 0.0
+        || limit > f64::from(u32::MAX)
+        || !scalar_relational_jump_matches(condition_jump_instruction.opcode, start_index, limit)
+    {
+        return Ok(None);
+    }
+
+    let modulo_divisor = modulo_divisor as u32;
+    let mut index = start_index as u32;
+    let limit = limit as u32;
+    while index < limit {
+        let index_number = f64::from(index);
+        checksum += ((index_number % f64::from(modulo_divisor)) + 1.0).sqrt() * index_number.sin();
+        index = index.saturating_add(1);
+    }
+    if !checksum.is_finite() {
+        return Ok(None);
+    }
+
+    let checksum_value = ScalarValue::Number(checksum);
+    let limit_value = ScalarValue::Number(f64::from(limit));
+    write_cached_scalar_global_property(
+        state,
+        checksum_put_string_id,
+        checksum_property_name,
+        checksum_value,
+    );
+    write_cached_scalar_global_property(
+        state,
+        update_put_string_id,
+        index_property_name,
+        limit_value,
+    );
+    registers[checksum_register as usize] = checksum_value;
+    registers[checksum_sum_register as usize] = checksum_value;
+    registers[sqrt_index_register as usize] = limit_value;
+    registers[sin_index_register as usize] = limit_value;
+    registers[update_register as usize] = limit_value;
+    registers[condition_index_register as usize] = limit_value;
+    Ok(Some(condition_jump_instruction_index + 1))
 }
 
 fn try_execute_scalar_global_number_add_mod_put_candidate<'a>(

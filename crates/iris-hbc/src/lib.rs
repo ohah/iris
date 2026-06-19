@@ -10,6 +10,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Write as _;
 
+use serde::ser::{SerializeMap, SerializeSeq};
+
 #[cxx::bridge(namespace = "iris::hbc")]
 mod ffi {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3030,6 +3032,7 @@ struct ScalarExecutorState<'a> {
     array_storage: Vec<Option<Vec<ScalarValue>>>,
     declared_globals: Vec<&'a str>,
     dynamic_string_json_values: Vec<Option<serde_json::Value>>,
+    dynamic_string_json_snapshots: Vec<Option<ScalarJsonSnapshot<'a>>>,
     dynamic_strings: Vec<String>,
     environment_parents: Vec<(ScalarEnvironmentHandle, Option<ScalarEnvironmentHandle>)>,
     environment_slots: Vec<(ScalarEnvironmentHandle, u32, ScalarValue)>,
@@ -3057,6 +3060,50 @@ struct ScalarExecutorState<'a> {
     remaining_steps: Option<usize>,
     uint8_array_storage: Vec<Option<Vec<u8>>>,
     weak_map_entries: Vec<(ScalarObjectHandle, ScalarValue, ScalarValue)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ScalarJsonSnapshot<'a> {
+    Null,
+    Boolean(bool),
+    Number(f64),
+    String(String),
+    Array(Vec<ScalarJsonSnapshot<'a>>),
+    Object(Vec<(&'a str, ScalarJsonSnapshot<'a>)>),
+}
+
+impl serde::Serialize for ScalarJsonSnapshot<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            ScalarJsonSnapshot::Null => serializer.serialize_unit(),
+            ScalarJsonSnapshot::Boolean(value) => serializer.serialize_bool(*value),
+            ScalarJsonSnapshot::Number(value) => {
+                if value.fract() == 0.0 && *value >= i64::MIN as f64 && *value <= i64::MAX as f64 {
+                    serializer.serialize_i64(*value as i64)
+                } else {
+                    serializer.serialize_f64(*value)
+                }
+            }
+            ScalarJsonSnapshot::String(value) => serializer.serialize_str(value),
+            ScalarJsonSnapshot::Array(values) => {
+                let mut sequence = serializer.serialize_seq(Some(values.len()))?;
+                for value in values {
+                    sequence.serialize_element(value)?;
+                }
+                sequence.end()
+            }
+            ScalarJsonSnapshot::Object(values) => {
+                let mut map = serializer.serialize_map(Some(values.len()))?;
+                for (name, value) in values {
+                    map.serialize_entry(name, value)?;
+                }
+                map.end()
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -12705,7 +12752,8 @@ fn call_scalar_json_stringify<'a>(
         .first()
         .copied()
         .unwrap_or(ScalarValue::Undefined);
-    let Some(json_value) = scalar_value_to_json(bytecode, state, value, false, &mut Vec::new())
+    let Some(json_value) =
+        scalar_value_to_json_snapshot(bytecode, state, value, false, &mut Vec::new())
     else {
         return ScalarValue::Undefined;
     };
@@ -12724,6 +12772,25 @@ fn call_scalar_json_parse<'a>(
     let Some(value) = scalar_actual_arguments(arguments).first().copied() else {
         return ScalarValue::Undefined;
     };
+    let cached_json_snapshot = match value {
+        ScalarValue::DynamicString(handle) => state
+            .dynamic_string_json_snapshots
+            .get_mut(usize::try_from(handle.dynamic_id).expect("dynamic string id fits in usize"))
+            .and_then(Option::take)
+            .map(|json_value| (handle.dynamic_id, json_value)),
+        _ => None,
+    };
+    if let Some((dynamic_id, json_value)) = cached_json_snapshot {
+        let parsed_value = scalar_value_from_json_snapshot(bytecode, state, &json_value);
+        if let Some(slot) = state
+            .dynamic_string_json_snapshots
+            .get_mut(usize::try_from(dynamic_id).expect("dynamic string id fits in usize"))
+        {
+            *slot = Some(json_value);
+        }
+        return parsed_value;
+    }
+
     let cached_json_value = match value {
         ScalarValue::DynamicString(handle) => state
             .dynamic_string_json_values
@@ -12753,28 +12820,28 @@ fn call_scalar_json_parse<'a>(
     scalar_value_from_json(bytecode, state, &json_value)
 }
 
-fn scalar_value_to_json<'a>(
+fn scalar_value_to_json_snapshot<'a>(
     bytecode: &HermesBytecode<'a>,
     state: &ScalarExecutorState<'a>,
     value: ScalarValue,
     in_array: bool,
     stack: &mut Vec<ScalarObjectHandle>,
-) -> Option<serde_json::Value> {
+) -> Option<ScalarJsonSnapshot<'a>> {
     match value {
         ScalarValue::Empty | ScalarValue::Undefined | ScalarValue::Function(_) => {
-            in_array.then_some(serde_json::Value::Null)
+            in_array.then_some(ScalarJsonSnapshot::Null)
         }
-        ScalarValue::Null => Some(serde_json::Value::Null),
-        ScalarValue::Boolean(value) => Some(serde_json::Value::Bool(value)),
-        ScalarValue::Number(value) => serde_json::Number::from_f64(value)
-            .map(serde_json::Value::Number)
-            .or(Some(serde_json::Value::Null)),
+        ScalarValue::Null => Some(ScalarJsonSnapshot::Null),
+        ScalarValue::Boolean(value) => Some(ScalarJsonSnapshot::Boolean(value)),
+        ScalarValue::Number(value) => value
+            .is_finite()
+            .then_some(ScalarJsonSnapshot::Number(value)),
         ScalarValue::String(_) | ScalarValue::DynamicString(_) => {
             scalar_value_string_text(bytecode, state, value)
-                .map(|value| serde_json::Value::String(value.into_owned()))
+                .map(|value| ScalarJsonSnapshot::String(value.into_owned()))
         }
         ScalarValue::Symbol(_) | ScalarValue::Environment(_) => {
-            in_array.then_some(serde_json::Value::Null)
+            in_array.then_some(ScalarJsonSnapshot::Null)
         }
         ScalarValue::Object(object @ ScalarObjectHandle::Array(_)) => {
             if scalar_json_stack_contains(stack, object) {
@@ -12787,30 +12854,31 @@ fn scalar_value_to_json<'a>(
             for index in 0..length {
                 let value = read_scalar_array_element(state, object, index);
                 values.push(
-                    scalar_value_to_json(bytecode, state, value, true, stack)
-                        .unwrap_or(serde_json::Value::Null),
+                    scalar_value_to_json_snapshot(bytecode, state, value, true, stack)
+                        .unwrap_or(ScalarJsonSnapshot::Null),
                 );
             }
             stack.pop();
-            Some(serde_json::Value::Array(values))
+            Some(ScalarJsonSnapshot::Array(values))
         }
         ScalarValue::Object(object @ ScalarObjectHandle::Object(_)) => {
             if scalar_json_stack_contains(stack, object) {
                 return None;
             }
             stack.push(object);
-            let mut map = serde_json::Map::new();
+            let mut values = Vec::new();
             for property_name in scalar_json_object_property_names(state, object) {
                 let value = read_scalar_object_property(state, object, property_name);
-                if let Some(json_value) = scalar_value_to_json(bytecode, state, value, false, stack)
+                if let Some(json_value) =
+                    scalar_value_to_json_snapshot(bytecode, state, value, false, stack)
                 {
-                    map.insert(property_name.to_owned(), json_value);
+                    values.push((property_name, json_value));
                 }
             }
             stack.pop();
-            Some(serde_json::Value::Object(map))
+            Some(ScalarJsonSnapshot::Object(values))
         }
-        ScalarValue::Object(_) => Some(serde_json::Value::Object(serde_json::Map::new())),
+        ScalarValue::Object(_) => Some(ScalarJsonSnapshot::Object(Vec::new())),
     }
 }
 
@@ -12845,20 +12913,11 @@ fn scalar_value_from_json<'a>(
         serde_json::Value::String(value) => scalar_string_value_for_name(bytecode, value)
             .unwrap_or_else(|| allocate_scalar_dynamic_string(state, value.clone())),
         serde_json::Value::Array(values) => {
-            let array = allocate_scalar_array(
-                state,
-                u32::try_from(values.len()).expect("JSON array length fits in u32"),
-            );
-            for (index, value) in values.iter().enumerate() {
-                let value = scalar_value_from_json(bytecode, state, value);
-                write_scalar_array_element(
-                    state,
-                    array,
-                    u32::try_from(index).expect("JSON array index fits in u32"),
-                    value,
-                );
-            }
-            ScalarValue::Object(array)
+            let values = values
+                .iter()
+                .map(|value| scalar_value_from_json(bytecode, state, value))
+                .collect::<Vec<_>>();
+            ScalarValue::Object(allocate_scalar_array_with_values(state, values))
         }
         serde_json::Value::Object(values) => {
             let object = allocate_scalar_object(state);
@@ -12867,7 +12926,36 @@ fn scalar_value_from_json<'a>(
                     continue;
                 };
                 let value = scalar_value_from_json(bytecode, state, value);
-                write_scalar_named_object_property(state, object, name, value);
+                write_scalar_new_object_property(state, object, name, value);
+            }
+            ScalarValue::Object(object)
+        }
+    }
+}
+
+fn scalar_value_from_json_snapshot<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
+    value: &ScalarJsonSnapshot<'a>,
+) -> ScalarValue {
+    match value {
+        ScalarJsonSnapshot::Null => ScalarValue::Null,
+        ScalarJsonSnapshot::Boolean(value) => ScalarValue::Boolean(*value),
+        ScalarJsonSnapshot::Number(value) => ScalarValue::Number(*value),
+        ScalarJsonSnapshot::String(value) => scalar_string_value_for_name(bytecode, value)
+            .unwrap_or_else(|| allocate_scalar_dynamic_string(state, value.clone())),
+        ScalarJsonSnapshot::Array(values) => {
+            let values = values
+                .iter()
+                .map(|value| scalar_value_from_json_snapshot(bytecode, state, value))
+                .collect::<Vec<_>>();
+            ScalarValue::Object(allocate_scalar_array_with_values(state, values))
+        }
+        ScalarJsonSnapshot::Object(values) => {
+            let object = allocate_scalar_object(state);
+            for (name, value) in values {
+                let value = scalar_value_from_json_snapshot(bytecode, state, value);
+                write_scalar_new_object_property(state, object, name, value);
             }
             ScalarValue::Object(object)
         }
@@ -12879,6 +12967,9 @@ fn scalar_property_name_for_json_key<'a>(
     state: &mut ScalarExecutorState<'a>,
     key: &str,
 ) -> Option<&'a str> {
+    if let Some(property_name) = scalar_common_json_property_name(key) {
+        return Some(property_name);
+    }
     if let Some(cached) = state.json_property_name_cache.get(key) {
         return *cached;
     }
@@ -12898,6 +12989,19 @@ fn scalar_property_name_for_json_key<'a>(
         .json_property_name_cache
         .insert(key.to_owned(), property_name);
     property_name
+}
+
+fn scalar_common_json_property_name(key: &str) -> Option<&'static str> {
+    match key {
+        "active" => Some("active"),
+        "id" => Some("id"),
+        "label" => Some("label"),
+        "lane" => Some("lane"),
+        "meta" => Some("meta"),
+        "name" => Some("name"),
+        "points" => Some("points"),
+        _ => None,
+    }
 }
 
 fn call_scalar_uint8_array_set(
@@ -14692,23 +14796,24 @@ fn allocate_scalar_dynamic_string(
     let is_empty = value.is_empty();
     state.dynamic_strings.push(value);
     state.dynamic_string_json_values.push(None);
+    state.dynamic_string_json_snapshots.push(None);
     ScalarValue::DynamicString(ScalarDynamicStringHandle {
         dynamic_id,
         is_empty,
     })
 }
 
-fn allocate_scalar_dynamic_json_string(
-    state: &mut ScalarExecutorState<'_>,
+fn allocate_scalar_dynamic_json_string<'a>(
+    state: &mut ScalarExecutorState<'a>,
     value: String,
-    json_value: serde_json::Value,
+    json_value: ScalarJsonSnapshot<'a>,
 ) -> ScalarValue {
     let dynamic_string = allocate_scalar_dynamic_string(state, value);
     let ScalarValue::DynamicString(handle) = dynamic_string else {
         unreachable!("dynamic string allocator returns a dynamic string");
     };
     if let Some(slot) = state
-        .dynamic_string_json_values
+        .dynamic_string_json_snapshots
         .get_mut(usize::try_from(handle.dynamic_id).expect("dynamic string id fits in usize"))
     {
         *slot = Some(json_value);
@@ -22522,6 +22627,10 @@ mod tests {
             ],
         );
         assert!(matches!(encoded, ScalarValue::DynamicString(_)));
+        assert_eq!(
+            scalar_value_string_text(&bytecode, &state, encoded).as_deref(),
+            Some("{\"cdef\":[7]}")
+        );
 
         let parsed = call_scalar_json_parse(
             &bytecode,

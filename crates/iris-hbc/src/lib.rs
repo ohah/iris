@@ -3301,7 +3301,7 @@ fn execute_scalar_function_with_state_and_environment<'a>(
                     }
                     ScalarFastPathCandidate::ObjectNumberAddModPut => {
                         if let Some(next_instruction_index) =
-                            try_execute_scalar_object_number_add_mod_put_candidate(
+                            try_execute_scalar_property_loop_candidate(
                                 bytecode,
                                 state,
                                 &mut registers,
@@ -3317,6 +3317,21 @@ fn execute_scalar_function_with_state_and_environment<'a>(
                         }
                         if let Some(next_instruction_index) =
                             try_execute_scalar_uint8_global_index_mod_put_candidate(
+                                bytecode,
+                                state,
+                                &mut registers,
+                                function_id,
+                                &instructions,
+                                &instruction_bytes,
+                                &mut string_operand_cache,
+                                instruction_index,
+                            )?
+                        {
+                            instruction_index = next_instruction_index;
+                            continue;
+                        }
+                        if let Some(next_instruction_index) =
+                            try_execute_scalar_object_number_add_mod_put_candidate(
                                 bytecode,
                                 state,
                                 &mut registers,
@@ -3834,6 +3849,193 @@ fn scalar_fast_path_candidates<'a>(
             let candidates = candidates
                 .get_or_insert_with(|| vec![ScalarFastPathCandidate::None; instructions.len()]);
             candidates[instruction_index] = ScalarFastPathCandidate::GlobalNumberAddModPut;
+        }
+    }
+
+    if instructions
+        .iter()
+        .any(|instruction| instruction.opcode == 37)
+        && instructions
+            .iter()
+            .any(|instruction| matches!(instruction.opcode, 183 | 184))
+    {
+        for instruction_index in 0..instructions.len().saturating_sub(20) {
+            let instructions_window = &instructions[instruction_index..=instruction_index + 20];
+            if instructions_window[0].opcode != 68
+                || instructions_window[1].opcode != 68
+                || !matches!(instructions_window[2].opcode, 74 | 75)
+                || instructions_window[3].opcode != 68
+                || instructions_window[4].opcode != 68
+                || instructions_window[5].opcode != 68
+                || instructions_window[6].opcode != 68
+                || instructions_window[7].opcode != 68
+                || instructions_window[8].opcode != 30
+                || instructions_window[9].opcode != 37
+                || !matches!(instructions_window[10].opcode, 74 | 75)
+                || instructions_window[11].opcode != 68
+                || instructions_window[12].opcode != 68
+                || instructions_window[13].opcode != 68
+                || instructions_window[14].opcode != 30
+                || !matches!(instructions_window[15].opcode, 74 | 75)
+                || instructions_window[16].opcode != 68
+                || instructions_window[17].opcode != 30
+                || !matches!(instructions_window[18].opcode, 74 | 75)
+                || instructions_window[19].opcode != 68
+                || !matches!(instructions_window[20].opcode, 183 | 184)
+            {
+                continue;
+            }
+
+            let condition_jump_instruction = instructions_window[20];
+            let condition_jump_bytes = instruction_bytes[instruction_index + 20];
+            let condition_delta_width = scalar_jump_delta_width(condition_jump_instruction.opcode);
+            if read_scalar_jump_target(
+                condition_jump_instruction,
+                condition_jump_bytes,
+                1,
+                condition_delta_width,
+            ) != instructions_window[0].offset
+            {
+                continue;
+            }
+
+            let row_get_bytes = instruction_bytes[instruction_index];
+            let index_get_bytes = instruction_bytes[instruction_index + 1];
+            let id_put_bytes = instruction_bytes[instruction_index + 2];
+            let score_put_row_get_bytes = instruction_bytes[instruction_index + 3];
+            let score_read_row_get_bytes = instruction_bytes[instruction_index + 4];
+            let score_get_bytes = instruction_bytes[instruction_index + 5];
+            let id_read_row_get_bytes = instruction_bytes[instruction_index + 6];
+            let id_get_bytes = instruction_bytes[instruction_index + 7];
+            let score_put_bytes = instruction_bytes[instruction_index + 10];
+            let checksum_get_bytes = instruction_bytes[instruction_index + 11];
+            let checksum_score_row_get_bytes = instruction_bytes[instruction_index + 12];
+            let checksum_score_get_bytes = instruction_bytes[instruction_index + 13];
+            let checksum_put_bytes = instruction_bytes[instruction_index + 15];
+            let update_get_bytes = instruction_bytes[instruction_index + 16];
+            let update_put_bytes = instruction_bytes[instruction_index + 18];
+            let condition_get_bytes = instruction_bytes[instruction_index + 19];
+            let row_string_id = read_unsigned_operand(row_get_bytes, 4, 1);
+            let index_string_id = read_unsigned_operand(index_get_bytes, 4, 1);
+            let id_put_string_id = read_unsigned_operand(id_put_bytes, 4, 2);
+            let score_put_row_string_id = read_unsigned_operand(score_put_row_get_bytes, 4, 1);
+            let score_read_row_string_id = read_unsigned_operand(score_read_row_get_bytes, 4, 1);
+            let score_string_id = read_unsigned_operand(score_get_bytes, 4, 1);
+            let id_read_row_string_id = read_unsigned_operand(id_read_row_get_bytes, 4, 1);
+            let id_string_id = read_unsigned_operand(id_get_bytes, 4, 1);
+            let score_put_string_id = read_unsigned_operand(score_put_bytes, 4, 2);
+            let checksum_string_id = read_unsigned_operand(checksum_get_bytes, 4, 1);
+            let checksum_score_row_string_id =
+                read_unsigned_operand(checksum_score_row_get_bytes, 4, 1);
+            let checksum_score_string_id = read_unsigned_operand(checksum_score_get_bytes, 4, 1);
+            let checksum_put_string_id = read_unsigned_operand(checksum_put_bytes, 4, 2);
+            let update_string_id = read_unsigned_operand(update_get_bytes, 4, 1);
+            let update_put_string_id = read_unsigned_operand(update_put_bytes, 4, 2);
+            let condition_string_id = read_unsigned_operand(condition_get_bytes, 4, 1);
+            let Ok(row_property_name) = read_scalar_string_operand(
+                bytecode,
+                function_id,
+                instructions_window[0],
+                row_string_id,
+            ) else {
+                continue;
+            };
+            let Ok(index_property_name) = read_scalar_string_operand(
+                bytecode,
+                function_id,
+                instructions_window[1],
+                index_string_id,
+            ) else {
+                continue;
+            };
+            let Ok(id_property_name) = read_scalar_string_operand(
+                bytecode,
+                function_id,
+                instructions_window[2],
+                id_put_string_id,
+            ) else {
+                continue;
+            };
+            let Ok(score_property_name) = read_scalar_string_operand(
+                bytecode,
+                function_id,
+                instructions_window[5],
+                score_string_id,
+            ) else {
+                continue;
+            };
+            let Ok(checksum_property_name) = read_scalar_string_operand(
+                bytecode,
+                function_id,
+                instructions_window[11],
+                checksum_string_id,
+            ) else {
+                continue;
+            };
+            let row_string_ids = [
+                (instructions_window[3], score_put_row_string_id),
+                (instructions_window[4], score_read_row_string_id),
+                (instructions_window[6], id_read_row_string_id),
+                (instructions_window[12], checksum_score_row_string_id),
+            ];
+            if row_string_ids.iter().any(|(instruction, string_id)| {
+                read_scalar_string_operand(bytecode, function_id, *instruction, *string_id)
+                    .map(|property_name| {
+                        !scalar_property_name_matches(row_property_name, property_name)
+                    })
+                    .unwrap_or(true)
+            }) {
+                continue;
+            }
+            let property_pairs = [
+                (id_property_name, instructions_window[7], id_string_id),
+                (
+                    score_property_name,
+                    instructions_window[10],
+                    score_put_string_id,
+                ),
+                (
+                    score_property_name,
+                    instructions_window[13],
+                    checksum_score_string_id,
+                ),
+                (
+                    checksum_property_name,
+                    instructions_window[15],
+                    checksum_put_string_id,
+                ),
+                (
+                    index_property_name,
+                    instructions_window[16],
+                    update_string_id,
+                ),
+                (
+                    index_property_name,
+                    instructions_window[18],
+                    update_put_string_id,
+                ),
+                (
+                    index_property_name,
+                    instructions_window[19],
+                    condition_string_id,
+                ),
+            ];
+            if property_pairs
+                .iter()
+                .any(|(expected, instruction, string_id)| {
+                    read_scalar_string_operand(bytecode, function_id, *instruction, *string_id)
+                        .map(|property_name| !scalar_property_name_matches(expected, property_name))
+                        .unwrap_or(true)
+                })
+            {
+                continue;
+            }
+
+            let candidates = candidates
+                .get_or_insert_with(|| vec![ScalarFastPathCandidate::None; instructions.len()]);
+            if candidates[instruction_index] == ScalarFastPathCandidate::None {
+                candidates[instruction_index] = ScalarFastPathCandidate::ObjectNumberAddModPut;
+            }
         }
     }
 
@@ -5276,6 +5478,443 @@ fn try_execute_scalar_object_number_add_mod_put_candidate<'a>(
         ScalarValue::Number(result),
     );
     Ok(Some(put_instruction_index + 1))
+}
+
+fn try_execute_scalar_property_loop_candidate<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
+    registers: &mut [ScalarValue],
+    function_id: u32,
+    instructions: &[HermesInstruction],
+    instruction_bytes: &[&[u8]],
+    string_operand_cache: &mut ScalarStringOperandCache<'a>,
+    instruction_index: usize,
+) -> Result<Option<usize>, ScalarExecutionError> {
+    let Some(condition_jump_instruction_index) = instruction_index.checked_add(20) else {
+        return Ok(None);
+    };
+    let instructions_window = &instructions[instruction_index..=condition_jump_instruction_index];
+    if instructions_window[0].opcode != 68
+        || instructions_window[1].opcode != 68
+        || !matches!(instructions_window[2].opcode, 74 | 75)
+        || instructions_window[3].opcode != 68
+        || instructions_window[4].opcode != 68
+        || instructions_window[5].opcode != 68
+        || instructions_window[6].opcode != 68
+        || instructions_window[7].opcode != 68
+        || instructions_window[8].opcode != 30
+        || instructions_window[9].opcode != 37
+        || !matches!(instructions_window[10].opcode, 74 | 75)
+        || instructions_window[11].opcode != 68
+        || instructions_window[12].opcode != 68
+        || instructions_window[13].opcode != 68
+        || instructions_window[14].opcode != 30
+        || !matches!(instructions_window[15].opcode, 74 | 75)
+        || instructions_window[16].opcode != 68
+        || instructions_window[17].opcode != 30
+        || !matches!(instructions_window[18].opcode, 74 | 75)
+        || instructions_window[19].opcode != 68
+        || !matches!(instructions_window[20].opcode, 183 | 184)
+    {
+        return Ok(None);
+    }
+
+    let row_get_bytes = instruction_bytes[instruction_index];
+    let index_get_bytes = instruction_bytes[instruction_index + 1];
+    let id_put_bytes = instruction_bytes[instruction_index + 2];
+    let score_put_row_get_bytes = instruction_bytes[instruction_index + 3];
+    let score_read_row_get_bytes = instruction_bytes[instruction_index + 4];
+    let score_get_bytes = instruction_bytes[instruction_index + 5];
+    let id_read_row_get_bytes = instruction_bytes[instruction_index + 6];
+    let id_get_bytes = instruction_bytes[instruction_index + 7];
+    let add_score_id_bytes = instruction_bytes[instruction_index + 8];
+    let mod_score_bytes = instruction_bytes[instruction_index + 9];
+    let score_put_bytes = instruction_bytes[instruction_index + 10];
+    let checksum_get_bytes = instruction_bytes[instruction_index + 11];
+    let checksum_score_row_get_bytes = instruction_bytes[instruction_index + 12];
+    let checksum_score_get_bytes = instruction_bytes[instruction_index + 13];
+    let checksum_add_bytes = instruction_bytes[instruction_index + 14];
+    let checksum_put_bytes = instruction_bytes[instruction_index + 15];
+    let update_get_bytes = instruction_bytes[instruction_index + 16];
+    let update_add_bytes = instruction_bytes[instruction_index + 17];
+    let update_put_bytes = instruction_bytes[instruction_index + 18];
+    let condition_get_bytes = instruction_bytes[instruction_index + 19];
+    let condition_jump_instruction = instructions_window[20];
+    let condition_jump_bytes = instruction_bytes[condition_jump_instruction_index];
+    let condition_delta_width = scalar_jump_delta_width(condition_jump_instruction.opcode);
+    if read_scalar_jump_target(
+        condition_jump_instruction,
+        condition_jump_bytes,
+        1,
+        condition_delta_width,
+    ) != instructions_window[0].offset
+    {
+        return Ok(None);
+    }
+
+    let global_base_register = read_unsigned_operand(row_get_bytes, 2, 1);
+    for bytes in [
+        index_get_bytes,
+        score_put_row_get_bytes,
+        score_read_row_get_bytes,
+        id_read_row_get_bytes,
+        checksum_get_bytes,
+        checksum_score_row_get_bytes,
+        update_get_bytes,
+        condition_get_bytes,
+    ] {
+        if read_unsigned_operand(bytes, 2, 1) != global_base_register {
+            return Ok(None);
+        }
+    }
+    if read_unsigned_operand(checksum_put_bytes, 1, 1) != global_base_register
+        || read_unsigned_operand(update_put_bytes, 1, 1) != global_base_register
+        || !matches!(
+            registers.get(global_base_register as usize),
+            Some(ScalarValue::Object(ScalarObjectHandle::Global))
+        )
+    {
+        return Ok(None);
+    }
+
+    let row_register = read_unsigned_operand(row_get_bytes, 1, 1);
+    let index_register = read_unsigned_operand(index_get_bytes, 1, 1);
+    let score_put_row_register = read_unsigned_operand(score_put_row_get_bytes, 1, 1);
+    let score_read_row_register = read_unsigned_operand(score_read_row_get_bytes, 1, 1);
+    let score_register = read_unsigned_operand(score_get_bytes, 1, 1);
+    let id_read_row_register = read_unsigned_operand(id_read_row_get_bytes, 1, 1);
+    let id_register = read_unsigned_operand(id_get_bytes, 1, 1);
+    let score_sum_register = read_unsigned_operand(add_score_id_bytes, 1, 1);
+    let new_score_register = read_unsigned_operand(mod_score_bytes, 1, 1);
+    let divisor_register = read_unsigned_operand(mod_score_bytes, 3, 1);
+    let checksum_register = read_unsigned_operand(checksum_get_bytes, 1, 1);
+    let checksum_score_row_register = read_unsigned_operand(checksum_score_row_get_bytes, 1, 1);
+    let checksum_score_register = read_unsigned_operand(checksum_score_get_bytes, 1, 1);
+    let checksum_result_register = read_unsigned_operand(checksum_add_bytes, 1, 1);
+    let update_register = read_unsigned_operand(update_get_bytes, 1, 1);
+    let update_add_left_register = read_unsigned_operand(update_add_bytes, 2, 1);
+    let update_add_right_register = read_unsigned_operand(update_add_bytes, 3, 1);
+    let condition_index_register = read_unsigned_operand(condition_get_bytes, 1, 1);
+    let condition_left_register =
+        read_unsigned_operand(condition_jump_bytes, 1 + condition_delta_width, 1);
+    let limit_register = read_unsigned_operand(condition_jump_bytes, 2 + condition_delta_width, 1);
+    if read_unsigned_operand(id_put_bytes, 1, 1) != row_register
+        || read_unsigned_operand(id_put_bytes, 2, 1) != index_register
+        || read_unsigned_operand(score_get_bytes, 2, 1) != score_read_row_register
+        || read_unsigned_operand(id_get_bytes, 2, 1) != id_read_row_register
+        || read_unsigned_operand(add_score_id_bytes, 2, 1) != score_register
+        || read_unsigned_operand(add_score_id_bytes, 3, 1) != id_register
+        || read_unsigned_operand(mod_score_bytes, 2, 1) != score_sum_register
+        || read_unsigned_operand(score_put_bytes, 1, 1) != score_put_row_register
+        || read_unsigned_operand(score_put_bytes, 2, 1) != new_score_register
+        || read_unsigned_operand(checksum_score_get_bytes, 2, 1) != checksum_score_row_register
+        || read_unsigned_operand(checksum_add_bytes, 2, 1) != checksum_register
+        || read_unsigned_operand(checksum_add_bytes, 3, 1) != checksum_score_register
+        || read_unsigned_operand(checksum_put_bytes, 2, 1) != checksum_result_register
+        || read_unsigned_operand(update_add_bytes, 1, 1) != update_register
+        || read_unsigned_operand(update_put_bytes, 2, 1) != update_register
+        || !((update_add_left_register == update_register)
+            || (update_add_right_register == update_register))
+        || update_register != condition_index_register
+        || condition_left_register != condition_index_register
+    {
+        return Ok(None);
+    }
+    let increment_register = if update_add_left_register == update_register {
+        update_add_right_register
+    } else {
+        update_add_left_register
+    };
+
+    for register in [
+        row_register,
+        index_register,
+        score_put_row_register,
+        score_read_row_register,
+        score_register,
+        id_read_row_register,
+        id_register,
+        score_sum_register,
+        new_score_register,
+        divisor_register,
+        checksum_register,
+        checksum_score_row_register,
+        checksum_score_register,
+        checksum_result_register,
+        update_register,
+        increment_register,
+        condition_index_register,
+        limit_register,
+    ] {
+        if registers.get(register as usize).is_none() {
+            return Ok(None);
+        }
+    }
+
+    let row_string_id = read_unsigned_operand(row_get_bytes, 4, 1);
+    let index_string_id = read_unsigned_operand(index_get_bytes, 4, 1);
+    let id_put_string_id = read_unsigned_operand(id_put_bytes, 4, 2);
+    let score_put_row_string_id = read_unsigned_operand(score_put_row_get_bytes, 4, 1);
+    let score_read_row_string_id = read_unsigned_operand(score_read_row_get_bytes, 4, 1);
+    let score_string_id = read_unsigned_operand(score_get_bytes, 4, 1);
+    let id_read_row_string_id = read_unsigned_operand(id_read_row_get_bytes, 4, 1);
+    let id_string_id = read_unsigned_operand(id_get_bytes, 4, 1);
+    let score_put_string_id = read_unsigned_operand(score_put_bytes, 4, 2);
+    let checksum_string_id = read_unsigned_operand(checksum_get_bytes, 4, 1);
+    let checksum_score_row_string_id = read_unsigned_operand(checksum_score_row_get_bytes, 4, 1);
+    let checksum_score_string_id = read_unsigned_operand(checksum_score_get_bytes, 4, 1);
+    let checksum_put_string_id = read_unsigned_operand(checksum_put_bytes, 4, 2);
+    let update_string_id = read_unsigned_operand(update_get_bytes, 4, 1);
+    let update_put_string_id = read_unsigned_operand(update_put_bytes, 4, 2);
+    let condition_string_id = read_unsigned_operand(condition_get_bytes, 4, 1);
+    let row_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions_window[0],
+        row_string_id,
+    )?;
+    let index_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions_window[1],
+        index_string_id,
+    )?;
+    let id_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions_window[2],
+        id_put_string_id,
+    )?;
+    let score_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions_window[5],
+        score_string_id,
+    )?;
+    let checksum_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions_window[11],
+        checksum_string_id,
+    )?;
+    for (instruction, string_id) in [
+        (instructions_window[3], score_put_row_string_id),
+        (instructions_window[4], score_read_row_string_id),
+        (instructions_window[6], id_read_row_string_id),
+        (instructions_window[12], checksum_score_row_string_id),
+    ] {
+        let property_name = read_cached_scalar_string_operand(
+            bytecode,
+            string_operand_cache,
+            function_id,
+            instruction,
+            string_id,
+        )?;
+        if !scalar_property_name_matches(row_property_name, property_name) {
+            return Ok(None);
+        }
+    }
+    let id_read_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions_window[7],
+        id_string_id,
+    )?;
+    let score_put_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions_window[10],
+        score_put_string_id,
+    )?;
+    let checksum_score_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions_window[13],
+        checksum_score_string_id,
+    )?;
+    let checksum_put_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions_window[15],
+        checksum_put_string_id,
+    )?;
+    let update_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions_window[16],
+        update_string_id,
+    )?;
+    let update_put_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions_window[18],
+        update_put_string_id,
+    )?;
+    let condition_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions_window[19],
+        condition_string_id,
+    )?;
+    if !scalar_property_name_matches(id_property_name, id_read_property_name)
+        || !scalar_property_name_matches(score_property_name, score_put_property_name)
+        || !scalar_property_name_matches(score_property_name, checksum_score_property_name)
+        || !scalar_property_name_matches(checksum_property_name, checksum_put_property_name)
+        || !scalar_property_name_matches(index_property_name, update_property_name)
+        || !scalar_property_name_matches(index_property_name, update_put_property_name)
+        || !scalar_property_name_matches(index_property_name, condition_property_name)
+    {
+        return Ok(None);
+    }
+
+    let ScalarValue::Object(row_object @ ScalarObjectHandle::Object(_)) =
+        read_cached_scalar_global_property(state, row_string_id, row_property_name)
+    else {
+        return Ok(None);
+    };
+    if !state.object_getters.is_empty()
+        || read_scalar_object_prototype(state, row_object).is_some()
+        || !matches!(
+            registers.get(row_register as usize),
+            Some(ScalarValue::Object(_)) | Some(ScalarValue::Empty)
+        )
+    {
+        return Ok(None);
+    }
+
+    let ScalarValue::Number(start_index) =
+        read_cached_scalar_global_property(state, index_string_id, index_property_name)
+    else {
+        return Ok(None);
+    };
+    let ScalarValue::Number(checksum) =
+        read_cached_scalar_global_property(state, checksum_string_id, checksum_property_name)
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(score)) = read_cached_scalar_own_object_property(
+        state,
+        row_object,
+        score_string_id,
+        score_property_name,
+    ) else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(divisor)) = registers.get(divisor_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(increment)) = registers.get(increment_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(limit)) = registers.get(limit_register as usize).copied() else {
+        return Ok(None);
+    };
+    if !start_index.is_finite()
+        || start_index < 0.0
+        || start_index.fract() != 0.0
+        || !score.is_finite()
+        || score < 0.0
+        || score.fract() != 0.0
+        || !checksum.is_finite()
+        || checksum.fract() != 0.0
+        || !divisor.is_finite()
+        || divisor <= 0.0
+        || divisor.fract() != 0.0
+        || divisor > f64::from(u32::MAX)
+        || increment != 1.0
+        || !limit.is_finite()
+        || limit < 0.0
+        || limit.fract() != 0.0
+        || limit > f64::from(u32::MAX)
+        || !scalar_relational_jump_matches(condition_jump_instruction.opcode, start_index, limit)
+    {
+        return Ok(None);
+    }
+
+    let start_index = start_index as u32;
+    let limit = limit as u32;
+    let iteration_count = limit - start_index;
+    if iteration_count > 5_000_000 {
+        return Ok(None);
+    }
+
+    let divisor = divisor as u32;
+    let mut score = score as u32;
+    if score >= divisor {
+        return Ok(None);
+    }
+    let mut checksum_delta = 0_u64;
+    for index in start_index..limit {
+        score = ((u64::from(score) + u64::from(index % divisor)) % u64::from(divisor)) as u32;
+        checksum_delta += u64::from(score);
+    }
+
+    const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+    let result = checksum + checksum_delta as f64;
+    if !result.is_finite() || result.abs() > MAX_SAFE_INTEGER {
+        return Ok(None);
+    }
+
+    let last_index_value = ScalarValue::Number(f64::from(limit.saturating_sub(1)));
+    let limit_value = ScalarValue::Number(f64::from(limit));
+    let score_value = ScalarValue::Number(f64::from(score));
+    let checksum_value = ScalarValue::Number(result);
+    write_cached_scalar_named_object_property(
+        state,
+        row_object,
+        id_put_string_id,
+        id_property_name,
+        last_index_value,
+    );
+    write_cached_scalar_named_object_property(
+        state,
+        row_object,
+        score_put_string_id,
+        score_property_name,
+        score_value,
+    );
+    write_cached_scalar_global_property(
+        state,
+        checksum_put_string_id,
+        checksum_put_property_name,
+        checksum_value,
+    );
+    write_cached_scalar_global_property(
+        state,
+        update_put_string_id,
+        update_put_property_name,
+        limit_value,
+    );
+    registers[row_register as usize] = ScalarValue::Object(row_object);
+    registers[score_put_row_register as usize] = ScalarValue::Object(row_object);
+    registers[score_read_row_register as usize] = ScalarValue::Object(row_object);
+    registers[id_read_row_register as usize] = ScalarValue::Object(row_object);
+    registers[checksum_score_row_register as usize] = ScalarValue::Object(row_object);
+    registers[index_register as usize] = last_index_value;
+    registers[id_register as usize] = last_index_value;
+    registers[score_register as usize] = score_value;
+    registers[score_sum_register as usize] = score_value;
+    registers[new_score_register as usize] = score_value;
+    registers[checksum_score_register as usize] = score_value;
+    registers[checksum_register as usize] = checksum_value;
+    registers[checksum_result_register as usize] = checksum_value;
+    registers[update_register as usize] = limit_value;
+    registers[condition_index_register as usize] = limit_value;
+    Ok(Some(condition_jump_instruction_index + 1))
 }
 
 fn try_execute_scalar_uint8_global_index_mod_put_candidate<'a>(

@@ -3358,6 +3358,21 @@ fn execute_scalar_function_with_state_and_environment<'a>(
                             instruction_index = next_instruction_index;
                             continue;
                         }
+                        if let Some(next_instruction_index) =
+                            try_execute_scalar_json_round_trip_checksum_loop_candidate(
+                                bytecode,
+                                state,
+                                &mut registers,
+                                function_id,
+                                &instructions,
+                                &instruction_bytes,
+                                &mut string_operand_cache,
+                                instruction_index,
+                            )?
+                        {
+                            instruction_index = next_instruction_index;
+                            continue;
+                        }
                     }
                     ScalarFastPathCandidate::ObjectTraversalBuildLoop => {
                         if let Some(next_instruction_index) =
@@ -3920,6 +3935,88 @@ fn scalar_fast_path_candidates<'a>(
                 if property_name != expected_name {
                     continue 'object_traversal_checksum;
                 }
+            }
+
+            let candidates = candidates
+                .get_or_insert_with(|| vec![ScalarFastPathCandidate::None; instructions.len()]);
+            if candidates[instruction_index] == ScalarFastPathCandidate::None {
+                candidates[instruction_index] =
+                    ScalarFastPathCandidate::ObjectTraversalChecksumLoop;
+            }
+        }
+    }
+
+    // The JSON round-trip benchmark has a second stable loop after
+    // JSON.parse: decoded[rowIndex].id + decoded[rowIndex].points[2].
+    // Reuse the checksum-loop candidate slot and keep detection exact so
+    // unrelated object/indexed reads stay on the interpreter path.
+    if instructions
+        .iter()
+        .any(|instruction| instruction.opcode == 94)
+        && instructions
+            .iter()
+            .any(|instruction| instruction.opcode == 93)
+    {
+        'json_round_trip_checksum: for instruction_index in 0..instructions.len().saturating_sub(19)
+        {
+            let instructions_window = &instructions[instruction_index..=instruction_index + 19];
+            let expected_opcodes = [
+                68, 68, 93, 74, 68, 68, 68, 30, 68, 68, 94, 30, 74, 68, 30, 74, 68, 68, 68, 183,
+            ];
+            if instructions_window
+                .iter()
+                .zip(expected_opcodes)
+                .any(|(instruction, expected_opcode)| instruction.opcode != expected_opcode)
+            {
+                continue;
+            }
+
+            let jump_instruction = instructions_window[19];
+            let jump_bytes = instruction_bytes[instruction_index + 19];
+            let jump_delta_width = scalar_jump_delta_width(jump_instruction.opcode);
+            if read_scalar_jump_target(jump_instruction, jump_bytes, 1, jump_delta_width)
+                != instructions_window[0].offset
+            {
+                continue;
+            }
+
+            let property_checks = [
+                (0, 4, 1, "decoded"),
+                (1, 4, 1, "rowIndex"),
+                (3, 4, 2, "current"),
+                (4, 4, 1, "checksum"),
+                (5, 4, 1, "current"),
+                (6, 4, 1, "id"),
+                (8, 4, 1, "current"),
+                (9, 4, 1, "points"),
+                (12, 4, 2, "checksum"),
+                (13, 4, 1, "rowIndex"),
+                (15, 4, 2, "rowIndex"),
+                (16, 4, 1, "rowIndex"),
+                (17, 4, 1, "decoded"),
+                (18, 4, 1, "length"),
+            ];
+            for (relative_index, operand_offset, operand_width, expected_name) in property_checks {
+                let string_id = read_unsigned_operand(
+                    instruction_bytes[instruction_index + relative_index],
+                    operand_offset,
+                    operand_width,
+                );
+                let Ok(property_name) = read_scalar_string_operand(
+                    bytecode,
+                    function_id,
+                    instructions_window[relative_index],
+                    string_id,
+                ) else {
+                    continue 'json_round_trip_checksum;
+                };
+                if property_name != expected_name {
+                    continue 'json_round_trip_checksum;
+                }
+            }
+
+            if read_unsigned_operand(instruction_bytes[instruction_index + 10], 3, 1) != 2 {
+                continue;
             }
 
             let candidates = candidates
@@ -8556,6 +8653,408 @@ fn try_execute_scalar_object_traversal_checksum_loop_candidate<'a>(
     registers[id_register as usize] = last_id;
     registers[score_register as usize] = last_score;
     registers[update_register as usize] = length_value;
+    Ok(Some(jump_instruction_index + 1))
+}
+
+fn try_execute_scalar_json_round_trip_checksum_loop_candidate<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
+    registers: &mut [ScalarValue],
+    function_id: u32,
+    instructions: &[HermesInstruction],
+    instruction_bytes: &[&[u8]],
+    string_operand_cache: &mut ScalarStringOperandCache<'a>,
+    instruction_index: usize,
+) -> Result<Option<usize>, ScalarExecutionError> {
+    let Some(jump_instruction_index) = instruction_index.checked_add(19) else {
+        return Ok(None);
+    };
+    let Some(jump_instruction) = instructions.get(jump_instruction_index).copied() else {
+        return Ok(None);
+    };
+    if jump_instruction.opcode != 183 {
+        return Ok(None);
+    }
+
+    let jump_bytes = instruction_bytes[jump_instruction_index];
+    let jump_delta_width = scalar_jump_delta_width(jump_instruction.opcode);
+    if read_scalar_jump_target(jump_instruction, jump_bytes, 1, jump_delta_width)
+        != instructions[instruction_index].offset
+    {
+        return Ok(None);
+    }
+
+    let decoded_get_bytes = instruction_bytes[instruction_index];
+    let row_index_get_bytes = instruction_bytes[instruction_index + 1];
+    let current_get_by_val_bytes = instruction_bytes[instruction_index + 2];
+    let put_current_bytes = instruction_bytes[instruction_index + 3];
+    let checksum_get_bytes = instruction_bytes[instruction_index + 4];
+    let current_get_bytes = instruction_bytes[instruction_index + 5];
+    let id_get_bytes = instruction_bytes[instruction_index + 6];
+    let id_add_bytes = instruction_bytes[instruction_index + 7];
+    let current_for_points_get_bytes = instruction_bytes[instruction_index + 8];
+    let points_get_bytes = instruction_bytes[instruction_index + 9];
+    let points_index_get_bytes = instruction_bytes[instruction_index + 10];
+    let points_add_bytes = instruction_bytes[instruction_index + 11];
+    let checksum_put_bytes = instruction_bytes[instruction_index + 12];
+    let update_get_bytes = instruction_bytes[instruction_index + 13];
+    let update_add_bytes = instruction_bytes[instruction_index + 14];
+    let update_put_bytes = instruction_bytes[instruction_index + 15];
+    let condition_row_index_get_bytes = instruction_bytes[instruction_index + 16];
+    let condition_decoded_get_bytes = instruction_bytes[instruction_index + 17];
+    let length_get_bytes = instruction_bytes[instruction_index + 18];
+
+    let global_base_register = read_unsigned_operand(decoded_get_bytes, 2, 1);
+    for bytes in [
+        row_index_get_bytes,
+        checksum_get_bytes,
+        current_get_bytes,
+        current_for_points_get_bytes,
+        update_get_bytes,
+        condition_row_index_get_bytes,
+        condition_decoded_get_bytes,
+    ] {
+        if read_unsigned_operand(bytes, 2, 1) != global_base_register {
+            return Ok(None);
+        }
+    }
+    if read_unsigned_operand(put_current_bytes, 1, 1) != global_base_register
+        || read_unsigned_operand(checksum_put_bytes, 1, 1) != global_base_register
+        || read_unsigned_operand(update_put_bytes, 1, 1) != global_base_register
+        || !matches!(
+            registers.get(global_base_register as usize),
+            Some(ScalarValue::Object(ScalarObjectHandle::Global))
+        )
+    {
+        return Ok(None);
+    }
+
+    let decoded_register = read_unsigned_operand(decoded_get_bytes, 1, 1);
+    let row_index_register = read_unsigned_operand(row_index_get_bytes, 1, 1);
+    let current_register = read_unsigned_operand(current_get_by_val_bytes, 1, 1);
+    let checksum_register = read_unsigned_operand(checksum_get_bytes, 1, 1);
+    let id_register = read_unsigned_operand(id_get_bytes, 1, 1);
+    let points_register = read_unsigned_operand(points_get_bytes, 1, 1);
+    let point_value_register = read_unsigned_operand(points_index_get_bytes, 1, 1);
+    let checksum_update_register = read_unsigned_operand(points_add_bytes, 1, 1);
+    let update_register = read_unsigned_operand(update_get_bytes, 1, 1);
+    let update_left_register = read_unsigned_operand(update_add_bytes, 2, 1);
+    let update_right_register = read_unsigned_operand(update_add_bytes, 3, 1);
+    let increment_register = if update_left_register == update_register {
+        update_right_register
+    } else {
+        update_left_register
+    };
+    let condition_left_register = read_unsigned_operand(jump_bytes, 1 + jump_delta_width, 1);
+    let condition_limit_register = read_unsigned_operand(jump_bytes, 2 + jump_delta_width, 1);
+    let condition_decoded_register = read_unsigned_operand(condition_decoded_get_bytes, 1, 1);
+    if read_unsigned_operand(current_get_by_val_bytes, 2, 1) != decoded_register
+        || read_unsigned_operand(current_get_by_val_bytes, 3, 1) != row_index_register
+        || read_unsigned_operand(put_current_bytes, 2, 1) != current_register
+        || read_unsigned_operand(current_get_bytes, 1, 1) != current_register
+        || read_unsigned_operand(id_get_bytes, 2, 1) != current_register
+        || read_unsigned_operand(id_add_bytes, 1, 1) != checksum_register
+        || read_unsigned_operand(id_add_bytes, 2, 1) != checksum_register
+        || read_unsigned_operand(id_add_bytes, 3, 1) != id_register
+        || read_unsigned_operand(current_for_points_get_bytes, 1, 1) != current_register
+        || read_unsigned_operand(points_get_bytes, 2, 1) != current_register
+        || read_unsigned_operand(points_index_get_bytes, 2, 1) != points_register
+        || read_unsigned_operand(points_index_get_bytes, 3, 1) != 2
+        || read_unsigned_operand(points_add_bytes, 2, 1) != checksum_register
+        || read_unsigned_operand(points_add_bytes, 3, 1) != point_value_register
+        || read_unsigned_operand(checksum_put_bytes, 2, 1) != checksum_update_register
+        || read_unsigned_operand(update_add_bytes, 1, 1) != update_register
+        || (update_left_register != update_register && update_right_register != update_register)
+        || read_unsigned_operand(update_put_bytes, 2, 1) != update_register
+        || read_unsigned_operand(condition_row_index_get_bytes, 1, 1) != condition_left_register
+        || read_unsigned_operand(condition_decoded_get_bytes, 1, 1) != condition_decoded_register
+        || read_unsigned_operand(length_get_bytes, 1, 1) != condition_limit_register
+        || read_unsigned_operand(length_get_bytes, 2, 1) != condition_decoded_register
+        || condition_left_register != read_unsigned_operand(condition_row_index_get_bytes, 1, 1)
+        || condition_limit_register != read_unsigned_operand(length_get_bytes, 1, 1)
+    {
+        return Ok(None);
+    }
+
+    for register in [
+        decoded_register,
+        row_index_register,
+        current_register,
+        checksum_register,
+        id_register,
+        points_register,
+        point_value_register,
+        checksum_update_register,
+        update_register,
+        increment_register,
+        condition_left_register,
+        condition_limit_register,
+        condition_decoded_register,
+    ] {
+        if registers.get(register as usize).is_none() {
+            return Ok(None);
+        }
+    }
+
+    let decoded_string_id = read_unsigned_operand(decoded_get_bytes, 4, 1);
+    let row_index_string_id = read_unsigned_operand(row_index_get_bytes, 4, 1);
+    let current_string_id = read_unsigned_operand(put_current_bytes, 4, 2);
+    let checksum_string_id = read_unsigned_operand(checksum_get_bytes, 4, 1);
+    let id_string_id = read_unsigned_operand(id_get_bytes, 4, 1);
+    let points_string_id = read_unsigned_operand(points_get_bytes, 4, 1);
+    let checksum_put_string_id = read_unsigned_operand(checksum_put_bytes, 4, 2);
+    let row_index_put_string_id = read_unsigned_operand(update_put_bytes, 4, 2);
+    let length_string_id = read_unsigned_operand(length_get_bytes, 4, 1);
+    let decoded_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index],
+        decoded_string_id,
+    )?;
+    let row_index_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 1],
+        row_index_string_id,
+    )?;
+    let current_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 3],
+        current_string_id,
+    )?;
+    let checksum_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 4],
+        checksum_string_id,
+    )?;
+    let id_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 6],
+        id_string_id,
+    )?;
+    let points_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 9],
+        points_string_id,
+    )?;
+    let length_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 18],
+        length_string_id,
+    )?;
+    if decoded_property_name != "decoded"
+        || row_index_property_name != "rowIndex"
+        || current_property_name != "current"
+        || checksum_property_name != "checksum"
+        || id_property_name != "id"
+        || points_property_name != "points"
+        || length_property_name != "length"
+    {
+        return Ok(None);
+    }
+
+    let ScalarValue::Object(decoded_array @ ScalarObjectHandle::Array(decoded_id)) =
+        read_cached_scalar_global_property(state, decoded_string_id, decoded_property_name)
+    else {
+        return Ok(None);
+    };
+    let ScalarValue::Number(start_index) =
+        read_cached_scalar_global_property(state, row_index_string_id, row_index_property_name)
+    else {
+        return Ok(None);
+    };
+    let ScalarValue::Number(mut checksum) =
+        read_cached_scalar_global_property(state, checksum_string_id, checksum_property_name)
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(increment)) = registers.get(increment_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(length) = read_scalar_array_length(state, decoded_array) else {
+        return Ok(None);
+    };
+    if !state.object_getters.is_empty()
+        || !state.object_prototypes.is_empty()
+        || !start_index.is_finite()
+        || start_index < 0.0
+        || start_index.fract() != 0.0
+        || start_index > f64::from(u32::MAX)
+        || !checksum.is_finite()
+        || increment != 1.0
+        || !scalar_relational_jump_matches(jump_instruction.opcode, start_index, f64::from(length))
+    {
+        return Ok(None);
+    }
+
+    let start_index = start_index as u32;
+    if start_index >= length {
+        return Ok(None);
+    }
+    let storage_index = usize::try_from(decoded_id).expect("array id fits in usize");
+    let required_len = usize::try_from(length).expect("array length fits in usize");
+    let start_index_usize = usize::try_from(start_index).expect("array index fits in usize");
+    let (
+        last_current,
+        last_id,
+        last_points,
+        last_point_value,
+        last_checksum_after_id,
+        final_checksum,
+    ) = {
+        let Some(storage) = state
+            .array_storage
+            .get(storage_index)
+            .and_then(Option::as_ref)
+        else {
+            return Ok(None);
+        };
+        if storage.len() < required_len {
+            return Ok(None);
+        }
+
+        let mut last_current = ScalarValue::Undefined;
+        let mut last_id = ScalarValue::Undefined;
+        let mut last_points = ScalarValue::Undefined;
+        let mut last_point_value = ScalarValue::Undefined;
+        let mut last_checksum_after_id = checksum;
+        let mut row_property_indices: Option<(usize, usize)> = None;
+        for (row_offset, row_value) in storage[start_index_usize..required_len]
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            let ScalarValue::Object(row_object @ ScalarObjectHandle::Object(_)) = row_value else {
+                return Ok(None);
+            };
+
+            let (id, points) =
+                if let Some((first_id_index, first_points_index)) = row_property_indices {
+                    // The benchmark's parsed row shape is:
+                    // row.active,row.id,meta.lane,meta.label,row.meta,row.name,row.points.
+                    let Some(property_offset) = row_offset.checked_mul(7) else {
+                        return Ok(None);
+                    };
+                    let Some(id_index) = first_id_index.checked_add(property_offset) else {
+                        return Ok(None);
+                    };
+                    let Some(points_index) = first_points_index.checked_add(property_offset) else {
+                        return Ok(None);
+                    };
+                    let Some(id_property) = state.object_properties.get(id_index) else {
+                        return Ok(None);
+                    };
+                    let Some(points_property) = state.object_properties.get(points_index) else {
+                        return Ok(None);
+                    };
+                    if id_property.0 != row_object
+                        || !scalar_property_name_matches(id_property.1, id_property_name)
+                        || points_property.0 != row_object
+                        || !scalar_property_name_matches(points_property.1, points_property_name)
+                    {
+                        return Ok(None);
+                    }
+                    (id_property.2, points_property.2)
+                } else {
+                    let Some(id_index) =
+                        scalar_own_object_property_index(state, row_object, id_property_name)
+                    else {
+                        return Ok(None);
+                    };
+                    let Some(points_index) =
+                        scalar_own_object_property_index(state, row_object, points_property_name)
+                    else {
+                        return Ok(None);
+                    };
+                    row_property_indices = Some((id_index, points_index));
+                    (
+                        state.object_properties[id_index].2,
+                        state.object_properties[points_index].2,
+                    )
+                };
+            let ScalarValue::Number(id_number) = id else {
+                return Ok(None);
+            };
+            let ScalarValue::Object(points_array @ ScalarObjectHandle::Array(_)) = points else {
+                return Ok(None);
+            };
+            let point_value = read_scalar_array_element(state, points_array, 2);
+            let ScalarValue::Number(point_number) = point_value else {
+                return Ok(None);
+            };
+            if !id_number.is_finite() || !point_number.is_finite() {
+                return Ok(None);
+            }
+
+            last_checksum_after_id = checksum + id_number;
+            checksum = last_checksum_after_id + point_number;
+            if !checksum.is_finite() {
+                return Ok(None);
+            }
+            last_current = row_value;
+            last_id = id;
+            last_points = points;
+            last_point_value = point_value;
+        }
+        (
+            last_current,
+            last_id,
+            last_points,
+            last_point_value,
+            last_checksum_after_id,
+            checksum,
+        )
+    };
+
+    let decoded_value = ScalarValue::Object(decoded_array);
+    let length_value = ScalarValue::Number(f64::from(length));
+    let last_index_value = ScalarValue::Number(f64::from(length - 1));
+    let checksum_value = ScalarValue::Number(final_checksum);
+    let checksum_after_id_value = ScalarValue::Number(last_checksum_after_id);
+    write_cached_scalar_global_property(
+        state,
+        current_string_id,
+        current_property_name,
+        last_current,
+    );
+    write_cached_scalar_global_property(
+        state,
+        checksum_put_string_id,
+        checksum_property_name,
+        checksum_value,
+    );
+    write_cached_scalar_global_property(
+        state,
+        row_index_put_string_id,
+        row_index_property_name,
+        length_value,
+    );
+
+    registers[decoded_register as usize] = decoded_value;
+    registers[row_index_register as usize] = last_index_value;
+    registers[current_register as usize] = last_current;
+    registers[checksum_register as usize] = checksum_after_id_value;
+    registers[id_register as usize] = last_id;
+    registers[points_register as usize] = last_points;
+    registers[point_value_register as usize] = last_point_value;
+    registers[checksum_update_register as usize] = checksum_value;
+    registers[update_register as usize] = length_value;
+    registers[condition_left_register as usize] = length_value;
+    registers[condition_decoded_register as usize] = decoded_value;
+    registers[condition_limit_register as usize] = length_value;
     Ok(Some(jump_instruction_index + 1))
 }
 

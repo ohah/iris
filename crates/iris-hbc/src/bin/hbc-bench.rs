@@ -24,12 +24,16 @@ fn run_from_args(args: Vec<String>) -> Result<String, String> {
     let mut path = None;
     let mut warmup_iterations = 3;
     let mut measured_iterations = 20;
+    let mut sample_inner_iterations = 1;
 
     for arg in args.iter().skip(1) {
         if let Some(value) = arg.strip_prefix("--warmup=") {
             warmup_iterations = parse_positive_u32("--warmup", value, true)?;
         } else if let Some(value) = arg.strip_prefix("--iterations=") {
             measured_iterations = parse_positive_u32("--iterations", value, false)?;
+        } else if let Some(value) = arg.strip_prefix("--sample-inner-iterations=") {
+            sample_inner_iterations =
+                parse_positive_u32("--sample-inner-iterations", value, false)?;
         } else if arg.starts_with("--") {
             return Err(format!("unknown option: {arg}\n{}", usage(program)));
         } else if path.replace(arg.clone()).is_some() {
@@ -43,19 +47,22 @@ fn run_from_args(args: Vec<String>) -> Result<String, String> {
 
     let bytes = fs::read(&path)
         .map_err(|error| format!("failed to read Hermes bytecode bundle: {error}"))?;
-    let report =
-        iris_hbc::benchmark_global_scalar_function(&bytes, warmup_iterations, measured_iterations)
-            .map_err(|error| {
-                format!("failed to benchmark Hermes bytecode scalar subset: {error}")
-            })?;
+    let report = iris_hbc::benchmark_global_scalar_function_with_inner_iterations(
+        &bytes,
+        warmup_iterations,
+        measured_iterations,
+        sample_inner_iterations,
+    )
+    .map_err(|error| format!("failed to benchmark Hermes bytecode scalar subset: {error}"))?;
 
     Ok(format!(
-        "{{\"engine\":\"iris\",\"casePath\":\"{}\",\"value\":{},\"declaredGlobals\":{},\"warmupIterations\":{},\"measuredIterations\":{},\"samplesMs\":[{}]}}",
+        "{{\"engine\":\"iris\",\"casePath\":\"{}\",\"value\":{},\"declaredGlobals\":{},\"warmupIterations\":{},\"measuredIterations\":{},\"sampleInnerIterations\":{},\"samplesMs\":[{}]}}",
         json_escape(&path),
         scalar_value_json(report.value),
         report.declared_global_count,
         report.warmup_iterations,
         report.measured_iterations,
+        report.sample_inner_iterations,
         report
             .samples_ms
             .iter()
@@ -66,7 +73,9 @@ fn run_from_args(args: Vec<String>) -> Result<String, String> {
 }
 
 fn usage(program: &str) -> String {
-    format!("usage: {program} [--warmup=N] [--iterations=N] <bundle.hbc>")
+    format!(
+        "usage: {program} [--warmup=N] [--iterations=N] [--sample-inner-iterations=N] <bundle.hbc>"
+    )
 }
 
 fn parse_positive_u32(name: &str, value: &str, allow_zero: bool) -> Result<u32, String> {

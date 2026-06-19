@@ -17,6 +17,7 @@ type EngineRun = {
   value: boolean | number | string | null;
   warmupIterations: number;
   measuredIterations: number;
+  sampleInnerIterations?: number;
   samplesMs: number[];
   declaredGlobals?: number;
 };
@@ -223,6 +224,13 @@ function compareCase(
       `${caseId(sourcePath)} measured iterations differ: hermes=${hermesRun.measuredIterations} iris=${irisRun.measuredIterations}`,
     );
   }
+  const hermesInnerIterations = hermesRun.sampleInnerIterations ?? 1;
+  const irisInnerIterations = irisRun.sampleInnerIterations ?? 1;
+  if (hermesInnerIterations !== irisInnerIterations) {
+    throw new Error(
+      `${caseId(sourcePath)} sample inner iterations differ: hermes=${hermesInnerIterations} iris=${irisInnerIterations}`,
+    );
+  }
 
   const hermesStats = summarize(hermesRun.samplesMs);
   const irisStats = summarize(irisRun.samplesMs);
@@ -290,6 +298,9 @@ function mergeEngineRuns(engine: EngineName, runs: EngineRun[]): EngineRun {
         `${engine} repeated case mismatch: first=${firstRun.casePath} next=${run.casePath}`,
       );
     }
+    if ((firstRun.sampleInnerIterations ?? 1) !== (run.sampleInnerIterations ?? 1)) {
+      throw new Error(`${engine} repeated sample inner iterations mismatch.`);
+    }
   }
 
   return {
@@ -298,6 +309,7 @@ function mergeEngineRuns(engine: EngineName, runs: EngineRun[]): EngineRun {
     value: firstRun.value,
     warmupIterations: runs.reduce((sum, run) => sum + run.warmupIterations, 0),
     measuredIterations: runs.reduce((sum, run) => sum + run.measuredIterations, 0),
+    sampleInnerIterations: firstRun.sampleInnerIterations ?? 1,
     samplesMs: runs.flatMap((run) => run.samplesMs),
     declaredGlobals: firstRun.declaredGlobals,
   };
@@ -306,6 +318,7 @@ function mergeEngineRuns(engine: EngineName, runs: EngineRun[]): EngineRun {
 function main() {
   const warmupIterations = readNumberArg("--warmup", 3, true);
   const measuredIterations = readNumberArg("--iterations", 20);
+  const sampleInnerIterations = readNumberArg("--sample-inner-iterations", 1);
   const rounds = readNumberArg("--rounds", 1);
   const engineOrder = readEngineOrder(rounds);
   const outputPath = resolve(root, readArg("--output") ?? defaultOutputPath);
@@ -354,6 +367,7 @@ function main() {
           captureJson<EngineRun>(runner, [
             `--warmup=${warmupIterations}`,
             `--iterations=${measuredIterations}`,
+            `--sample-inner-iterations=${sampleInnerIterations}`,
             compiledCase.hbcPath,
           ]),
         );
@@ -385,14 +399,20 @@ function main() {
       iris: "Iris parses HBC once, then executes the global function with a fresh scalar executor state for each sample.",
       scope:
         "Host-side strict HBC microbenchmark, not a full React Native runtime replacement benchmark.",
+      sample:
+        sampleInnerIterations === 1
+          ? "Each measured sample evaluates the prepared HBC bundle once."
+          : `Each measured sample evaluates the prepared HBC bundle ${sampleInnerIterations} times and records the grouped elapsed time.`,
       order:
         "When rounds is greater than one, engine execution order can be alternated and case order is reversed on odd rounds to reduce first-run and thermal bias.",
     },
     warmupIterations,
     measuredIterations,
+    sampleInnerIterations,
     rounds,
     engineOrder,
     totalMeasuredIterations: measuredIterations * rounds,
+    totalMeasuredExecutions: measuredIterations * rounds * sampleInnerIterations,
     engines: {
       hermes: {
         frameworkDir: relativePath(hermesFrameworkDir),

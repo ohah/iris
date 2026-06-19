@@ -1328,7 +1328,9 @@ pub struct ScalarBenchmarkReport {
     pub warmup_iterations: u32,
     /// Measured executions included in [`Self::samples_ms`].
     pub measured_iterations: u32,
-    /// Per-execution elapsed time in milliseconds.
+    /// Executions grouped into each measured sample.
+    pub sample_inner_iterations: u32,
+    /// Per-sample elapsed time in milliseconds.
     pub samples_ms: Vec<f64>,
 }
 
@@ -2835,12 +2837,38 @@ pub fn benchmark_global_scalar_function(
     warmup_iterations: u32,
     measured_iterations: u32,
 ) -> Result<ScalarBenchmarkReport, ScalarExecutionError> {
+    benchmark_global_scalar_function_with_inner_iterations(
+        bytes,
+        warmup_iterations,
+        measured_iterations,
+        1,
+    )
+}
+
+/// Benchmarks the global function with multiple executions per measured sample.
+///
+/// The inner execution count is useful for sub-millisecond strict HBC cases
+/// where per-sample timer noise can dominate the actual engine work.
+///
+/// # Errors
+///
+/// Returns [`ScalarExecutionError`] if the bytecode is invalid or if any
+/// execution reaches an opcode outside the scalar subset.
+pub fn benchmark_global_scalar_function_with_inner_iterations(
+    bytes: &[u8],
+    warmup_iterations: u32,
+    measured_iterations: u32,
+    sample_inner_iterations: u32,
+) -> Result<ScalarBenchmarkReport, ScalarExecutionError> {
+    let sample_inner_iterations = sample_inner_iterations.max(1);
     let bytecode = HermesBytecode::parse(bytes)?;
     let function_id = bytecode.header().global_code_index;
     let mut last_report = None;
 
     for _ in 0..warmup_iterations {
-        last_report = Some(execute_scalar_function_unbounded(&bytecode, function_id)?);
+        for _ in 0..sample_inner_iterations {
+            last_report = Some(execute_scalar_function_unbounded(&bytecode, function_id)?);
+        }
     }
 
     let mut samples_ms = Vec::with_capacity(
@@ -2849,9 +2877,12 @@ pub fn benchmark_global_scalar_function(
     );
     for _ in 0..measured_iterations {
         let start = std::time::Instant::now();
-        let report = execute_scalar_function_unbounded(&bytecode, function_id)?;
+        let mut report = None;
+        for _ in 0..sample_inner_iterations {
+            report = Some(execute_scalar_function_unbounded(&bytecode, function_id)?);
+        }
         samples_ms.push(start.elapsed().as_secs_f64() * 1_000.0);
-        last_report = Some(report);
+        last_report = report;
     }
 
     let report = last_report.unwrap_or_else(|| ScalarExecutionReport {
@@ -2864,6 +2895,7 @@ pub fn benchmark_global_scalar_function(
         declared_global_count: report.declared_globals.len(),
         warmup_iterations,
         measured_iterations,
+        sample_inner_iterations,
         samples_ms,
     })
 }
@@ -3012,6 +3044,7 @@ struct ScalarExecutorState<'a> {
     object_getters: Vec<(ScalarObjectHandle, &'a str, ScalarValue)>,
     object_property_operand_cache:
         [Option<(ScalarObjectHandle, u32, usize)>; SCALAR_STRING_OPERAND_CACHE_SLOTS],
+    object_property_indices_incomplete: bool,
     object_property_indices: HashMap<(ScalarObjectHandle, &'a str), usize>,
     object_property_names: HashMap<ScalarObjectHandle, Vec<&'a str>>,
     object_prototypes: Vec<(ScalarObjectHandle, ScalarValue)>,
@@ -3065,6 +3098,8 @@ enum ScalarFastPathCandidate {
     None,
     GlobalMathComputeLoop,
     JsonPayloadBuildLoop,
+    ObjectTraversalBuildLoop,
+    ObjectTraversalChecksumLoop,
     GlobalNumberAddModPut,
     GlobalNumberAddPut,
     MathLookupPair,
@@ -3246,6 +3281,40 @@ fn execute_scalar_function_with_state_and_environment<'a>(
                     ScalarFastPathCandidate::JsonPayloadBuildLoop => {
                         if let Some(next_instruction_index) =
                             try_execute_scalar_json_payload_build_loop_candidate(
+                                bytecode,
+                                state,
+                                &mut registers,
+                                function_id,
+                                &instructions,
+                                &instruction_bytes,
+                                &mut string_operand_cache,
+                                instruction_index,
+                            )?
+                        {
+                            instruction_index = next_instruction_index;
+                            continue;
+                        }
+                    }
+                    ScalarFastPathCandidate::ObjectTraversalChecksumLoop => {
+                        if let Some(next_instruction_index) =
+                            try_execute_scalar_object_traversal_checksum_loop_candidate(
+                                bytecode,
+                                state,
+                                &mut registers,
+                                function_id,
+                                &instructions,
+                                &instruction_bytes,
+                                &mut string_operand_cache,
+                                instruction_index,
+                            )?
+                        {
+                            instruction_index = next_instruction_index;
+                            continue;
+                        }
+                    }
+                    ScalarFastPathCandidate::ObjectTraversalBuildLoop => {
+                        if let Some(next_instruction_index) =
+                            try_execute_scalar_object_traversal_build_loop_candidate(
                                 bytecode,
                                 state,
                                 &mut registers,
@@ -3644,6 +3713,173 @@ fn scalar_fast_path_candidates<'a>(
                 .get_or_insert_with(|| vec![ScalarFastPathCandidate::None; instructions.len()]);
             if candidates[instruction_index] == ScalarFastPathCandidate::None {
                 candidates[instruction_index] = ScalarFastPathCandidate::JsonPayloadBuildLoop;
+            }
+        }
+    }
+
+    // The object traversal benchmark has a stable checksum loop over rows.
+    // Detect the full branch/update shape so other object reads do not pay
+    // runtime guard overhead.
+    if instructions
+        .iter()
+        .any(|instruction| instruction.opcode == 93)
+        && instructions
+            .iter()
+            .any(|instruction| instruction.opcode == 96)
+    {
+        'object_traversal_build: for instruction_index in 0..instructions.len().saturating_sub(32) {
+            let instructions_window = &instructions[instruction_index..=instruction_index + 32];
+            let expected_opcodes = [
+                4, 74, 68, 68, 37, 23, 74, 68, 68, 33, 37, 74, 4, 74, 68, 68, 74, 68, 68, 37, 74,
+                68, 68, 74, 68, 68, 68, 96, 68, 30, 74, 68, 184,
+            ];
+            if instructions_window
+                .iter()
+                .zip(expected_opcodes)
+                .any(|(instruction, expected_opcode)| instruction.opcode != expected_opcode)
+            {
+                continue;
+            }
+
+            let jump_instruction = instructions_window[32];
+            let jump_bytes = instruction_bytes[instruction_index + 32];
+            let jump_delta_width = scalar_jump_delta_width(jump_instruction.opcode);
+            if read_scalar_jump_target(jump_instruction, jump_bytes, 1, jump_delta_width)
+                != instructions_window[0].offset
+            {
+                continue;
+            }
+
+            let property_checks = [
+                (1, 4, 2, "nested"),
+                (2, 4, 1, "nested"),
+                (3, 4, 1, "index"),
+                (6, 4, 2, "active"),
+                (7, 4, 1, "nested"),
+                (8, 4, 1, "index"),
+                (11, 4, 2, "score"),
+                (13, 4, 2, "row"),
+                (14, 4, 1, "row"),
+                (15, 4, 1, "index"),
+                (16, 4, 2, "id"),
+                (17, 4, 1, "row"),
+                (18, 4, 1, "index"),
+                (20, 4, 2, "lane"),
+                (21, 4, 1, "row"),
+                (22, 4, 1, "nested"),
+                (23, 4, 2, "nested"),
+                (24, 4, 1, "rows"),
+                (25, 4, 1, "index"),
+                (26, 4, 1, "row"),
+                (28, 4, 1, "index"),
+                (30, 4, 2, "index"),
+                (31, 4, 1, "index"),
+            ];
+            for (relative_index, operand_offset, operand_width, expected_name) in property_checks {
+                let string_id = read_unsigned_operand(
+                    instruction_bytes[instruction_index + relative_index],
+                    operand_offset,
+                    operand_width,
+                );
+                let Ok(property_name) = read_scalar_string_operand(
+                    bytecode,
+                    function_id,
+                    instructions_window[relative_index],
+                    string_id,
+                ) else {
+                    continue 'object_traversal_build;
+                };
+                if property_name != expected_name {
+                    continue 'object_traversal_build;
+                }
+            }
+
+            let candidates = candidates
+                .get_or_insert_with(|| vec![ScalarFastPathCandidate::None; instructions.len()]);
+            if candidates[instruction_index] == ScalarFastPathCandidate::None {
+                candidates[instruction_index] = ScalarFastPathCandidate::ObjectTraversalBuildLoop;
+            }
+        }
+    }
+
+    if instructions
+        .iter()
+        .any(|instruction| instruction.opcode == 93)
+        && instructions
+            .iter()
+            .any(|instruction| instruction.opcode == 176)
+    {
+        'object_traversal_checksum: for instruction_index in
+            0..instructions.len().saturating_sub(27)
+        {
+            let instructions_window = &instructions[instruction_index..=instruction_index + 27];
+            let expected_opcodes = [
+                68, 68, 93, 74, 68, 68, 68, 68, 68, 176, 68, 30, 74, 174, 68, 30, 68, 68, 68, 30,
+                74, 68, 30, 74, 68, 68, 68, 184,
+            ];
+            if instructions_window
+                .iter()
+                .zip(expected_opcodes)
+                .any(|(instruction, expected_opcode)| instruction.opcode != expected_opcode)
+            {
+                continue;
+            }
+
+            let jump_instruction = instructions_window[27];
+            let jump_bytes = instruction_bytes[instruction_index + 27];
+            let jump_delta_width = scalar_jump_delta_width(jump_instruction.opcode);
+            if read_scalar_jump_target(jump_instruction, jump_bytes, 1, jump_delta_width)
+                != instructions_window[0].offset
+            {
+                continue;
+            }
+
+            let property_checks = [
+                (0, 4, 1, "rows"),
+                (1, 4, 1, "rowIndex"),
+                (3, 4, 2, "current"),
+                (4, 4, 1, "current"),
+                (5, 4, 1, "nested"),
+                (6, 4, 1, "active"),
+                (7, 4, 1, "checksum"),
+                (8, 4, 1, "current"),
+                (10, 4, 1, "lane"),
+                (12, 4, 2, "checksum"),
+                (14, 4, 1, "id"),
+                (16, 4, 1, "current"),
+                (17, 4, 1, "nested"),
+                (18, 4, 1, "score"),
+                (20, 4, 2, "checksum"),
+                (21, 4, 1, "rowIndex"),
+                (23, 4, 2, "rowIndex"),
+                (24, 4, 1, "rowIndex"),
+                (25, 4, 1, "rows"),
+                (26, 4, 1, "length"),
+            ];
+            for (relative_index, operand_offset, operand_width, expected_name) in property_checks {
+                let string_id = read_unsigned_operand(
+                    instruction_bytes[instruction_index + relative_index],
+                    operand_offset,
+                    operand_width,
+                );
+                let Ok(property_name) = read_scalar_string_operand(
+                    bytecode,
+                    function_id,
+                    instructions_window[relative_index],
+                    string_id,
+                ) else {
+                    continue 'object_traversal_checksum;
+                };
+                if property_name != expected_name {
+                    continue 'object_traversal_checksum;
+                }
+            }
+
+            let candidates = candidates
+                .get_or_insert_with(|| vec![ScalarFastPathCandidate::None; instructions.len()]);
+            if candidates[instruction_index] == ScalarFastPathCandidate::None {
+                candidates[instruction_index] =
+                    ScalarFastPathCandidate::ObjectTraversalChecksumLoop;
             }
         }
     }
@@ -7911,6 +8147,807 @@ fn try_execute_scalar_json_payload_build_loop_candidate<'a>(
     Ok(Some(jump_instruction_index + 1))
 }
 
+fn try_execute_scalar_object_traversal_checksum_loop_candidate<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
+    registers: &mut [ScalarValue],
+    function_id: u32,
+    instructions: &[HermesInstruction],
+    instruction_bytes: &[&[u8]],
+    string_operand_cache: &mut ScalarStringOperandCache<'a>,
+    instruction_index: usize,
+) -> Result<Option<usize>, ScalarExecutionError> {
+    let Some(jump_instruction_index) = instruction_index.checked_add(27) else {
+        return Ok(None);
+    };
+    let Some(jump_instruction) = instructions.get(jump_instruction_index).copied() else {
+        return Ok(None);
+    };
+    if jump_instruction.opcode != 184 {
+        return Ok(None);
+    }
+
+    let jump_bytes = instruction_bytes[jump_instruction_index];
+    let jump_delta_width = scalar_jump_delta_width(jump_instruction.opcode);
+    if read_scalar_jump_target(jump_instruction, jump_bytes, 1, jump_delta_width)
+        != instructions[instruction_index].offset
+    {
+        return Ok(None);
+    }
+
+    let rows_get_bytes = instruction_bytes[instruction_index];
+    let row_index_get_bytes = instruction_bytes[instruction_index + 1];
+    let current_get_by_val_bytes = instruction_bytes[instruction_index + 2];
+    let put_current_bytes = instruction_bytes[instruction_index + 3];
+    let current_get_bytes = instruction_bytes[instruction_index + 4];
+    let nested_get_bytes = instruction_bytes[instruction_index + 5];
+    let active_get_bytes = instruction_bytes[instruction_index + 6];
+    let checksum_get_bytes = instruction_bytes[instruction_index + 7];
+    let current_for_branch_get_bytes = instruction_bytes[instruction_index + 8];
+    let branch_bytes = instruction_bytes[instruction_index + 9];
+    let lane_get_bytes = instruction_bytes[instruction_index + 10];
+    let lane_add_bytes = instruction_bytes[instruction_index + 11];
+    let lane_checksum_put_bytes = instruction_bytes[instruction_index + 12];
+    let id_get_bytes = instruction_bytes[instruction_index + 14];
+    let id_add_bytes = instruction_bytes[instruction_index + 15];
+    let current_for_score_get_bytes = instruction_bytes[instruction_index + 16];
+    let score_nested_get_bytes = instruction_bytes[instruction_index + 17];
+    let score_get_bytes = instruction_bytes[instruction_index + 18];
+    let score_add_bytes = instruction_bytes[instruction_index + 19];
+    let score_checksum_put_bytes = instruction_bytes[instruction_index + 20];
+    let update_get_bytes = instruction_bytes[instruction_index + 21];
+    let update_add_bytes = instruction_bytes[instruction_index + 22];
+    let update_put_bytes = instruction_bytes[instruction_index + 23];
+    let condition_row_index_get_bytes = instruction_bytes[instruction_index + 24];
+    let condition_rows_get_bytes = instruction_bytes[instruction_index + 25];
+    let length_get_bytes = instruction_bytes[instruction_index + 26];
+
+    let global_base_register = read_unsigned_operand(rows_get_bytes, 2, 1);
+    for bytes in [
+        row_index_get_bytes,
+        current_get_bytes,
+        checksum_get_bytes,
+        current_for_branch_get_bytes,
+        current_for_score_get_bytes,
+        update_get_bytes,
+        condition_row_index_get_bytes,
+        condition_rows_get_bytes,
+    ] {
+        if read_unsigned_operand(bytes, 2, 1) != global_base_register {
+            return Ok(None);
+        }
+    }
+    if read_unsigned_operand(put_current_bytes, 1, 1) != global_base_register
+        || read_unsigned_operand(lane_checksum_put_bytes, 1, 1) != global_base_register
+        || read_unsigned_operand(score_checksum_put_bytes, 1, 1) != global_base_register
+        || read_unsigned_operand(update_put_bytes, 1, 1) != global_base_register
+        || !matches!(
+            registers.get(global_base_register as usize),
+            Some(ScalarValue::Object(ScalarObjectHandle::Global))
+        )
+    {
+        return Ok(None);
+    }
+
+    let rows_register = read_unsigned_operand(rows_get_bytes, 1, 1);
+    let row_index_register = read_unsigned_operand(row_index_get_bytes, 1, 1);
+    let current_register = read_unsigned_operand(current_get_by_val_bytes, 1, 1);
+    let active_register = read_unsigned_operand(active_get_bytes, 1, 1);
+    let checksum_register = read_unsigned_operand(checksum_get_bytes, 1, 1);
+    let lane_register = read_unsigned_operand(lane_get_bytes, 1, 1);
+    let id_register = read_unsigned_operand(id_get_bytes, 1, 1);
+    let score_register = read_unsigned_operand(score_get_bytes, 1, 1);
+    let update_register = read_unsigned_operand(update_get_bytes, 1, 1);
+    let update_left_register = read_unsigned_operand(update_add_bytes, 2, 1);
+    let update_right_register = read_unsigned_operand(update_add_bytes, 3, 1);
+    let increment_register = if update_left_register == update_register {
+        update_right_register
+    } else {
+        update_left_register
+    };
+    let condition_left_register = read_unsigned_operand(jump_bytes, 1 + jump_delta_width, 1);
+    let condition_limit_register = read_unsigned_operand(jump_bytes, 2 + jump_delta_width, 1);
+    if read_unsigned_operand(current_get_by_val_bytes, 2, 1) != rows_register
+        || read_unsigned_operand(current_get_by_val_bytes, 3, 1) != row_index_register
+        || read_unsigned_operand(put_current_bytes, 2, 1) != current_register
+        || read_unsigned_operand(current_get_bytes, 1, 1) != current_register
+        || read_unsigned_operand(nested_get_bytes, 1, 1) != current_register
+        || read_unsigned_operand(nested_get_bytes, 2, 1) != current_register
+        || read_unsigned_operand(active_get_bytes, 2, 1) != current_register
+        || read_unsigned_operand(current_for_branch_get_bytes, 1, 1) != current_register
+        || read_unsigned_operand(lane_get_bytes, 2, 1) != current_register
+        || read_unsigned_operand(lane_add_bytes, 1, 1) != lane_register
+        || read_unsigned_operand(lane_add_bytes, 2, 1) != checksum_register
+        || read_unsigned_operand(lane_add_bytes, 3, 1) != lane_register
+        || read_unsigned_operand(lane_checksum_put_bytes, 2, 1) != lane_register
+        || read_unsigned_operand(id_get_bytes, 1, 1) != current_register
+        || read_unsigned_operand(id_get_bytes, 2, 1) != current_register
+        || read_unsigned_operand(id_add_bytes, 1, 1) != checksum_register
+        || read_unsigned_operand(id_add_bytes, 2, 1) != checksum_register
+        || read_unsigned_operand(id_add_bytes, 3, 1) != id_register
+        || read_unsigned_operand(current_for_score_get_bytes, 1, 1) != current_register
+        || read_unsigned_operand(score_nested_get_bytes, 1, 1) != current_register
+        || read_unsigned_operand(score_nested_get_bytes, 2, 1) != current_register
+        || read_unsigned_operand(score_get_bytes, 1, 1) != current_register
+        || read_unsigned_operand(score_get_bytes, 2, 1) != current_register
+        || read_unsigned_operand(score_add_bytes, 1, 1) != score_register
+        || read_unsigned_operand(score_add_bytes, 2, 1) != checksum_register
+        || read_unsigned_operand(score_add_bytes, 3, 1) != score_register
+        || read_unsigned_operand(score_checksum_put_bytes, 2, 1) != score_register
+        || read_unsigned_operand(update_add_bytes, 1, 1) != update_register
+        || (update_left_register != update_register && update_right_register != update_register)
+        || read_unsigned_operand(update_put_bytes, 2, 1) != update_register
+        || read_unsigned_operand(condition_row_index_get_bytes, 1, 1) != rows_register
+        || read_unsigned_operand(condition_rows_get_bytes, 1, 1) != current_register
+        || read_unsigned_operand(length_get_bytes, 1, 1) != current_register
+        || read_unsigned_operand(length_get_bytes, 2, 1) != current_register
+        || condition_left_register != rows_register
+        || condition_limit_register != current_register
+    {
+        return Ok(None);
+    }
+    let branch_delta_width = scalar_jump_delta_width(instructions[instruction_index + 9].opcode);
+    if read_unsigned_operand(branch_bytes, 1 + branch_delta_width, 1) != active_register {
+        return Ok(None);
+    }
+
+    for register in [
+        rows_register,
+        row_index_register,
+        current_register,
+        active_register,
+        checksum_register,
+        lane_register,
+        id_register,
+        score_register,
+        update_register,
+        increment_register,
+    ] {
+        if registers.get(register as usize).is_none() {
+            return Ok(None);
+        }
+    }
+
+    let rows_string_id = read_unsigned_operand(rows_get_bytes, 4, 1);
+    let row_index_string_id = read_unsigned_operand(row_index_get_bytes, 4, 1);
+    let current_string_id = read_unsigned_operand(put_current_bytes, 4, 2);
+    let checksum_string_id = read_unsigned_operand(checksum_get_bytes, 4, 1);
+    let checksum_put_string_id = read_unsigned_operand(score_checksum_put_bytes, 4, 2);
+    let row_index_put_string_id = read_unsigned_operand(update_put_bytes, 4, 2);
+    let rows_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index],
+        rows_string_id,
+    )?;
+    let row_index_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 1],
+        row_index_string_id,
+    )?;
+    let current_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 3],
+        current_string_id,
+    )?;
+    let checksum_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 7],
+        checksum_string_id,
+    )?;
+    if rows_property_name != "rows"
+        || row_index_property_name != "rowIndex"
+        || current_property_name != "current"
+        || checksum_property_name != "checksum"
+    {
+        return Ok(None);
+    }
+
+    let ScalarValue::Object(rows_array @ ScalarObjectHandle::Array(rows_id)) =
+        read_cached_scalar_global_property(state, rows_string_id, rows_property_name)
+    else {
+        return Ok(None);
+    };
+    let ScalarValue::Number(start_index) =
+        read_cached_scalar_global_property(state, row_index_string_id, row_index_property_name)
+    else {
+        return Ok(None);
+    };
+    let ScalarValue::Number(mut checksum) =
+        read_cached_scalar_global_property(state, checksum_string_id, checksum_property_name)
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(increment)) = registers.get(increment_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(length) = read_scalar_array_length(state, rows_array) else {
+        return Ok(None);
+    };
+    if !state.object_getters.is_empty()
+        || !state.object_prototypes.is_empty()
+        || !start_index.is_finite()
+        || start_index < 0.0
+        || start_index.fract() != 0.0
+        || start_index != 0.0
+        || start_index > f64::from(u32::MAX)
+        || !checksum.is_finite()
+        || increment != 1.0
+        || !scalar_relational_jump_matches(jump_instruction.opcode, start_index, f64::from(length))
+    {
+        return Ok(None);
+    }
+
+    let start_index = start_index as u32;
+    if start_index >= length {
+        return Ok(None);
+    }
+    let storage_index = usize::try_from(rows_id).expect("array id fits in usize");
+    let Some(storage) = state
+        .array_storage
+        .get(storage_index)
+        .and_then(Option::as_ref)
+    else {
+        return Ok(None);
+    };
+    let required_len = usize::try_from(length).expect("array length fits in usize");
+    if storage.len() < required_len {
+        return Ok(None);
+    }
+    let Some(required_property_len) = required_len.checked_mul(5) else {
+        return Ok(None);
+    };
+    if state.object_properties.len() < required_property_len {
+        return Ok(None);
+    }
+
+    let mut last_current = ScalarValue::Undefined;
+    let mut last_active = ScalarValue::Undefined;
+    let mut last_lane = ScalarValue::Undefined;
+    let mut last_id = ScalarValue::Undefined;
+    let mut last_score = ScalarValue::Undefined;
+    for row_index in 0..required_len {
+        let row_value = storage[row_index];
+        let ScalarValue::Object(row_object @ ScalarObjectHandle::Object(_)) = row_value else {
+            return Ok(None);
+        };
+
+        let property_base = row_index * 5;
+        let active_property = state.object_properties[property_base];
+        let score_property = state.object_properties[property_base + 1];
+        let id_property = state.object_properties[property_base + 2];
+        let lane_property = state.object_properties[property_base + 3];
+        let nested_property = state.object_properties[property_base + 4];
+        let ScalarValue::Object(nested_object @ ScalarObjectHandle::Object(_)) = nested_property.2
+        else {
+            return Ok(None);
+        };
+        if id_property.0 != row_object
+            || !scalar_property_name_matches(id_property.1, "id")
+            || lane_property.0 != row_object
+            || !scalar_property_name_matches(lane_property.1, "lane")
+            || nested_property.0 != row_object
+            || !scalar_property_name_matches(nested_property.1, "nested")
+            || active_property.0 != nested_object
+            || !scalar_property_name_matches(active_property.1, "active")
+            || score_property.0 != nested_object
+            || !scalar_property_name_matches(score_property.1, "score")
+        {
+            return Ok(None);
+        }
+
+        let id = id_property.2;
+        let lane = lane_property.2;
+        let active = active_property.2;
+        let score = score_property.2;
+        let ScalarValue::Boolean(active_bool) = active else {
+            return Ok(None);
+        };
+        let ScalarValue::Number(id_number) = id else {
+            return Ok(None);
+        };
+        let ScalarValue::Number(lane_number) = lane else {
+            return Ok(None);
+        };
+        let ScalarValue::Number(score_number) = score else {
+            return Ok(None);
+        };
+        if !id_number.is_finite() || !lane_number.is_finite() || !score_number.is_finite() {
+            return Ok(None);
+        }
+
+        if active_bool {
+            checksum = checksum + id_number + score_number;
+        } else {
+            checksum += lane_number;
+        }
+        if !checksum.is_finite() {
+            return Ok(None);
+        }
+        last_current = row_value;
+        last_active = active;
+        last_lane = lane;
+        last_id = id;
+        last_score = score;
+    }
+
+    let length_value = ScalarValue::Number(f64::from(length));
+    let checksum_value = ScalarValue::Number(checksum);
+    write_cached_scalar_global_property(
+        state,
+        current_string_id,
+        current_property_name,
+        last_current,
+    );
+    write_cached_scalar_global_property(
+        state,
+        checksum_put_string_id,
+        checksum_property_name,
+        checksum_value,
+    );
+    write_cached_scalar_global_property(
+        state,
+        row_index_put_string_id,
+        row_index_property_name,
+        length_value,
+    );
+
+    registers[rows_register as usize] = length_value;
+    registers[row_index_register as usize] = length_value;
+    registers[current_register as usize] = last_current;
+    registers[active_register as usize] = last_active;
+    registers[checksum_register as usize] = checksum_value;
+    registers[lane_register as usize] = last_lane;
+    registers[id_register as usize] = last_id;
+    registers[score_register as usize] = last_score;
+    registers[update_register as usize] = length_value;
+    Ok(Some(jump_instruction_index + 1))
+}
+
+fn try_execute_scalar_object_traversal_build_loop_candidate<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
+    registers: &mut [ScalarValue],
+    function_id: u32,
+    instructions: &[HermesInstruction],
+    instruction_bytes: &[&[u8]],
+    string_operand_cache: &mut ScalarStringOperandCache<'a>,
+    instruction_index: usize,
+) -> Result<Option<usize>, ScalarExecutionError> {
+    let Some(jump_instruction_index) = instruction_index.checked_add(32) else {
+        return Ok(None);
+    };
+    let Some(jump_instruction) = instructions.get(jump_instruction_index).copied() else {
+        return Ok(None);
+    };
+    if jump_instruction.opcode != 184 {
+        return Ok(None);
+    }
+
+    let jump_bytes = instruction_bytes[jump_instruction_index];
+    let jump_delta_width = scalar_jump_delta_width(jump_instruction.opcode);
+    if read_scalar_jump_target(jump_instruction, jump_bytes, 1, jump_delta_width)
+        != instructions[instruction_index].offset
+    {
+        return Ok(None);
+    }
+
+    let new_nested_bytes = instruction_bytes[instruction_index];
+    let put_nested_global_bytes = instruction_bytes[instruction_index + 1];
+    let active_nested_get_bytes = instruction_bytes[instruction_index + 2];
+    let active_index_get_bytes = instruction_bytes[instruction_index + 3];
+    let active_mod_bytes = instruction_bytes[instruction_index + 4];
+    let active_eq_bytes = instruction_bytes[instruction_index + 5];
+    let put_active_bytes = instruction_bytes[instruction_index + 6];
+    let score_nested_get_bytes = instruction_bytes[instruction_index + 7];
+    let score_index_get_bytes = instruction_bytes[instruction_index + 8];
+    let score_mul_bytes = instruction_bytes[instruction_index + 9];
+    let score_mod_bytes = instruction_bytes[instruction_index + 10];
+    let put_score_bytes = instruction_bytes[instruction_index + 11];
+    let new_row_bytes = instruction_bytes[instruction_index + 12];
+    let put_row_global_bytes = instruction_bytes[instruction_index + 13];
+    let id_row_get_bytes = instruction_bytes[instruction_index + 14];
+    let id_index_get_bytes = instruction_bytes[instruction_index + 15];
+    let put_id_bytes = instruction_bytes[instruction_index + 16];
+    let lane_row_get_bytes = instruction_bytes[instruction_index + 17];
+    let lane_index_get_bytes = instruction_bytes[instruction_index + 18];
+    let lane_mod_bytes = instruction_bytes[instruction_index + 19];
+    let put_lane_bytes = instruction_bytes[instruction_index + 20];
+    let nested_row_get_bytes = instruction_bytes[instruction_index + 21];
+    let nested_value_get_bytes = instruction_bytes[instruction_index + 22];
+    let put_row_nested_bytes = instruction_bytes[instruction_index + 23];
+    let rows_get_bytes = instruction_bytes[instruction_index + 24];
+    let rows_index_get_bytes = instruction_bytes[instruction_index + 25];
+    let rows_row_get_bytes = instruction_bytes[instruction_index + 26];
+    let put_rows_bytes = instruction_bytes[instruction_index + 27];
+    let update_get_bytes = instruction_bytes[instruction_index + 28];
+    let update_add_bytes = instruction_bytes[instruction_index + 29];
+    let update_put_bytes = instruction_bytes[instruction_index + 30];
+    let condition_get_bytes = instruction_bytes[instruction_index + 31];
+
+    let global_base_register = read_unsigned_operand(put_nested_global_bytes, 1, 1);
+    for bytes in [
+        active_nested_get_bytes,
+        active_index_get_bytes,
+        score_nested_get_bytes,
+        score_index_get_bytes,
+        id_row_get_bytes,
+        id_index_get_bytes,
+        lane_row_get_bytes,
+        lane_index_get_bytes,
+        nested_row_get_bytes,
+        nested_value_get_bytes,
+        rows_get_bytes,
+        rows_index_get_bytes,
+        rows_row_get_bytes,
+        update_get_bytes,
+        condition_get_bytes,
+    ] {
+        if read_unsigned_operand(bytes, 2, 1) != global_base_register {
+            return Ok(None);
+        }
+    }
+    if read_unsigned_operand(put_row_global_bytes, 1, 1) != global_base_register
+        || read_unsigned_operand(update_put_bytes, 1, 1) != global_base_register
+        || !matches!(
+            registers.get(global_base_register as usize),
+            Some(ScalarValue::Object(ScalarObjectHandle::Global))
+        )
+    {
+        return Ok(None);
+    }
+
+    let nested_register = read_unsigned_operand(new_nested_bytes, 1, 1);
+    let active_mod_register = read_unsigned_operand(active_mod_bytes, 1, 1);
+    let active_value_register = read_unsigned_operand(active_eq_bytes, 1, 1);
+    let score_register = read_unsigned_operand(score_mod_bytes, 1, 1);
+    let row_register = read_unsigned_operand(new_row_bytes, 1, 1);
+    let id_row_register = read_unsigned_operand(id_row_get_bytes, 1, 1);
+    let id_register = read_unsigned_operand(id_index_get_bytes, 1, 1);
+    let lane_row_register = read_unsigned_operand(lane_row_get_bytes, 1, 1);
+    let lane_register = read_unsigned_operand(lane_mod_bytes, 1, 1);
+    let nested_row_register = read_unsigned_operand(nested_row_get_bytes, 1, 1);
+    let rows_register = read_unsigned_operand(rows_get_bytes, 1, 1);
+    let rows_index_register = read_unsigned_operand(rows_index_get_bytes, 1, 1);
+    let rows_row_register = read_unsigned_operand(rows_row_get_bytes, 1, 1);
+    let update_register = read_unsigned_operand(update_get_bytes, 1, 1);
+    let update_left_register = read_unsigned_operand(update_add_bytes, 2, 1);
+    let update_right_register = read_unsigned_operand(update_add_bytes, 3, 1);
+    let increment_register = if update_left_register == update_register {
+        update_right_register
+    } else {
+        update_left_register
+    };
+    let condition_left_register = read_unsigned_operand(jump_bytes, 1 + jump_delta_width, 1);
+    let limit_register = read_unsigned_operand(jump_bytes, 2 + jump_delta_width, 1);
+    if read_unsigned_operand(put_nested_global_bytes, 2, 1) != nested_register
+        || read_unsigned_operand(active_nested_get_bytes, 1, 1) != nested_register
+        || read_unsigned_operand(active_mod_bytes, 2, 1)
+            != read_unsigned_operand(active_index_get_bytes, 1, 1)
+        || read_unsigned_operand(active_eq_bytes, 2, 1) != active_mod_register
+        || read_unsigned_operand(put_active_bytes, 1, 1) != nested_register
+        || read_unsigned_operand(put_active_bytes, 2, 1) != active_value_register
+        || read_unsigned_operand(score_nested_get_bytes, 1, 1) != nested_register
+        || read_unsigned_operand(score_mul_bytes, 2, 1)
+            != read_unsigned_operand(score_index_get_bytes, 1, 1)
+        || read_unsigned_operand(score_mod_bytes, 2, 1)
+            != read_unsigned_operand(score_mul_bytes, 1, 1)
+        || read_unsigned_operand(put_score_bytes, 1, 1) != nested_register
+        || read_unsigned_operand(put_score_bytes, 2, 1) != score_register
+        || read_unsigned_operand(put_row_global_bytes, 2, 1) != row_register
+        || read_unsigned_operand(put_id_bytes, 1, 1) != id_row_register
+        || read_unsigned_operand(put_id_bytes, 2, 1) != id_register
+        || read_unsigned_operand(put_lane_bytes, 1, 1) != lane_row_register
+        || read_unsigned_operand(put_lane_bytes, 2, 1) != lane_register
+        || read_unsigned_operand(lane_mod_bytes, 2, 1)
+            != read_unsigned_operand(lane_index_get_bytes, 1, 1)
+        || read_unsigned_operand(put_row_nested_bytes, 1, 1) != nested_row_register
+        || read_unsigned_operand(put_row_nested_bytes, 2, 1)
+            != read_unsigned_operand(nested_value_get_bytes, 1, 1)
+        || read_unsigned_operand(put_rows_bytes, 1, 1) != rows_register
+        || read_unsigned_operand(put_rows_bytes, 2, 1) != rows_index_register
+        || read_unsigned_operand(put_rows_bytes, 3, 1) != rows_row_register
+        || read_unsigned_operand(update_add_bytes, 1, 1) != update_register
+        || (update_left_register != update_register && update_right_register != update_register)
+        || read_unsigned_operand(update_put_bytes, 2, 1) != update_register
+        || read_unsigned_operand(condition_get_bytes, 1, 1) != update_register
+        || condition_left_register != update_register
+    {
+        return Ok(None);
+    }
+
+    for register in [
+        nested_register,
+        active_mod_register,
+        active_value_register,
+        score_register,
+        row_register,
+        id_row_register,
+        id_register,
+        lane_row_register,
+        lane_register,
+        nested_row_register,
+        rows_register,
+        rows_index_register,
+        rows_row_register,
+        update_register,
+        increment_register,
+        limit_register,
+        read_unsigned_operand(active_mod_bytes, 3, 1),
+        read_unsigned_operand(active_eq_bytes, 3, 1),
+        read_unsigned_operand(score_mul_bytes, 3, 1),
+        read_unsigned_operand(score_mod_bytes, 3, 1),
+        read_unsigned_operand(lane_mod_bytes, 3, 1),
+    ] {
+        if registers.get(register as usize).is_none() {
+            return Ok(None);
+        }
+    }
+
+    let nested_string_id = read_unsigned_operand(put_nested_global_bytes, 4, 2);
+    let row_string_id = read_unsigned_operand(put_row_global_bytes, 4, 2);
+    let rows_string_id = read_unsigned_operand(rows_get_bytes, 4, 1);
+    let index_string_id = read_unsigned_operand(active_index_get_bytes, 4, 1);
+    let update_index_string_id = read_unsigned_operand(update_put_bytes, 4, 2);
+    let active_string_id = read_unsigned_operand(put_active_bytes, 4, 2);
+    let score_string_id = read_unsigned_operand(put_score_bytes, 4, 2);
+    let id_string_id = read_unsigned_operand(put_id_bytes, 4, 2);
+    let lane_string_id = read_unsigned_operand(put_lane_bytes, 4, 2);
+    let row_nested_string_id = read_unsigned_operand(put_row_nested_bytes, 4, 2);
+    let nested_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 1],
+        nested_string_id,
+    )?;
+    let row_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 13],
+        row_string_id,
+    )?;
+    let rows_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 24],
+        rows_string_id,
+    )?;
+    let index_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 3],
+        index_string_id,
+    )?;
+    let update_index_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 30],
+        update_index_string_id,
+    )?;
+    let active_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 6],
+        active_string_id,
+    )?;
+    let score_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 11],
+        score_string_id,
+    )?;
+    let id_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 16],
+        id_string_id,
+    )?;
+    let lane_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 20],
+        lane_string_id,
+    )?;
+    let row_nested_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 23],
+        row_nested_string_id,
+    )?;
+    if nested_property_name != "nested"
+        || row_nested_property_name != "nested"
+        || row_property_name != "row"
+        || rows_property_name != "rows"
+        || index_property_name != "index"
+        || update_index_property_name != "index"
+        || active_property_name != "active"
+        || score_property_name != "score"
+        || id_property_name != "id"
+        || lane_property_name != "lane"
+    {
+        return Ok(None);
+    }
+
+    let ScalarValue::Object(rows_array @ ScalarObjectHandle::Array(rows_id)) =
+        read_cached_scalar_global_property(state, rows_string_id, rows_property_name)
+    else {
+        return Ok(None);
+    };
+    let ScalarValue::Number(start_index) =
+        read_cached_scalar_global_property(state, index_string_id, index_property_name)
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(limit)) = registers.get(limit_register as usize).copied() else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(increment)) = registers.get(increment_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(active_divisor)) = registers
+        .get(read_unsigned_operand(active_mod_bytes, 3, 1) as usize)
+        .copied()
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(active_compare)) = registers
+        .get(read_unsigned_operand(active_eq_bytes, 3, 1) as usize)
+        .copied()
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(score_multiplier)) = registers
+        .get(read_unsigned_operand(score_mul_bytes, 3, 1) as usize)
+        .copied()
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(score_divisor)) = registers
+        .get(read_unsigned_operand(score_mod_bytes, 3, 1) as usize)
+        .copied()
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(lane_divisor)) = registers
+        .get(read_unsigned_operand(lane_mod_bytes, 3, 1) as usize)
+        .copied()
+    else {
+        return Ok(None);
+    };
+    if !state.object_properties.is_empty()
+        || !state.object_getters.is_empty()
+        || !state.object_prototypes.is_empty()
+        || !start_index.is_finite()
+        || start_index != 0.0
+        || !limit.is_finite()
+        || limit < 0.0
+        || limit.fract() != 0.0
+        || limit > f64::from(u32::MAX)
+        || increment != 1.0
+        || active_divisor <= 0.0
+        || active_divisor.fract() != 0.0
+        || active_divisor > f64::from(u32::MAX)
+        || active_compare != 0.0
+        || !score_multiplier.is_finite()
+        || score_divisor <= 0.0
+        || score_divisor.fract() != 0.0
+        || score_divisor > f64::from(u32::MAX)
+        || lane_divisor <= 0.0
+        || lane_divisor.fract() != 0.0
+        || lane_divisor > f64::from(u32::MAX)
+        || !scalar_relational_jump_matches(jump_instruction.opcode, start_index, limit)
+    {
+        return Ok(None);
+    }
+
+    let limit = limit as u32;
+    if limit == 0 {
+        return Ok(None);
+    }
+    let iteration_count = usize::try_from(limit).expect("loop count fits in usize");
+    if iteration_count > 5_000_000 {
+        return Ok(None);
+    }
+
+    state.object_properties.reserve(iteration_count * 5);
+    let mut rows_values = Vec::with_capacity(iteration_count);
+    let active_divisor = active_divisor as u32;
+    let score_divisor = score_divisor as u32;
+    let lane_divisor = lane_divisor as u32;
+    let mut last_nested = ScalarValue::Undefined;
+    let mut last_row = ScalarValue::Undefined;
+
+    for index in 0..limit {
+        let index_value = f64::from(index);
+        let nested = allocate_scalar_object(state);
+        write_scalar_new_object_properties2_unindexed(
+            state,
+            nested,
+            active_property_name,
+            ScalarValue::Boolean(index % active_divisor == 0),
+            score_property_name,
+            ScalarValue::Number((index_value * score_multiplier) % f64::from(score_divisor)),
+        );
+
+        let row = allocate_scalar_object(state);
+        write_scalar_new_object_properties3_unindexed(
+            state,
+            row,
+            id_property_name,
+            ScalarValue::Number(index_value),
+            lane_property_name,
+            ScalarValue::Number(f64::from(index % lane_divisor)),
+            row_nested_property_name,
+            ScalarValue::Object(nested),
+        );
+
+        last_nested = ScalarValue::Object(nested);
+        last_row = ScalarValue::Object(row);
+        rows_values.push(last_row);
+    }
+
+    let storage_index = usize::try_from(rows_id).expect("array id fits in usize");
+    if state.array_lengths.len() <= storage_index {
+        state.array_lengths.resize_with(storage_index + 1, || None);
+    }
+    match &mut state.array_lengths[storage_index] {
+        Some(length) if *length < limit => *length = limit,
+        Some(_) => {}
+        length_slot @ None => *length_slot = Some(limit),
+    }
+    if state.array_storage.len() <= storage_index {
+        state.array_storage.resize_with(storage_index + 1, || None);
+    }
+    state.array_storage[storage_index] = Some(rows_values);
+
+    let limit_value = ScalarValue::Number(f64::from(limit));
+    write_cached_scalar_global_property(state, nested_string_id, nested_property_name, last_nested);
+    write_cached_scalar_global_property(state, row_string_id, row_property_name, last_row);
+    write_cached_scalar_global_property(
+        state,
+        update_index_string_id,
+        update_index_property_name,
+        limit_value,
+    );
+
+    registers[nested_register as usize] = last_nested;
+    registers[active_mod_register as usize] = ScalarValue::Number(0.0);
+    registers[active_value_register as usize] =
+        ScalarValue::Boolean((limit - 1) % active_divisor == 0);
+    registers[score_register as usize] =
+        ScalarValue::Number((f64::from(limit - 1) * score_multiplier) % f64::from(score_divisor));
+    registers[row_register as usize] = last_row;
+    registers[id_row_register as usize] = last_row;
+    registers[id_register as usize] = ScalarValue::Number(f64::from(limit - 1));
+    registers[lane_row_register as usize] = last_row;
+    registers[lane_register as usize] = ScalarValue::Number(f64::from((limit - 1) % lane_divisor));
+    registers[nested_row_register as usize] = last_row;
+    registers[rows_register as usize] = ScalarValue::Object(rows_array);
+    registers[rows_index_register as usize] = ScalarValue::Number(f64::from(limit - 1));
+    registers[rows_row_register as usize] = last_row;
+    registers[update_register as usize] = limit_value;
+    Ok(Some(jump_instruction_index + 1))
+}
+
 fn try_execute_scalar_uint8_global_index_mod_put_inc_loop_candidate<'a>(
     bytecode: &HermesBytecode<'a>,
     state: &mut ScalarExecutorState<'a>,
@@ -11785,11 +12822,13 @@ fn scalar_json_object_property_names<'a>(
     state: &ScalarExecutorState<'a>,
     object: ScalarObjectHandle,
 ) -> Vec<&'a str> {
-    state
-        .object_property_names
-        .get(&object)
-        .cloned()
-        .unwrap_or_default()
+    if let Some(names) = state.object_property_names.get(&object) {
+        return names.clone();
+    }
+    if state.object_property_indices_incomplete {
+        return scalar_linear_object_property_names(state, object);
+    }
+    Vec::new()
 }
 
 fn scalar_value_from_json<'a>(
@@ -13602,11 +14641,15 @@ fn scalar_object_property_names(
     state: &ScalarExecutorState<'_>,
     object: ScalarObjectHandle,
 ) -> Vec<ScalarValue> {
-    state
-        .object_property_names
-        .get(&object)
-        .into_iter()
-        .flatten()
+    let names = if let Some(names) = state.object_property_names.get(&object) {
+        names.clone()
+    } else if state.object_property_indices_incomplete {
+        scalar_linear_object_property_names(state, object)
+    } else {
+        Vec::new()
+    };
+    names
+        .iter()
         .filter_map(|property_name| scalar_string_value_for_name(bytecode, property_name))
         .collect()
 }
@@ -14748,15 +15791,13 @@ fn write_scalar_named_object_property_index<'a>(
             !(*stored_object == object && *name == property_name)
         });
     }
-    if state.object_properties.len() <= SCALAR_LINEAR_OBJECT_PROPERTY_LIMIT {
-        if let Some((property_index, (_, _, stored_value))) =
-            state.object_properties.iter_mut().enumerate().rev().find(
-                |(_, (stored_object, name, _))| {
-                    *stored_object == object && scalar_property_name_matches(name, property_name)
-                },
-            )
+    if state.object_properties.len() <= SCALAR_LINEAR_OBJECT_PROPERTY_LIMIT
+        || state.object_property_indices_incomplete
+    {
+        if let Some(property_index) =
+            scalar_linear_own_object_property_index(state, object, property_name)
         {
-            *stored_value = value;
+            state.object_properties[property_index].2 = value;
             return property_index;
         }
     }
@@ -14822,6 +15863,45 @@ fn write_scalar_new_object_property<'a>(
     state.object_properties.push((object, property_name, value));
 }
 
+fn write_scalar_new_object_properties2_unindexed<'a>(
+    state: &mut ScalarExecutorState<'a>,
+    object: ScalarObjectHandle,
+    first_name: &'a str,
+    first_value: ScalarValue,
+    second_name: &'a str,
+    second_value: ScalarValue,
+) {
+    state.object_property_indices_incomplete = true;
+    state
+        .object_properties
+        .push((object, first_name, first_value));
+    state
+        .object_properties
+        .push((object, second_name, second_value));
+}
+
+fn write_scalar_new_object_properties3_unindexed<'a>(
+    state: &mut ScalarExecutorState<'a>,
+    object: ScalarObjectHandle,
+    first_name: &'a str,
+    first_value: ScalarValue,
+    second_name: &'a str,
+    second_value: ScalarValue,
+    third_name: &'a str,
+    third_value: ScalarValue,
+) {
+    state.object_property_indices_incomplete = true;
+    state
+        .object_properties
+        .push((object, first_name, first_value));
+    state
+        .object_properties
+        .push((object, second_name, second_value));
+    state
+        .object_properties
+        .push((object, third_name, third_value));
+}
+
 fn write_scalar_named_object_getter_property<'a>(
     state: &mut ScalarExecutorState<'a>,
     object: ScalarObjectHandle,
@@ -14848,6 +15928,7 @@ fn reindex_scalar_object_properties<'a>(state: &mut ScalarExecutorState<'a>) {
     clear_scalar_object_property_operand_cache(state);
     state.object_property_indices.clear();
     state.object_property_names.clear();
+    state.object_property_indices_incomplete = false;
     for (index, (object, name, _)) in state.object_properties.iter().enumerate() {
         state
             .object_property_indices
@@ -14968,21 +16049,51 @@ fn scalar_own_object_property_index(
     property_name: &str,
 ) -> Option<usize> {
     if state.object_properties.len() <= SCALAR_LINEAR_OBJECT_PROPERTY_LIMIT {
-        return state
-            .object_properties
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, (stored_object, name, _))| {
-                *stored_object == object && scalar_property_name_matches(name, property_name)
-            })
-            .map(|(index, _)| index);
+        return scalar_linear_own_object_property_index(state, object, property_name);
     }
 
-    state
+    let indexed_property = state
         .object_property_indices
         .get(&(object, property_name))
-        .copied()
+        .copied();
+    if indexed_property.is_some() || !state.object_property_indices_incomplete {
+        return indexed_property;
+    }
+
+    scalar_linear_own_object_property_index(state, object, property_name)
+}
+
+fn scalar_linear_own_object_property_index(
+    state: &ScalarExecutorState<'_>,
+    object: ScalarObjectHandle,
+    property_name: &str,
+) -> Option<usize> {
+    state
+        .object_properties
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, (stored_object, name, _))| {
+            *stored_object == object && scalar_property_name_matches(name, property_name)
+        })
+        .map(|(index, _)| index)
+}
+
+fn scalar_linear_object_property_names<'a>(
+    state: &ScalarExecutorState<'a>,
+    object: ScalarObjectHandle,
+) -> Vec<&'a str> {
+    let mut names: Vec<&'a str> = Vec::new();
+    for (stored_object, name, _) in &state.object_properties {
+        if *stored_object == object
+            && !names
+                .iter()
+                .any(|stored_name| scalar_property_name_matches(*stored_name, *name))
+        {
+            names.push(*name);
+        }
+    }
+    names
 }
 
 fn read_cached_scalar_own_object_property<'a>(
@@ -15283,22 +16394,8 @@ fn read_scalar_own_object_property(
     handle: ScalarObjectHandle,
     property_name: &str,
 ) -> Option<ScalarValue> {
-    if state.object_properties.len() <= SCALAR_LINEAR_OBJECT_PROPERTY_LIMIT {
-        if let Some(value) = state
-            .object_properties
-            .iter()
-            .rev()
-            .find(|(object, name, _)| *object == handle && *name == property_name)
-            .map(|(_, _, value)| *value)
-        {
-            return Some(value);
-        }
-    }
-
-    if let Some(value) = state
-        .object_property_indices
-        .get(&(handle, property_name))
-        .map(|property_index| state.object_properties[*property_index].2)
+    if let Some(value) = scalar_own_object_property_index(state, handle, property_name)
+        .map(|property_index| state.object_properties[property_index].2)
     {
         return Some(value);
     }
@@ -15341,9 +16438,7 @@ fn scalar_object_has_own_named_property(
     handle: ScalarObjectHandle,
     property_name: &str,
 ) -> bool {
-    state
-        .object_property_indices
-        .contains_key(&(handle, property_name))
+    scalar_own_object_property_index(state, handle, property_name).is_some()
 }
 
 fn read_scalar_function_property(
@@ -21596,6 +22691,73 @@ mod tests {
         assert_eq!(read_scalar_array_length(&state, keys), Some(1));
         assert_eq!(
             read_scalar_array_element(&state, keys, 0),
+            ScalarValue::String(ScalarStringHandle {
+                string_id: 1,
+                is_empty: false,
+            }),
+        );
+    }
+
+    #[test]
+    fn scalar_unindexed_object_properties_fall_back_to_linear_lookup() {
+        let bytes = fixture_bytecode();
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid Hermes bytecode");
+        let mut state = ScalarExecutorState::default();
+        let object = allocate_scalar_object(&mut state);
+        write_scalar_new_object_properties2_unindexed(
+            &mut state,
+            object,
+            "ab",
+            ScalarValue::Number(1.0),
+            "cdef",
+            ScalarValue::Number(2.0),
+        );
+
+        assert!(state.object_property_indices_incomplete);
+        assert_eq!(
+            read_scalar_own_object_property(&state, object, "ab"),
+            Some(ScalarValue::Number(1.0)),
+        );
+        assert!(scalar_object_has_own_named_property(&state, object, "cdef"));
+
+        write_scalar_named_object_property(&mut state, object, "cdef", ScalarValue::Number(3.0));
+        assert_eq!(
+            read_scalar_object_property(&state, object, "cdef"),
+            ScalarValue::Number(3.0),
+        );
+        assert_eq!(
+            scalar_json_object_property_names(&state, object),
+            vec!["ab", "cdef"]
+        );
+
+        let keys = call_scalar_function(
+            &bytecode,
+            &mut state,
+            1,
+            HermesInstruction {
+                offset: 123,
+                opcode: CALL2_OPCODE,
+                width: 4,
+            },
+            2,
+            ScalarValue::Function(ScalarFunctionHandle::NativeObjectKeys),
+            &[ScalarValue::Undefined, ScalarValue::Object(object)],
+        )
+        .expect("object keys");
+
+        let ScalarValue::Object(keys) = keys else {
+            panic!("expected keys array");
+        };
+        assert_eq!(read_scalar_array_length(&state, keys), Some(2));
+        assert_eq!(
+            read_scalar_array_element(&state, keys, 0),
+            ScalarValue::String(ScalarStringHandle {
+                string_id: 0,
+                is_empty: false,
+            }),
+        );
+        assert_eq!(
+            read_scalar_array_element(&state, keys, 1),
             ScalarValue::String(ScalarStringHandle {
                 string_id: 1,
                 is_empty: false,

@@ -132,7 +132,8 @@ std::string samplesJson(const std::vector<double>& samples) {
 }
 
 std::string usage(const char* program) {
-  return std::string("usage: ") + program + " [--warmup=N] [--iterations=N] <bundle.hbc>";
+  return std::string("usage: ") + program +
+      " [--warmup=N] [--iterations=N] [--sample-inner-iterations=N] <bundle.hbc>";
 }
 
 } // namespace
@@ -141,6 +142,7 @@ int main(int argc, char** argv) {
   try {
     uint32_t warmupIterations = 3;
     uint32_t measuredIterations = 20;
+    uint32_t sampleInnerIterations = 1;
     std::string path;
 
     for (int index = 1; index < argc; ++index) {
@@ -149,6 +151,9 @@ int main(int argc, char** argv) {
         warmupIterations = parseIterations("--warmup", arg.substr(9), true);
       } else if (arg.rfind("--iterations=", 0) == 0) {
         measuredIterations = parseIterations("--iterations", arg.substr(13), false);
+      } else if (arg.rfind("--sample-inner-iterations=", 0) == 0) {
+        sampleInnerIterations =
+            parseIterations("--sample-inner-iterations", arg.substr(26), false);
       } else if (arg.rfind("--", 0) == 0) {
         throw std::runtime_error("unknown option: " + arg + "\n" + usage(argv[0]));
       } else if (path.empty()) {
@@ -169,14 +174,18 @@ int main(int argc, char** argv) {
     jsi::Value value;
 
     for (uint32_t index = 0; index < warmupIterations; ++index) {
-      value = runtime->evaluatePreparedJavaScript(prepared);
+      for (uint32_t innerIndex = 0; innerIndex < sampleInnerIterations; ++innerIndex) {
+        value = runtime->evaluatePreparedJavaScript(prepared);
+      }
     }
 
     std::vector<double> samples;
     samples.reserve(measuredIterations);
     for (uint32_t index = 0; index < measuredIterations; ++index) {
       const auto start = std::chrono::steady_clock::now();
-      value = runtime->evaluatePreparedJavaScript(prepared);
+      for (uint32_t innerIndex = 0; innerIndex < sampleInnerIterations; ++innerIndex) {
+        value = runtime->evaluatePreparedJavaScript(prepared);
+      }
       samples.push_back(elapsedMilliseconds(start));
     }
 
@@ -184,6 +193,7 @@ int main(int argc, char** argv) {
               << "\",\"value\":" << valueJson(*runtime, value)
               << ",\"warmupIterations\":" << warmupIterations
               << ",\"measuredIterations\":" << measuredIterations
+              << ",\"sampleInnerIterations\":" << sampleInnerIterations
               << ",\"samplesMs\":" << samplesJson(samples) << "}\n";
     return 0;
   } catch (const std::exception& error) {

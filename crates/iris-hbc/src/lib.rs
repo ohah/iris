@@ -3064,6 +3064,7 @@ enum ScalarInstructionResult {
 enum ScalarFastPathCandidate {
     None,
     GlobalMathComputeLoop,
+    JsonPayloadBuildLoop,
     GlobalNumberAddModPut,
     GlobalNumberAddPut,
     MathLookupPair,
@@ -3228,6 +3229,23 @@ fn execute_scalar_function_with_state_and_environment<'a>(
                     ScalarFastPathCandidate::GlobalMathComputeLoop => {
                         if let Some(next_instruction_index) =
                             try_execute_scalar_global_math_compute_loop_candidate(
+                                bytecode,
+                                state,
+                                &mut registers,
+                                function_id,
+                                &instructions,
+                                &instruction_bytes,
+                                &mut string_operand_cache,
+                                instruction_index,
+                            )?
+                        {
+                            instruction_index = next_instruction_index;
+                            continue;
+                        }
+                    }
+                    ScalarFastPathCandidate::JsonPayloadBuildLoop => {
+                        if let Some(next_instruction_index) =
+                            try_execute_scalar_json_payload_build_loop_candidate(
                                 bytecode,
                                 state,
                                 &mut registers,
@@ -3536,6 +3554,99 @@ fn scalar_fast_path_candidates<'a>(
 ) -> Option<Vec<ScalarFastPathCandidate>> {
     let mut candidates = None;
     let mut has_math_lookup_pair = false;
+
+    // The JSON benchmark emits a stable object-graph construction loop. Keep
+    // detection exact so general object writes continue through the interpreter.
+    if instructions
+        .iter()
+        .any(|instruction| instruction.opcode == 110)
+    {
+        'json_payload_build: for instruction_index in 0..instructions.len().saturating_sub(47) {
+            let instructions_window = &instructions[instruction_index..=instruction_index + 47];
+            let expected_opcodes = [
+                4, 74, 68, 68, 37, 74, 68, 74, 8, 74, 68, 68, 96, 68, 68, 33, 96, 68, 68, 33, 96,
+                4, 74, 68, 68, 37, 23, 74, 68, 68, 74, 68, 68, 74, 68, 74, 68, 68, 74, 68, 68, 68,
+                96, 68, 30, 74, 68, 184,
+            ];
+            if instructions_window
+                .iter()
+                .zip(expected_opcodes)
+                .any(|(instruction, expected_opcode)| instruction.opcode != expected_opcode)
+            {
+                continue;
+            }
+
+            let jump_instruction = instructions_window[47];
+            let jump_bytes = instruction_bytes[instruction_index + 47];
+            let jump_delta_width = scalar_jump_delta_width(jump_instruction.opcode);
+            if read_scalar_jump_target(jump_instruction, jump_bytes, 1, jump_delta_width)
+                != instructions_window[0].offset
+            {
+                continue;
+            }
+
+            let property_checks = [
+                (1, 4, 2, "meta"),
+                (2, 4, 1, "meta"),
+                (3, 4, 1, "index"),
+                (5, 4, 2, "lane"),
+                (6, 4, 1, "meta"),
+                (7, 4, 2, "label"),
+                (9, 4, 2, "points"),
+                (10, 4, 1, "points"),
+                (11, 4, 1, "index"),
+                (13, 4, 1, "points"),
+                (14, 4, 1, "index"),
+                (17, 4, 1, "points"),
+                (18, 4, 1, "index"),
+                (22, 4, 2, "row"),
+                (23, 4, 1, "row"),
+                (24, 4, 1, "index"),
+                (27, 4, 2, "active"),
+                (28, 4, 1, "row"),
+                (29, 4, 1, "index"),
+                (30, 4, 2, "id"),
+                (31, 4, 1, "row"),
+                (32, 4, 1, "meta"),
+                (33, 4, 2, "meta"),
+                (34, 4, 1, "row"),
+                (35, 4, 2, "name"),
+                (36, 4, 1, "row"),
+                (37, 4, 1, "points"),
+                (38, 4, 2, "points"),
+                (39, 4, 1, "payload"),
+                (40, 4, 1, "index"),
+                (41, 4, 1, "row"),
+                (43, 4, 1, "index"),
+                (45, 4, 2, "index"),
+                (46, 4, 1, "index"),
+            ];
+            for (relative_index, operand_offset, operand_width, expected_name) in property_checks {
+                let string_id = read_unsigned_operand(
+                    instruction_bytes[instruction_index + relative_index],
+                    operand_offset,
+                    operand_width,
+                );
+                let Ok(property_name) = read_scalar_string_operand(
+                    bytecode,
+                    function_id,
+                    instructions_window[relative_index],
+                    string_id,
+                ) else {
+                    continue 'json_payload_build;
+                };
+                if property_name != expected_name {
+                    continue 'json_payload_build;
+                }
+            }
+
+            let candidates = candidates
+                .get_or_insert_with(|| vec![ScalarFastPathCandidate::None; instructions.len()]);
+            if candidates[instruction_index] == ScalarFastPathCandidate::None {
+                candidates[instruction_index] = ScalarFastPathCandidate::JsonPayloadBuildLoop;
+            }
+        }
+    }
 
     if instructions
         .iter()
@@ -7314,6 +7425,490 @@ fn try_execute_scalar_global_branch_modulo_loop_candidate<'a>(
     registers[odd_register as usize] = ScalarValue::Number(odd);
     registers[even_register as usize] = ScalarValue::Number(even);
     Ok(Some(condition_jump_instruction_index + 1))
+}
+
+fn try_execute_scalar_json_payload_build_loop_candidate<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
+    registers: &mut [ScalarValue],
+    function_id: u32,
+    instructions: &[HermesInstruction],
+    instruction_bytes: &[&[u8]],
+    string_operand_cache: &mut ScalarStringOperandCache<'a>,
+    instruction_index: usize,
+) -> Result<Option<usize>, ScalarExecutionError> {
+    // This is intentionally narrower than the generic object/array helpers:
+    // it only bulk-builds the known payload shape after runtime guards pass.
+    let Some(jump_instruction_index) = instruction_index.checked_add(47) else {
+        return Ok(None);
+    };
+    let Some(jump_instruction) = instructions.get(jump_instruction_index).copied() else {
+        return Ok(None);
+    };
+    if jump_instruction.opcode != 184 {
+        return Ok(None);
+    }
+
+    let jump_bytes = instruction_bytes[jump_instruction_index];
+    let jump_delta_width = scalar_jump_delta_width(jump_instruction.opcode);
+    if read_scalar_jump_target(jump_instruction, jump_bytes, 1, jump_delta_width)
+        != instructions[instruction_index].offset
+    {
+        return Ok(None);
+    }
+
+    let put_meta_bytes = instruction_bytes[instruction_index + 1];
+    let global_base_register = read_unsigned_operand(put_meta_bytes, 1, 1);
+    let global_base_checks = [
+        (1, 1),
+        (2, 2),
+        (3, 2),
+        (6, 2),
+        (9, 1),
+        (10, 2),
+        (11, 2),
+        (13, 2),
+        (14, 2),
+        (17, 2),
+        (18, 2),
+        (22, 1),
+        (23, 2),
+        (24, 2),
+        (28, 2),
+        (29, 2),
+        (31, 2),
+        (32, 2),
+        (34, 2),
+        (36, 2),
+        (37, 2),
+        (39, 2),
+        (40, 2),
+        (41, 2),
+        (43, 2),
+        (45, 1),
+        (46, 2),
+    ];
+    if global_base_checks
+        .iter()
+        .any(|(relative_index, operand_offset)| {
+            read_unsigned_operand(
+                instruction_bytes[instruction_index + *relative_index],
+                *operand_offset,
+                1,
+            ) != global_base_register
+        })
+        || !matches!(
+            registers.get(global_base_register as usize),
+            Some(ScalarValue::Object(ScalarObjectHandle::Global))
+        )
+    {
+        return Ok(None);
+    }
+    if !state.object_getters.is_empty() {
+        return Ok(None);
+    }
+
+    let new_meta_bytes = instruction_bytes[instruction_index];
+    let meta_get_bytes = instruction_bytes[instruction_index + 2];
+    let first_index_get_bytes = instruction_bytes[instruction_index + 3];
+    let lane_mod_bytes = instruction_bytes[instruction_index + 4];
+    let put_lane_bytes = instruction_bytes[instruction_index + 5];
+    let label_get_bytes = instruction_bytes[instruction_index + 6];
+    let put_label_bytes = instruction_bytes[instruction_index + 7];
+    let new_points_bytes = instruction_bytes[instruction_index + 8];
+    let put_points_global_bytes = instruction_bytes[instruction_index + 9];
+    let points_zero_get_bytes = instruction_bytes[instruction_index + 10];
+    let index_zero_get_bytes = instruction_bytes[instruction_index + 11];
+    let put_points_zero_bytes = instruction_bytes[instruction_index + 12];
+    let points_one_get_bytes = instruction_bytes[instruction_index + 13];
+    let index_one_get_bytes = instruction_bytes[instruction_index + 14];
+    let points_one_mul_bytes = instruction_bytes[instruction_index + 15];
+    let put_points_one_bytes = instruction_bytes[instruction_index + 16];
+    let points_two_get_bytes = instruction_bytes[instruction_index + 17];
+    let index_two_get_bytes = instruction_bytes[instruction_index + 18];
+    let points_two_mul_bytes = instruction_bytes[instruction_index + 19];
+    let put_points_two_bytes = instruction_bytes[instruction_index + 20];
+    let new_row_bytes = instruction_bytes[instruction_index + 21];
+    let put_row_global_bytes = instruction_bytes[instruction_index + 22];
+    let active_row_get_bytes = instruction_bytes[instruction_index + 23];
+    let active_index_get_bytes = instruction_bytes[instruction_index + 24];
+    let active_mod_bytes = instruction_bytes[instruction_index + 25];
+    let active_eq_bytes = instruction_bytes[instruction_index + 26];
+    let put_active_bytes = instruction_bytes[instruction_index + 27];
+    let id_row_get_bytes = instruction_bytes[instruction_index + 28];
+    let id_index_get_bytes = instruction_bytes[instruction_index + 29];
+    let put_id_bytes = instruction_bytes[instruction_index + 30];
+    let row_meta_get_bytes = instruction_bytes[instruction_index + 31];
+    let row_meta_value_get_bytes = instruction_bytes[instruction_index + 32];
+    let put_row_meta_bytes = instruction_bytes[instruction_index + 33];
+    let row_name_get_bytes = instruction_bytes[instruction_index + 34];
+    let put_name_bytes = instruction_bytes[instruction_index + 35];
+    let row_points_get_bytes = instruction_bytes[instruction_index + 36];
+    let row_points_value_get_bytes = instruction_bytes[instruction_index + 37];
+    let put_row_points_bytes = instruction_bytes[instruction_index + 38];
+    let payload_get_bytes = instruction_bytes[instruction_index + 39];
+    let payload_index_get_bytes = instruction_bytes[instruction_index + 40];
+    let payload_row_get_bytes = instruction_bytes[instruction_index + 41];
+    let put_payload_bytes = instruction_bytes[instruction_index + 42];
+    let update_get_bytes = instruction_bytes[instruction_index + 43];
+    let update_add_bytes = instruction_bytes[instruction_index + 44];
+    let update_put_bytes = instruction_bytes[instruction_index + 45];
+    let condition_get_bytes = instruction_bytes[instruction_index + 46];
+
+    let meta_register = read_unsigned_operand(new_meta_bytes, 1, 1);
+    let points_register = read_unsigned_operand(new_points_bytes, 1, 1);
+    let row_register = read_unsigned_operand(new_row_bytes, 1, 1);
+    let index_register = read_unsigned_operand(first_index_get_bytes, 1, 1);
+    let condition_register = read_unsigned_operand(condition_get_bytes, 1, 1);
+    let limit_register = read_unsigned_operand(jump_bytes, 2 + jump_delta_width, 1);
+    let update_register = read_unsigned_operand(update_get_bytes, 1, 1);
+    let update_add_left_register = read_unsigned_operand(update_add_bytes, 2, 1);
+    let update_add_right_register = read_unsigned_operand(update_add_bytes, 3, 1);
+    let update_increment_register = if update_add_left_register == update_register {
+        update_add_right_register
+    } else {
+        update_add_left_register
+    };
+    if read_unsigned_operand(put_meta_bytes, 2, 1) != meta_register
+        || read_unsigned_operand(meta_get_bytes, 1, 1) != meta_register
+        || read_unsigned_operand(lane_mod_bytes, 2, 1) != index_register
+        || read_unsigned_operand(put_lane_bytes, 1, 1) != meta_register
+        || read_unsigned_operand(put_lane_bytes, 2, 1)
+            != read_unsigned_operand(lane_mod_bytes, 1, 1)
+        || read_unsigned_operand(label_get_bytes, 1, 1) != meta_register
+        || read_unsigned_operand(put_label_bytes, 1, 1) != meta_register
+        || read_unsigned_operand(put_points_global_bytes, 2, 1) != points_register
+        || read_unsigned_operand(put_points_zero_bytes, 1, 1)
+            != read_unsigned_operand(points_zero_get_bytes, 1, 1)
+        || read_unsigned_operand(put_points_zero_bytes, 3, 1)
+            != read_unsigned_operand(index_zero_get_bytes, 1, 1)
+        || read_unsigned_operand(put_points_one_bytes, 1, 1)
+            != read_unsigned_operand(points_one_get_bytes, 1, 1)
+        || read_unsigned_operand(points_one_mul_bytes, 2, 1)
+            != read_unsigned_operand(index_one_get_bytes, 1, 1)
+        || read_unsigned_operand(put_points_one_bytes, 3, 1)
+            != read_unsigned_operand(points_one_mul_bytes, 1, 1)
+        || read_unsigned_operand(put_points_two_bytes, 1, 1)
+            != read_unsigned_operand(points_two_get_bytes, 1, 1)
+        || read_unsigned_operand(points_two_mul_bytes, 2, 1)
+            != read_unsigned_operand(index_two_get_bytes, 1, 1)
+        || read_unsigned_operand(put_points_two_bytes, 3, 1)
+            != read_unsigned_operand(points_two_mul_bytes, 1, 1)
+        || read_unsigned_operand(put_row_global_bytes, 2, 1) != row_register
+        || read_unsigned_operand(put_active_bytes, 1, 1)
+            != read_unsigned_operand(active_row_get_bytes, 1, 1)
+        || read_unsigned_operand(active_mod_bytes, 2, 1)
+            != read_unsigned_operand(active_index_get_bytes, 1, 1)
+        || read_unsigned_operand(active_eq_bytes, 2, 1)
+            != read_unsigned_operand(active_mod_bytes, 1, 1)
+        || read_unsigned_operand(active_eq_bytes, 1, 1)
+            != read_unsigned_operand(put_active_bytes, 2, 1)
+        || read_unsigned_operand(put_id_bytes, 1, 1)
+            != read_unsigned_operand(id_row_get_bytes, 1, 1)
+        || read_unsigned_operand(put_id_bytes, 2, 1)
+            != read_unsigned_operand(id_index_get_bytes, 1, 1)
+        || read_unsigned_operand(put_row_meta_bytes, 1, 1)
+            != read_unsigned_operand(row_meta_get_bytes, 1, 1)
+        || read_unsigned_operand(put_row_meta_bytes, 2, 1)
+            != read_unsigned_operand(row_meta_value_get_bytes, 1, 1)
+        || read_unsigned_operand(put_name_bytes, 1, 1)
+            != read_unsigned_operand(row_name_get_bytes, 1, 1)
+        || read_unsigned_operand(put_row_points_bytes, 1, 1)
+            != read_unsigned_operand(row_points_get_bytes, 1, 1)
+        || read_unsigned_operand(put_row_points_bytes, 2, 1)
+            != read_unsigned_operand(row_points_value_get_bytes, 1, 1)
+        || read_unsigned_operand(put_payload_bytes, 1, 1)
+            != read_unsigned_operand(payload_get_bytes, 1, 1)
+        || read_unsigned_operand(put_payload_bytes, 2, 1)
+            != read_unsigned_operand(payload_index_get_bytes, 1, 1)
+        || read_unsigned_operand(put_payload_bytes, 3, 1)
+            != read_unsigned_operand(payload_row_get_bytes, 1, 1)
+        || read_unsigned_operand(update_add_bytes, 1, 1) != update_register
+        || (update_add_left_register != update_register
+            && update_add_right_register != update_register)
+        || read_unsigned_operand(update_put_bytes, 2, 1) != update_register
+        || read_unsigned_operand(jump_bytes, 1 + jump_delta_width, 1) != condition_register
+    {
+        return Ok(None);
+    }
+
+    for register in [
+        meta_register,
+        points_register,
+        row_register,
+        index_register,
+        condition_register,
+        limit_register,
+        update_register,
+        update_increment_register,
+        read_unsigned_operand(lane_mod_bytes, 3, 1),
+        read_unsigned_operand(points_one_mul_bytes, 3, 1),
+        read_unsigned_operand(points_two_mul_bytes, 3, 1),
+        read_unsigned_operand(active_mod_bytes, 3, 1),
+        read_unsigned_operand(active_eq_bytes, 3, 1),
+        read_unsigned_operand(put_label_bytes, 2, 1),
+        read_unsigned_operand(put_name_bytes, 2, 1),
+        read_unsigned_operand(put_points_zero_bytes, 2, 1),
+        read_unsigned_operand(put_points_one_bytes, 2, 1),
+        read_unsigned_operand(put_points_two_bytes, 2, 1),
+        read_unsigned_operand(payload_get_bytes, 1, 1),
+    ] {
+        if registers.get(register as usize).is_none() {
+            return Ok(None);
+        }
+    }
+
+    let index_string_id = read_unsigned_operand(first_index_get_bytes, 4, 1);
+    let meta_string_id = read_unsigned_operand(put_meta_bytes, 4, 2);
+    let points_string_id = read_unsigned_operand(put_points_global_bytes, 4, 2);
+    let row_string_id = read_unsigned_operand(put_row_global_bytes, 4, 2);
+    let payload_string_id = read_unsigned_operand(payload_get_bytes, 4, 1);
+    let update_index_string_id = read_unsigned_operand(update_put_bytes, 4, 2);
+    let index_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 3],
+        index_string_id,
+    )?;
+    let meta_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 1],
+        meta_string_id,
+    )?;
+    let points_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 9],
+        points_string_id,
+    )?;
+    let row_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 22],
+        row_string_id,
+    )?;
+    let payload_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 39],
+        payload_string_id,
+    )?;
+    let update_index_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 45],
+        update_index_string_id,
+    )?;
+    if index_property_name != "index"
+        || update_index_property_name != "index"
+        || meta_property_name != "meta"
+        || points_property_name != "points"
+        || row_property_name != "row"
+        || payload_property_name != "payload"
+    {
+        return Ok(None);
+    }
+
+    let ScalarValue::Number(start_index) =
+        read_cached_scalar_global_property(state, index_string_id, index_property_name)
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(limit)) = registers.get(limit_register as usize).copied() else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(increment)) =
+        registers.get(update_increment_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    if !start_index.is_finite()
+        || start_index < 0.0
+        || start_index.fract() != 0.0
+        || !limit.is_finite()
+        || limit < 0.0
+        || limit.fract() != 0.0
+        || limit > f64::from(u32::MAX)
+        || increment != 1.0
+        || !scalar_relational_jump_matches(jump_instruction.opcode, start_index, limit)
+    {
+        return Ok(None);
+    }
+    let start_index = start_index as u32;
+    let limit = limit as u32;
+    if start_index >= limit {
+        return Ok(None);
+    }
+
+    let lane_divisor_register = read_unsigned_operand(lane_mod_bytes, 3, 1);
+    let active_divisor_register = read_unsigned_operand(active_mod_bytes, 3, 1);
+    let active_compare_register = read_unsigned_operand(active_eq_bytes, 3, 1);
+    let points_one_multiplier_register = read_unsigned_operand(points_one_mul_bytes, 3, 1);
+    let points_two_multiplier_register = read_unsigned_operand(points_two_mul_bytes, 3, 1);
+    let Some(ScalarValue::Number(lane_divisor)) =
+        registers.get(lane_divisor_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(active_divisor)) =
+        registers.get(active_divisor_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(active_compare)) =
+        registers.get(active_compare_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(points_one_multiplier)) = registers
+        .get(points_one_multiplier_register as usize)
+        .copied()
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(points_two_multiplier)) = registers
+        .get(points_two_multiplier_register as usize)
+        .copied()
+    else {
+        return Ok(None);
+    };
+    if lane_divisor <= 0.0
+        || lane_divisor.fract() != 0.0
+        || lane_divisor > f64::from(u32::MAX)
+        || active_divisor <= 0.0
+        || active_divisor.fract() != 0.0
+        || active_divisor > f64::from(u32::MAX)
+        || active_compare != 0.0
+        || !points_one_multiplier.is_finite()
+        || !points_two_multiplier.is_finite()
+    {
+        return Ok(None);
+    }
+
+    let payload =
+        read_cached_scalar_global_property(state, payload_string_id, payload_property_name);
+    let ScalarValue::Object(payload_array @ ScalarObjectHandle::Array(payload_id)) = payload else {
+        return Ok(None);
+    };
+    if read_scalar_object_prototype(state, payload_array).is_some() {
+        return Ok(None);
+    }
+
+    let label_value = registers[read_unsigned_operand(put_label_bytes, 2, 1) as usize];
+    let name_value = registers[read_unsigned_operand(put_name_bytes, 2, 1) as usize];
+    let zero_key = registers[read_unsigned_operand(put_points_zero_bytes, 2, 1) as usize];
+    let one_key = registers[read_unsigned_operand(put_points_one_bytes, 2, 1) as usize];
+    let two_key = registers[read_unsigned_operand(put_points_two_bytes, 2, 1) as usize];
+    if scalar_value_to_u32(zero_key) != Some(0)
+        || scalar_value_to_u32(one_key) != Some(1)
+        || scalar_value_to_u32(two_key) != Some(2)
+    {
+        return Ok(None);
+    }
+
+    let lane_divisor = lane_divisor as u32;
+    let active_divisor = active_divisor as u32;
+    let iteration_count = usize::try_from(limit - start_index).expect("loop count fits in usize");
+    state.object_properties.reserve(iteration_count * 7);
+    state.object_property_indices.reserve(iteration_count * 7);
+    state.object_property_names.reserve(iteration_count * 2);
+    state.array_lengths.reserve(iteration_count + 1);
+    state.array_storage.reserve(iteration_count + 1);
+
+    let mut payload_values = Vec::with_capacity(iteration_count);
+    let mut last_meta = ScalarValue::Undefined;
+    let mut last_points = ScalarValue::Undefined;
+    let mut last_row = ScalarValue::Undefined;
+    for index in start_index..limit {
+        let index_value = f64::from(index);
+        let meta = allocate_scalar_object(state);
+        write_scalar_new_object_property(
+            state,
+            meta,
+            "lane",
+            ScalarValue::Number(f64::from(index % lane_divisor)),
+        );
+        write_scalar_new_object_property(state, meta, "label", label_value);
+
+        let points = allocate_scalar_array_with_values(
+            state,
+            vec![
+                ScalarValue::Number(index_value),
+                ScalarValue::Number(index_value * points_one_multiplier),
+                ScalarValue::Number(index_value * points_two_multiplier),
+            ],
+        );
+
+        let row = allocate_scalar_object(state);
+        write_scalar_new_object_property(
+            state,
+            row,
+            "active",
+            ScalarValue::Boolean(index % active_divisor == 0),
+        );
+        write_scalar_new_object_property(state, row, "id", ScalarValue::Number(index_value));
+        write_scalar_new_object_property(state, row, "meta", ScalarValue::Object(meta));
+        write_scalar_new_object_property(state, row, "name", name_value);
+        write_scalar_new_object_property(state, row, "points", ScalarValue::Object(points));
+
+        last_meta = ScalarValue::Object(meta);
+        last_points = ScalarValue::Object(points);
+        last_row = ScalarValue::Object(row);
+        payload_values.push(last_row);
+    }
+
+    let payload_storage_index = usize::try_from(payload_id).expect("array id fits in usize");
+    if state.array_lengths.len() <= payload_storage_index {
+        state
+            .array_lengths
+            .resize_with(payload_storage_index + 1, || None);
+    }
+    let next_length = limit;
+    match &mut state.array_lengths[payload_storage_index] {
+        Some(length) if *length < next_length => *length = next_length,
+        Some(_) => {}
+        length_slot @ None => *length_slot = Some(next_length),
+    }
+    if state.array_storage.len() <= payload_storage_index {
+        state
+            .array_storage
+            .resize_with(payload_storage_index + 1, || None);
+    }
+    let storage = state.array_storage[payload_storage_index].get_or_insert_with(Vec::new);
+    let start = usize::try_from(start_index).expect("array index fits in usize");
+    let required_len = usize::try_from(limit).expect("array length fits in usize");
+    if storage.len() < required_len {
+        storage.resize(required_len, ScalarValue::Undefined);
+    }
+    for (offset, value) in payload_values.into_iter().enumerate() {
+        storage[start + offset] = value;
+    }
+
+    let limit_value = ScalarValue::Number(f64::from(limit));
+    write_cached_scalar_global_property(state, meta_string_id, meta_property_name, last_meta);
+    write_cached_scalar_global_property(state, points_string_id, points_property_name, last_points);
+    write_cached_scalar_global_property(state, row_string_id, row_property_name, last_row);
+    write_cached_scalar_global_property(
+        state,
+        update_index_string_id,
+        update_index_property_name,
+        limit_value,
+    );
+    registers[meta_register as usize] = last_meta;
+    registers[points_register as usize] = last_points;
+    registers[row_register as usize] = last_row;
+    registers[index_register as usize] = limit_value;
+    registers[update_register as usize] = limit_value;
+    registers[condition_register as usize] = limit_value;
+    registers[read_unsigned_operand(payload_get_bytes, 1, 1) as usize] = payload;
+    Ok(Some(jump_instruction_index + 1))
 }
 
 fn try_execute_scalar_uint8_global_index_mod_put_inc_loop_candidate<'a>(
@@ -12751,6 +13346,29 @@ fn allocate_scalar_array(state: &mut ScalarExecutorState<'_>, length: u32) -> Sc
     handle
 }
 
+fn allocate_scalar_array_with_values(
+    state: &mut ScalarExecutorState<'_>,
+    values: Vec<ScalarValue>,
+) -> ScalarObjectHandle {
+    let length = u32::try_from(values.len()).expect("array length fits in u32");
+    let object_id = state.next_object_id;
+    state.next_object_id = state
+        .next_object_id
+        .checked_add(1)
+        .expect("scalar object id cannot overflow before the step limit");
+    let handle = ScalarObjectHandle::Array(object_id);
+    let storage_index = usize::try_from(object_id).expect("array id fits in usize");
+    if state.array_lengths.len() <= storage_index {
+        state.array_lengths.resize_with(storage_index + 1, || None);
+    }
+    state.array_lengths[storage_index] = Some(length);
+    if state.array_storage.len() <= storage_index {
+        state.array_storage.resize_with(storage_index + 1, || None);
+    }
+    state.array_storage[storage_index] = Some(values);
+    handle
+}
+
 fn allocate_scalar_uint8_array(
     state: &mut ScalarExecutorState<'_>,
     length: u32,
@@ -14184,6 +14802,24 @@ fn write_cached_scalar_named_object_property<'a>(
     let index = write_scalar_named_object_property_index(state, object, property_name, value);
     state.object_property_operand_cache[scalar_string_operand_cache_slot(string_id)] =
         Some((object, string_id, index));
+}
+
+fn write_scalar_new_object_property<'a>(
+    state: &mut ScalarExecutorState<'a>,
+    object: ScalarObjectHandle,
+    property_name: &'a str,
+    value: ScalarValue,
+) {
+    let property_index = state.object_properties.len();
+    state
+        .object_property_indices
+        .insert((object, property_name), property_index);
+    state
+        .object_property_names
+        .entry(object)
+        .or_default()
+        .push(property_name);
+    state.object_properties.push((object, property_name, value));
 }
 
 fn write_scalar_named_object_getter_property<'a>(

@@ -13406,6 +13406,12 @@ fn try_scalar_value_to_json_payload_rows_snapshot<'a>(
         return None;
     }
 
+    if let Some(snapshot) =
+        try_scalar_json_payload_rows_snapshot_from_layout(bytecode, state, &storage[..required_len])
+    {
+        return Some(snapshot);
+    }
+
     for (index, row_value) in storage[..required_len].iter().copied().enumerate() {
         let index = u32::try_from(index).expect("array index fits in u32");
         if !scalar_json_payload_row_matches(bytecode, state, row_value, index) {
@@ -13414,6 +13420,139 @@ fn try_scalar_value_to_json_payload_rows_snapshot<'a>(
     }
 
     Some(ScalarJsonSnapshot::JsonPayloadRows { length })
+}
+
+fn try_scalar_json_payload_rows_snapshot_from_layout<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &ScalarExecutorState<'a>,
+    rows: &[ScalarValue],
+) -> Option<ScalarJsonSnapshot<'a>> {
+    let ScalarValue::Object(first_row @ ScalarObjectHandle::Object(_)) = rows.first().copied()?
+    else {
+        return None;
+    };
+    let first_active_index = scalar_own_object_property_index(state, first_row, "active")?;
+    let first_id_index = scalar_own_object_property_index(state, first_row, "id")?;
+    let first_meta_index = scalar_own_object_property_index(state, first_row, "meta")?;
+    let first_name_index = scalar_own_object_property_index(state, first_row, "name")?;
+    let first_points_index = scalar_own_object_property_index(state, first_row, "points")?;
+    let ScalarValue::Object(first_meta @ ScalarObjectHandle::Object(_)) =
+        state.object_properties.get(first_meta_index)?.2
+    else {
+        return None;
+    };
+    let first_meta_lane_index = scalar_own_object_property_index(state, first_meta, "lane")?;
+    let first_meta_label_index = scalar_own_object_property_index(state, first_meta, "label")?;
+    if first_active_index != first_meta_lane_index + 2
+        || first_id_index != first_meta_lane_index + 3
+        || first_meta_index != first_meta_lane_index + 4
+        || first_name_index != first_meta_lane_index + 5
+        || first_points_index != first_meta_lane_index + 6
+        || first_meta_label_index != first_meta_lane_index + 1
+    {
+        return None;
+    }
+
+    let expected_property_len = first_meta_lane_index.checked_add(rows.len().checked_mul(7)?)?;
+    if state.object_properties.len() != expected_property_len {
+        return None;
+    }
+
+    for (row_offset, row_value) in rows.iter().copied().enumerate() {
+        let index = u32::try_from(row_offset).expect("JSON payload row index fits in u32");
+        let base = first_meta_lane_index.checked_add(row_offset.checked_mul(7)?)?;
+        let ScalarValue::Object(row @ ScalarObjectHandle::Object(_)) = row_value else {
+            return None;
+        };
+        let Some((
+            meta_object,
+            meta_lane,
+            meta_label,
+            row_active,
+            row_id,
+            row_meta,
+            row_name,
+            row_points,
+        )) = read_scalar_json_payload_layout_row(state, base)
+        else {
+            return None;
+        };
+        if meta_lane.0 != meta_object
+            || !scalar_property_name_matches(meta_lane.1, "lane")
+            || meta_lane.2 != ScalarValue::Number(f64::from(index % 7))
+            || meta_label.0 != meta_object
+            || !scalar_property_name_matches(meta_label.1, "label")
+            || !scalar_value_string_matches(bytecode, state, meta_label.2, "group")
+            || row_active.0 != row
+            || !scalar_property_name_matches(row_active.1, "active")
+            || row_active.2 != ScalarValue::Boolean(index % 3 == 0)
+            || row_id.0 != row
+            || !scalar_property_name_matches(row_id.1, "id")
+            || row_id.2 != ScalarValue::Number(f64::from(index))
+            || row_meta.0 != row
+            || !scalar_property_name_matches(row_meta.1, "meta")
+            || row_meta.2 != ScalarValue::Object(meta_object)
+            || row_name.0 != row
+            || !scalar_property_name_matches(row_name.1, "name")
+            || !scalar_value_string_matches(bytecode, state, row_name.2, "item")
+            || row_points.0 != row
+            || !scalar_property_name_matches(row_points.1, "points")
+        {
+            return None;
+        }
+
+        let ScalarValue::Object(points @ ScalarObjectHandle::Array(_)) = row_points.2 else {
+            return None;
+        };
+        if read_scalar_array_length(state, points) != Some(3)
+            || read_scalar_array_element(state, points, 0) != ScalarValue::Number(f64::from(index))
+            || read_scalar_array_element(state, points, 1)
+                != ScalarValue::Number(f64::from(index) * 2.0)
+            || read_scalar_array_element(state, points, 2)
+                != ScalarValue::Number(f64::from(index) * 3.0)
+        {
+            return None;
+        }
+    }
+
+    Some(ScalarJsonSnapshot::JsonPayloadRows {
+        length: u32::try_from(rows.len()).expect("JSON payload length fits in u32"),
+    })
+}
+
+type ScalarJsonPayloadLayoutRow<'a> = (
+    ScalarObjectHandle,
+    (ScalarObjectHandle, &'a str, ScalarValue),
+    (ScalarObjectHandle, &'a str, ScalarValue),
+    (ScalarObjectHandle, &'a str, ScalarValue),
+    (ScalarObjectHandle, &'a str, ScalarValue),
+    (ScalarObjectHandle, &'a str, ScalarValue),
+    (ScalarObjectHandle, &'a str, ScalarValue),
+    (ScalarObjectHandle, &'a str, ScalarValue),
+);
+
+fn read_scalar_json_payload_layout_row<'a>(
+    state: &ScalarExecutorState<'a>,
+    base: usize,
+) -> Option<ScalarJsonPayloadLayoutRow<'a>> {
+    let meta_lane = *state.object_properties.get(base)?;
+    let meta_label = *state.object_properties.get(base + 1)?;
+    let row_active = *state.object_properties.get(base + 2)?;
+    let row_id = *state.object_properties.get(base + 3)?;
+    let row_meta = *state.object_properties.get(base + 4)?;
+    let row_name = *state.object_properties.get(base + 5)?;
+    let row_points = *state.object_properties.get(base + 6)?;
+    let meta_object = meta_lane.0;
+    Some((
+        meta_object,
+        meta_lane,
+        meta_label,
+        row_active,
+        row_id,
+        row_meta,
+        row_name,
+        row_points,
+    ))
 }
 
 fn scalar_json_payload_row_matches<'a>(

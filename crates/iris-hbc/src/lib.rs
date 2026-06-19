@@ -5420,6 +5420,63 @@ fn try_execute_scalar_uint8_global_index_mod_put_inc_loop_candidate<'a>(
         return Ok(None);
     };
 
+    let length = read_scalar_array_length(state, array).map_or(0.0, f64::from);
+    if increment == 1.0
+        && source_number.is_finite()
+        && source_number >= 0.0
+        && source_number.fract() == 0.0
+        && divisor.is_finite()
+        && divisor > 0.0
+        && divisor.fract() == 0.0
+        && divisor <= f64::from(u32::MAX)
+        && scalar_relational_jump_matches(jump_instruction.opcode, source_number, length)
+    {
+        let divisor = divisor as u32;
+        let start_index = usize::try_from(key_index).expect("Uint8Array index fits in usize");
+        let length_index = usize::try_from(
+            read_scalar_array_length(state, array).expect("Uint8Array length exists"),
+        )
+        .expect("Uint8Array length fits in usize");
+        let storage_index = usize::try_from(object_id).expect("Uint8Array id fits in usize");
+        if let Some(storage) = state
+            .uint8_array_storage
+            .get_mut(storage_index)
+            .and_then(Option::as_mut)
+        {
+            if length_index <= storage.len() {
+                let mut modulo = key_index % divisor;
+                for slot in &mut storage[start_index..length_index] {
+                    *slot = (modulo % 256) as u8;
+                    modulo = modulo.wrapping_add(1);
+                    if modulo == divisor {
+                        modulo = 0;
+                    }
+                }
+
+                let last_index = (length_index - 1) as f64;
+                let value = f64::from(
+                    u32::try_from(length_index - 1).expect("Uint8Array length fits in u32")
+                        % divisor,
+                );
+                registers[source_object_register as usize] = ScalarValue::Object(array);
+                registers[key_register as usize] = ScalarValue::Number(last_index);
+                registers[value_source_register as usize] = ScalarValue::Number(last_index);
+                registers[value_register as usize] = ScalarValue::Number(value);
+                registers[update_register as usize] = ScalarValue::Number(length);
+                write_cached_scalar_global_property(
+                    state,
+                    put_index_string_id,
+                    put_index_property_name,
+                    ScalarValue::Number(length),
+                );
+                registers[condition_index_register as usize] = ScalarValue::Number(length);
+                registers[condition_source_register as usize] = ScalarValue::Object(array);
+                registers[condition_length_register as usize] = ScalarValue::Number(length);
+                return Ok(Some(jump_instruction_index + 1));
+            }
+        }
+    }
+
     let value = source_number % divisor;
     let next_index = source_number + increment;
     registers[source_object_register as usize] = ScalarValue::Object(array);
@@ -5448,7 +5505,6 @@ fn try_execute_scalar_uint8_global_index_mod_put_inc_loop_candidate<'a>(
         }
     }
 
-    let length = read_scalar_array_length(state, array).map_or(0.0, f64::from);
     registers[condition_length_register as usize] = ScalarValue::Number(length);
     if scalar_relational_jump_matches(jump_instruction.opcode, next_index, length) {
         Ok(Some(instruction_index))

@@ -3068,6 +3068,7 @@ enum ScalarFastPathCandidate {
     MathLookupPair,
     NativeMathCall2,
     ObjectNumberAddModPut,
+    Uint8GlobalIndexModPutIncLoop,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3317,6 +3318,23 @@ fn execute_scalar_function_with_state_and_environment<'a>(
                         }
                         if let Some(next_instruction_index) =
                             try_execute_scalar_uint8_global_index_mod_put_candidate(
+                                bytecode,
+                                state,
+                                &mut registers,
+                                function_id,
+                                &instructions,
+                                &instruction_bytes,
+                                &mut string_operand_cache,
+                                instruction_index,
+                            )?
+                        {
+                            instruction_index = next_instruction_index;
+                            continue;
+                        }
+                    }
+                    ScalarFastPathCandidate::Uint8GlobalIndexModPutIncLoop => {
+                        if let Some(next_instruction_index) =
+                            try_execute_scalar_uint8_global_index_mod_put_inc_loop_candidate(
                                 bytecode,
                                 state,
                                 &mut registers,
@@ -3592,6 +3610,229 @@ fn scalar_fast_path_candidates<'a>(
         .iter()
         .any(|instruction| matches!(instruction.opcode, 96 | 97))
     {
+        for instruction_index in 0..instructions.len().saturating_sub(11) {
+            let source_get_instruction = instructions[instruction_index];
+            let key_get_instruction = instructions[instruction_index + 1];
+            let value_get_instruction = instructions[instruction_index + 2];
+            let mod_instruction = instructions[instruction_index + 3];
+            let put_by_val_instruction = instructions[instruction_index + 4];
+            let update_get_instruction = instructions[instruction_index + 5];
+            let add_instruction = instructions[instruction_index + 6];
+            let put_index_instruction = instructions[instruction_index + 7];
+            let condition_index_instruction = instructions[instruction_index + 8];
+            let condition_source_instruction = instructions[instruction_index + 9];
+            let condition_length_instruction = instructions[instruction_index + 10];
+            let jump_instruction = instructions[instruction_index + 11];
+            if source_get_instruction.opcode != 68
+                || key_get_instruction.opcode != 68
+                || value_get_instruction.opcode != 68
+                || mod_instruction.opcode != 37
+                || !matches!(put_by_val_instruction.opcode, 96 | 97)
+                || update_get_instruction.opcode != 68
+                || add_instruction.opcode != 30
+                || !matches!(put_index_instruction.opcode, 74 | 75)
+                || condition_index_instruction.opcode != 68
+                || condition_source_instruction.opcode != 68
+                || condition_length_instruction.opcode != 68
+                || !matches!(jump_instruction.opcode, 183 | 184)
+            {
+                continue;
+            }
+
+            let source_get_bytes = instruction_bytes[instruction_index];
+            let key_get_bytes = instruction_bytes[instruction_index + 1];
+            let value_get_bytes = instruction_bytes[instruction_index + 2];
+            let mod_bytes = instruction_bytes[instruction_index + 3];
+            let put_by_val_bytes = instruction_bytes[instruction_index + 4];
+            let update_get_bytes = instruction_bytes[instruction_index + 5];
+            let add_bytes = instruction_bytes[instruction_index + 6];
+            let put_index_bytes = instruction_bytes[instruction_index + 7];
+            let condition_index_bytes = instruction_bytes[instruction_index + 8];
+            let condition_source_bytes = instruction_bytes[instruction_index + 9];
+            let condition_length_bytes = instruction_bytes[instruction_index + 10];
+            let jump_bytes = instruction_bytes[instruction_index + 11];
+            let global_base_register = read_unsigned_operand(source_get_bytes, 2, 1);
+            if read_unsigned_operand(key_get_bytes, 2, 1) != global_base_register
+                || read_unsigned_operand(value_get_bytes, 2, 1) != global_base_register
+                || read_unsigned_operand(update_get_bytes, 2, 1) != global_base_register
+                || read_unsigned_operand(put_index_bytes, 1, 1) != global_base_register
+                || read_unsigned_operand(condition_index_bytes, 2, 1) != global_base_register
+                || read_unsigned_operand(condition_source_bytes, 2, 1) != global_base_register
+            {
+                continue;
+            }
+
+            let source_object_register = read_unsigned_operand(source_get_bytes, 1, 1);
+            let key_register = read_unsigned_operand(key_get_bytes, 1, 1);
+            let value_source_register = read_unsigned_operand(value_get_bytes, 1, 1);
+            let value_register = read_unsigned_operand(mod_bytes, 1, 1);
+            let divisor_register = read_unsigned_operand(mod_bytes, 3, 1);
+            let update_register = read_unsigned_operand(update_get_bytes, 1, 1);
+            let add_destination = read_unsigned_operand(add_bytes, 1, 1);
+            let add_left_register = read_unsigned_operand(add_bytes, 2, 1);
+            let add_right_register = read_unsigned_operand(add_bytes, 3, 1);
+            let put_index_value_register = read_unsigned_operand(put_index_bytes, 2, 1);
+            let condition_index_register = read_unsigned_operand(condition_index_bytes, 1, 1);
+            let condition_source_register = read_unsigned_operand(condition_source_bytes, 1, 1);
+            let condition_length_register = read_unsigned_operand(condition_length_bytes, 1, 1);
+            let increment_register = if add_left_register == update_register {
+                add_right_register
+            } else {
+                add_left_register
+            };
+            let jump_left_register = read_unsigned_operand(
+                jump_bytes,
+                1 + scalar_jump_delta_width(jump_instruction.opcode),
+                1,
+            );
+            let jump_right_register = read_unsigned_operand(
+                jump_bytes,
+                2 + scalar_jump_delta_width(jump_instruction.opcode),
+                1,
+            );
+            if read_unsigned_operand(mod_bytes, 2, 1) != value_source_register
+                || read_unsigned_operand(put_by_val_bytes, 1, 1) != source_object_register
+                || read_unsigned_operand(put_by_val_bytes, 2, 1) != key_register
+                || read_unsigned_operand(put_by_val_bytes, 3, 1) != value_register
+                || update_register != add_destination
+                || put_index_value_register != update_register
+                || !((add_left_register == update_register)
+                    || (add_right_register == update_register))
+                || read_unsigned_operand(condition_length_bytes, 2, 1) != condition_source_register
+                || jump_left_register != condition_index_register
+                || jump_right_register != condition_length_register
+                || read_scalar_jump_target(
+                    jump_instruction,
+                    jump_bytes,
+                    1,
+                    scalar_jump_delta_width(jump_instruction.opcode),
+                ) != source_get_instruction.offset
+            {
+                continue;
+            }
+
+            if source_object_register == global_base_register
+                || key_register == global_base_register
+                || value_source_register == global_base_register
+                || value_register == global_base_register
+                || update_register == global_base_register
+                || condition_index_register == global_base_register
+                || condition_source_register == global_base_register
+                || condition_length_register == global_base_register
+                || source_object_register == key_register
+                || source_object_register == value_source_register
+                || source_object_register == value_register
+                || key_register == value_source_register
+                || key_register == value_register
+                || value_source_register == value_register
+                || divisor_register == source_object_register
+                || divisor_register == key_register
+                || divisor_register == value_source_register
+                || divisor_register == value_register
+                || divisor_register == update_register
+                || increment_register == global_base_register
+                || increment_register == source_object_register
+                || increment_register == key_register
+                || increment_register == value_source_register
+                || increment_register == value_register
+                || increment_register == update_register
+                || increment_register == condition_index_register
+                || increment_register == condition_source_register
+                || increment_register == condition_length_register
+            {
+                continue;
+            }
+
+            let key_string_id = read_unsigned_operand(key_get_bytes, 4, 1);
+            let value_string_id = read_unsigned_operand(value_get_bytes, 4, 1);
+            let update_string_id = read_unsigned_operand(update_get_bytes, 4, 1);
+            let put_index_string_id = read_unsigned_operand(put_index_bytes, 4, 2);
+            let condition_index_string_id = read_unsigned_operand(condition_index_bytes, 4, 1);
+            let source_string_id = read_unsigned_operand(source_get_bytes, 4, 1);
+            let condition_source_string_id = read_unsigned_operand(condition_source_bytes, 4, 1);
+            let length_string_id = read_unsigned_operand(condition_length_bytes, 4, 1);
+            let Ok(key_property_name) = read_scalar_string_operand(
+                bytecode,
+                function_id,
+                key_get_instruction,
+                key_string_id,
+            ) else {
+                continue;
+            };
+            let Ok(value_property_name) = read_scalar_string_operand(
+                bytecode,
+                function_id,
+                value_get_instruction,
+                value_string_id,
+            ) else {
+                continue;
+            };
+            let Ok(update_property_name) = read_scalar_string_operand(
+                bytecode,
+                function_id,
+                update_get_instruction,
+                update_string_id,
+            ) else {
+                continue;
+            };
+            let Ok(put_index_property_name) = read_scalar_string_operand(
+                bytecode,
+                function_id,
+                put_index_instruction,
+                put_index_string_id,
+            ) else {
+                continue;
+            };
+            let Ok(condition_index_property_name) = read_scalar_string_operand(
+                bytecode,
+                function_id,
+                condition_index_instruction,
+                condition_index_string_id,
+            ) else {
+                continue;
+            };
+            let Ok(source_property_name) = read_scalar_string_operand(
+                bytecode,
+                function_id,
+                source_get_instruction,
+                source_string_id,
+            ) else {
+                continue;
+            };
+            let Ok(condition_source_property_name) = read_scalar_string_operand(
+                bytecode,
+                function_id,
+                condition_source_instruction,
+                condition_source_string_id,
+            ) else {
+                continue;
+            };
+            let Ok(length_property_name) = read_scalar_string_operand(
+                bytecode,
+                function_id,
+                condition_length_instruction,
+                length_string_id,
+            ) else {
+                continue;
+            };
+            if !scalar_property_name_matches(key_property_name, value_property_name)
+                || !scalar_property_name_matches(key_property_name, update_property_name)
+                || !scalar_property_name_matches(key_property_name, put_index_property_name)
+                || !scalar_property_name_matches(key_property_name, condition_index_property_name)
+                || !scalar_property_name_matches(
+                    source_property_name,
+                    condition_source_property_name,
+                )
+                || length_property_name != "length"
+            {
+                continue;
+            }
+
+            let candidates = candidates
+                .get_or_insert_with(|| vec![ScalarFastPathCandidate::None; instructions.len()]);
+            candidates[instruction_index] = ScalarFastPathCandidate::Uint8GlobalIndexModPutIncLoop;
+        }
+
         for instruction_index in 0..instructions.len().saturating_sub(4) {
             let source_get_instruction = instructions[instruction_index];
             let key_get_instruction = instructions[instruction_index + 1];
@@ -4894,6 +5135,326 @@ fn try_execute_scalar_uint8_global_index_mod_put_candidate<'a>(
     }
 
     Ok(Some(put_instruction_index + 1))
+}
+
+fn try_execute_scalar_uint8_global_index_mod_put_inc_loop_candidate<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
+    registers: &mut [ScalarValue],
+    function_id: u32,
+    instructions: &[HermesInstruction],
+    instruction_bytes: &[&[u8]],
+    string_operand_cache: &mut ScalarStringOperandCache<'a>,
+    instruction_index: usize,
+) -> Result<Option<usize>, ScalarExecutionError> {
+    let Some(jump_instruction_index) = instruction_index.checked_add(11) else {
+        return Ok(None);
+    };
+    let Some(source_get_instruction) = instructions.get(instruction_index).copied() else {
+        return Ok(None);
+    };
+    let Some(key_get_instruction) = instructions.get(instruction_index + 1).copied() else {
+        return Ok(None);
+    };
+    let Some(value_get_instruction) = instructions.get(instruction_index + 2).copied() else {
+        return Ok(None);
+    };
+    let Some(mod_instruction) = instructions.get(instruction_index + 3).copied() else {
+        return Ok(None);
+    };
+    let Some(put_by_val_instruction) = instructions.get(instruction_index + 4).copied() else {
+        return Ok(None);
+    };
+    let Some(update_get_instruction) = instructions.get(instruction_index + 5).copied() else {
+        return Ok(None);
+    };
+    let Some(add_instruction) = instructions.get(instruction_index + 6).copied() else {
+        return Ok(None);
+    };
+    let Some(put_index_instruction) = instructions.get(instruction_index + 7).copied() else {
+        return Ok(None);
+    };
+    let Some(condition_index_instruction) = instructions.get(instruction_index + 8).copied() else {
+        return Ok(None);
+    };
+    let Some(condition_source_instruction) = instructions.get(instruction_index + 9).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(condition_length_instruction) = instructions.get(instruction_index + 10).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(jump_instruction) = instructions.get(jump_instruction_index).copied() else {
+        return Ok(None);
+    };
+    if source_get_instruction.opcode != 68
+        || key_get_instruction.opcode != 68
+        || value_get_instruction.opcode != 68
+        || mod_instruction.opcode != 37
+        || !matches!(put_by_val_instruction.opcode, 96 | 97)
+        || update_get_instruction.opcode != 68
+        || add_instruction.opcode != 30
+        || !matches!(put_index_instruction.opcode, 74 | 75)
+        || condition_index_instruction.opcode != 68
+        || condition_source_instruction.opcode != 68
+        || condition_length_instruction.opcode != 68
+        || !matches!(jump_instruction.opcode, 183 | 184)
+    {
+        return Ok(None);
+    }
+
+    let source_get_bytes = instruction_bytes[instruction_index];
+    let key_get_bytes = instruction_bytes[instruction_index + 1];
+    let value_get_bytes = instruction_bytes[instruction_index + 2];
+    let mod_bytes = instruction_bytes[instruction_index + 3];
+    let put_by_val_bytes = instruction_bytes[instruction_index + 4];
+    let update_get_bytes = instruction_bytes[instruction_index + 5];
+    let add_bytes = instruction_bytes[instruction_index + 6];
+    let put_index_bytes = instruction_bytes[instruction_index + 7];
+    let condition_index_bytes = instruction_bytes[instruction_index + 8];
+    let condition_source_bytes = instruction_bytes[instruction_index + 9];
+    let condition_length_bytes = instruction_bytes[instruction_index + 10];
+    let jump_bytes = instruction_bytes[jump_instruction_index];
+
+    let global_base_register = read_unsigned_operand(source_get_bytes, 2, 1);
+    if read_unsigned_operand(key_get_bytes, 2, 1) != global_base_register
+        || read_unsigned_operand(value_get_bytes, 2, 1) != global_base_register
+        || read_unsigned_operand(update_get_bytes, 2, 1) != global_base_register
+        || read_unsigned_operand(put_index_bytes, 1, 1) != global_base_register
+        || read_unsigned_operand(condition_index_bytes, 2, 1) != global_base_register
+        || read_unsigned_operand(condition_source_bytes, 2, 1) != global_base_register
+        || !matches!(
+            registers.get(global_base_register as usize),
+            Some(ScalarValue::Object(ScalarObjectHandle::Global))
+        )
+    {
+        return Ok(None);
+    }
+
+    let source_object_register = read_unsigned_operand(source_get_bytes, 1, 1);
+    let key_register = read_unsigned_operand(key_get_bytes, 1, 1);
+    let value_source_register = read_unsigned_operand(value_get_bytes, 1, 1);
+    let value_register = read_unsigned_operand(mod_bytes, 1, 1);
+    let divisor_register = read_unsigned_operand(mod_bytes, 3, 1);
+    let update_register = read_unsigned_operand(update_get_bytes, 1, 1);
+    let add_destination = read_unsigned_operand(add_bytes, 1, 1);
+    let add_left_register = read_unsigned_operand(add_bytes, 2, 1);
+    let add_right_register = read_unsigned_operand(add_bytes, 3, 1);
+    let put_index_value_register = read_unsigned_operand(put_index_bytes, 2, 1);
+    let condition_index_register = read_unsigned_operand(condition_index_bytes, 1, 1);
+    let condition_source_register = read_unsigned_operand(condition_source_bytes, 1, 1);
+    let condition_length_register = read_unsigned_operand(condition_length_bytes, 1, 1);
+    let jump_delta_width = scalar_jump_delta_width(jump_instruction.opcode);
+    let jump_left_register = read_unsigned_operand(jump_bytes, 1 + jump_delta_width, 1);
+    let jump_right_register = read_unsigned_operand(jump_bytes, 2 + jump_delta_width, 1);
+    if read_unsigned_operand(mod_bytes, 2, 1) != value_source_register
+        || read_unsigned_operand(put_by_val_bytes, 1, 1) != source_object_register
+        || read_unsigned_operand(put_by_val_bytes, 2, 1) != key_register
+        || read_unsigned_operand(put_by_val_bytes, 3, 1) != value_register
+        || update_register != add_destination
+        || put_index_value_register != update_register
+        || !((add_left_register == update_register) || (add_right_register == update_register))
+        || read_unsigned_operand(condition_length_bytes, 2, 1) != condition_source_register
+        || jump_left_register != condition_index_register
+        || jump_right_register != condition_length_register
+        || read_scalar_jump_target(jump_instruction, jump_bytes, 1, jump_delta_width)
+            != source_get_instruction.offset
+    {
+        return Ok(None);
+    }
+
+    let increment_register = if add_left_register == update_register {
+        add_right_register
+    } else {
+        add_left_register
+    };
+    if source_object_register == global_base_register
+        || key_register == global_base_register
+        || value_source_register == global_base_register
+        || value_register == global_base_register
+        || update_register == global_base_register
+        || condition_index_register == global_base_register
+        || condition_source_register == global_base_register
+        || condition_length_register == global_base_register
+        || source_object_register == key_register
+        || source_object_register == value_source_register
+        || source_object_register == value_register
+        || key_register == value_source_register
+        || key_register == value_register
+        || value_source_register == value_register
+        || divisor_register == source_object_register
+        || divisor_register == key_register
+        || divisor_register == value_source_register
+        || divisor_register == value_register
+        || divisor_register == update_register
+        || increment_register == global_base_register
+        || increment_register == source_object_register
+        || increment_register == key_register
+        || increment_register == value_source_register
+        || increment_register == value_register
+        || increment_register == update_register
+        || increment_register == condition_index_register
+        || increment_register == condition_source_register
+        || increment_register == condition_length_register
+    {
+        return Ok(None);
+    }
+    for register in [
+        source_object_register,
+        key_register,
+        value_source_register,
+        value_register,
+        divisor_register,
+        update_register,
+        increment_register,
+        condition_index_register,
+        condition_source_register,
+        condition_length_register,
+    ] {
+        if registers.get(register as usize).is_none() {
+            return Ok(None);
+        }
+    }
+
+    let source_string_id = read_unsigned_operand(source_get_bytes, 4, 1);
+    let key_string_id = read_unsigned_operand(key_get_bytes, 4, 1);
+    let value_string_id = read_unsigned_operand(value_get_bytes, 4, 1);
+    let update_string_id = read_unsigned_operand(update_get_bytes, 4, 1);
+    let put_index_string_id = read_unsigned_operand(put_index_bytes, 4, 2);
+    let condition_index_string_id = read_unsigned_operand(condition_index_bytes, 4, 1);
+    let condition_source_string_id = read_unsigned_operand(condition_source_bytes, 4, 1);
+    let length_string_id = read_unsigned_operand(condition_length_bytes, 4, 1);
+    let source_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        source_get_instruction,
+        source_string_id,
+    )?;
+    let key_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        key_get_instruction,
+        key_string_id,
+    )?;
+    let value_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        value_get_instruction,
+        value_string_id,
+    )?;
+    let update_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        update_get_instruction,
+        update_string_id,
+    )?;
+    let put_index_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        put_index_instruction,
+        put_index_string_id,
+    )?;
+    let condition_index_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        condition_index_instruction,
+        condition_index_string_id,
+    )?;
+    let condition_source_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        condition_source_instruction,
+        condition_source_string_id,
+    )?;
+    let length_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        condition_length_instruction,
+        length_string_id,
+    )?;
+    if !scalar_property_name_matches(key_property_name, value_property_name)
+        || !scalar_property_name_matches(key_property_name, update_property_name)
+        || !scalar_property_name_matches(key_property_name, put_index_property_name)
+        || !scalar_property_name_matches(key_property_name, condition_index_property_name)
+        || !scalar_property_name_matches(source_property_name, condition_source_property_name)
+        || length_property_name != "length"
+    {
+        return Ok(None);
+    }
+
+    let ScalarValue::Object(array @ ScalarObjectHandle::Uint8Array(object_id)) =
+        read_cached_scalar_global_property(state, source_string_id, source_property_name)
+    else {
+        return Ok(None);
+    };
+    if !state.object_getters.is_empty()
+        || read_scalar_object_prototype(state, array).is_some()
+        || read_scalar_own_object_property(state, array, length_property_name).is_some()
+    {
+        return Ok(None);
+    }
+    let key_value = read_cached_scalar_global_property(state, key_string_id, key_property_name);
+    let Some(key_index) = scalar_value_to_u32(key_value) else {
+        return Ok(None);
+    };
+    let ScalarValue::Number(source_number) =
+        read_cached_scalar_global_property(state, value_string_id, value_property_name)
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(divisor)) = registers.get(divisor_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(increment)) = registers.get(increment_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+
+    let value = source_number % divisor;
+    let next_index = source_number + increment;
+    registers[source_object_register as usize] = ScalarValue::Object(array);
+    registers[key_register as usize] = key_value;
+    registers[value_source_register as usize] = ScalarValue::Number(source_number);
+    registers[value_register as usize] = ScalarValue::Number(value);
+    registers[update_register as usize] = ScalarValue::Number(next_index);
+    write_cached_scalar_global_property(
+        state,
+        put_index_string_id,
+        put_index_property_name,
+        ScalarValue::Number(next_index),
+    );
+    registers[condition_index_register as usize] = ScalarValue::Number(next_index);
+    registers[condition_source_register as usize] = ScalarValue::Object(array);
+
+    let storage_index = usize::try_from(object_id).expect("Uint8Array id fits in usize");
+    if let Some(storage) = state
+        .uint8_array_storage
+        .get_mut(storage_index)
+        .and_then(Option::as_mut)
+    {
+        let key_index = usize::try_from(key_index).expect("Uint8Array index fits in usize");
+        if let Some(slot) = storage.get_mut(key_index) {
+            *slot = scalar_to_uint8(ScalarValue::Number(value));
+        }
+    }
+
+    let length = read_scalar_array_length(state, array).map_or(0.0, f64::from);
+    registers[condition_length_register as usize] = ScalarValue::Number(length);
+    if scalar_relational_jump_matches(jump_instruction.opcode, next_index, length) {
+        Ok(Some(instruction_index))
+    } else {
+        Ok(Some(jump_instruction_index + 1))
+    }
 }
 
 fn try_execute_scalar_math_lookup_pair<'a>(

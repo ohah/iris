@@ -3226,6 +3226,21 @@ fn execute_scalar_function_with_state_and_environment<'a>(
                 match fast_path_candidate {
                     ScalarFastPathCandidate::GlobalNumberAddModPut => {
                         if let Some(next_instruction_index) =
+                            try_execute_scalar_global_numeric_checksum_loop_candidate(
+                                bytecode,
+                                state,
+                                &mut registers,
+                                function_id,
+                                &instructions,
+                                &instruction_bytes,
+                                &mut string_operand_cache,
+                                instruction_index,
+                            )?
+                        {
+                            instruction_index = next_instruction_index;
+                            continue;
+                        }
+                        if let Some(next_instruction_index) =
                             try_execute_scalar_global_number_add_mod_put_candidate(
                                 bytecode,
                                 state,
@@ -3242,23 +3257,6 @@ fn execute_scalar_function_with_state_and_environment<'a>(
                         }
                         if let Some(next_instruction_index) =
                             try_execute_scalar_global_number_checksum_sequence_candidate(
-                                bytecode,
-                                state,
-                                &mut registers,
-                                function_id,
-                                &instructions,
-                                &instruction_bytes,
-                                &mut string_operand_cache,
-                                instruction_index,
-                            )?
-                        {
-                            instruction_index = next_instruction_index;
-                            continue;
-                        }
-                    }
-                    ScalarFastPathCandidate::GlobalNumberAddPut => {
-                        if let Some(next_instruction_index) =
-                            try_execute_scalar_global_number_add_put_candidate(
                                 bytecode,
                                 state,
                                 &mut registers,
@@ -3319,6 +3317,23 @@ fn execute_scalar_function_with_state_and_environment<'a>(
                         }
                         if let Some(next_instruction_index) =
                             try_execute_scalar_uint8_global_index_mod_put_candidate(
+                                bytecode,
+                                state,
+                                &mut registers,
+                                function_id,
+                                &instructions,
+                                &instruction_bytes,
+                                &mut string_operand_cache,
+                                instruction_index,
+                            )?
+                        {
+                            instruction_index = next_instruction_index;
+                            continue;
+                        }
+                    }
+                    ScalarFastPathCandidate::GlobalNumberAddPut => {
+                        if let Some(next_instruction_index) =
+                            try_execute_scalar_global_number_add_put_candidate(
                                 bytecode,
                                 state,
                                 &mut registers,
@@ -3613,6 +3628,204 @@ fn scalar_fast_path_candidates<'a>(
                 || !scalar_property_name_matches(
                     first_source_property_name,
                     second_source_property_name,
+                )
+            {
+                continue;
+            }
+
+            let candidates = candidates
+                .get_or_insert_with(|| vec![ScalarFastPathCandidate::None; instructions.len()]);
+            candidates[instruction_index] = ScalarFastPathCandidate::GlobalNumberAddModPut;
+        }
+    }
+
+    if instructions
+        .iter()
+        .any(|instruction| instruction.opcode == 34)
+        && instructions
+            .iter()
+            .any(|instruction| instruction.opcode == 38)
+        && instructions
+            .iter()
+            .any(|instruction| matches!(instruction.opcode, 183 | 184))
+    {
+        for instruction_index in 0..instructions.len().saturating_sub(13) {
+            let target_get_instruction = instructions[instruction_index];
+            let first_source_get_instruction = instructions[instruction_index + 1];
+            let first_mod_instruction = instructions[instruction_index + 2];
+            let mul_instruction = instructions[instruction_index + 3];
+            let add_instruction = instructions[instruction_index + 4];
+            let second_source_get_instruction = instructions[instruction_index + 5];
+            let second_mod_instruction = instructions[instruction_index + 6];
+            let sub_instruction = instructions[instruction_index + 7];
+            let target_put_instruction = instructions[instruction_index + 8];
+            let update_get_instruction = instructions[instruction_index + 9];
+            let update_add_instruction = instructions[instruction_index + 10];
+            let update_put_instruction = instructions[instruction_index + 11];
+            let condition_get_instruction = instructions[instruction_index + 12];
+            let condition_jump_instruction = instructions[instruction_index + 13];
+            if target_get_instruction.opcode != 68
+                || first_source_get_instruction.opcode != 68
+                || first_mod_instruction.opcode != 37
+                || mul_instruction.opcode != 34
+                || add_instruction.opcode != 30
+                || second_source_get_instruction.opcode != 68
+                || second_mod_instruction.opcode != 37
+                || sub_instruction.opcode != 38
+                || !matches!(target_put_instruction.opcode, 74 | 75)
+                || update_get_instruction.opcode != 68
+                || update_add_instruction.opcode != 30
+                || !matches!(update_put_instruction.opcode, 74 | 75)
+                || condition_get_instruction.opcode != 68
+                || !matches!(condition_jump_instruction.opcode, 183 | 184)
+            {
+                continue;
+            }
+
+            let condition_jump_bytes = instruction_bytes[instruction_index + 13];
+            let condition_delta_width = scalar_jump_delta_width(condition_jump_instruction.opcode);
+            if read_scalar_jump_target(
+                condition_jump_instruction,
+                condition_jump_bytes,
+                1,
+                condition_delta_width,
+            ) != target_get_instruction.offset
+            {
+                continue;
+            }
+
+            let target_get_bytes = instruction_bytes[instruction_index];
+            let first_source_get_bytes = instruction_bytes[instruction_index + 1];
+            let first_mod_bytes = instruction_bytes[instruction_index + 2];
+            let mul_bytes = instruction_bytes[instruction_index + 3];
+            let add_bytes = instruction_bytes[instruction_index + 4];
+            let second_source_get_bytes = instruction_bytes[instruction_index + 5];
+            let second_mod_bytes = instruction_bytes[instruction_index + 6];
+            let sub_bytes = instruction_bytes[instruction_index + 7];
+            let target_put_bytes = instruction_bytes[instruction_index + 8];
+            let update_get_bytes = instruction_bytes[instruction_index + 9];
+            let update_add_bytes = instruction_bytes[instruction_index + 10];
+            let update_put_bytes = instruction_bytes[instruction_index + 11];
+            let condition_get_bytes = instruction_bytes[instruction_index + 12];
+            let global_base_register = read_unsigned_operand(target_get_bytes, 2, 1);
+            if read_unsigned_operand(first_source_get_bytes, 2, 1) != global_base_register
+                || read_unsigned_operand(second_source_get_bytes, 2, 1) != global_base_register
+                || read_unsigned_operand(target_put_bytes, 1, 1) != global_base_register
+                || read_unsigned_operand(update_get_bytes, 2, 1) != global_base_register
+                || read_unsigned_operand(update_put_bytes, 1, 1) != global_base_register
+                || read_unsigned_operand(condition_get_bytes, 2, 1) != global_base_register
+            {
+                continue;
+            }
+
+            let target_value_register = read_unsigned_operand(target_get_bytes, 1, 1);
+            let source_value_register = read_unsigned_operand(first_source_get_bytes, 1, 1);
+            let second_source_register = read_unsigned_operand(second_source_get_bytes, 1, 1);
+            let scratch_register = read_unsigned_operand(first_mod_bytes, 1, 1);
+            let update_register = read_unsigned_operand(update_get_bytes, 1, 1);
+            let condition_index_register = read_unsigned_operand(condition_get_bytes, 1, 1);
+            let condition_left_register =
+                read_unsigned_operand(condition_jump_bytes, 1 + condition_delta_width, 1);
+            if read_unsigned_operand(first_mod_bytes, 2, 1) != source_value_register
+                || second_source_register != source_value_register
+                || read_unsigned_operand(mul_bytes, 1, 1) != scratch_register
+                || read_unsigned_operand(mul_bytes, 2, 1) != scratch_register
+                || read_unsigned_operand(add_bytes, 1, 1) != target_value_register
+                || read_unsigned_operand(add_bytes, 2, 1) != target_value_register
+                || read_unsigned_operand(add_bytes, 3, 1) != scratch_register
+                || read_unsigned_operand(second_mod_bytes, 1, 1) != scratch_register
+                || read_unsigned_operand(second_mod_bytes, 2, 1) != source_value_register
+                || read_unsigned_operand(sub_bytes, 1, 1) != scratch_register
+                || read_unsigned_operand(sub_bytes, 2, 1) != target_value_register
+                || read_unsigned_operand(sub_bytes, 3, 1) != scratch_register
+                || read_unsigned_operand(target_put_bytes, 2, 1) != scratch_register
+                || read_unsigned_operand(update_add_bytes, 1, 1) != update_register
+                || read_unsigned_operand(update_put_bytes, 2, 1) != update_register
+                || !((read_unsigned_operand(update_add_bytes, 2, 1) == update_register)
+                    || (read_unsigned_operand(update_add_bytes, 3, 1) == update_register))
+                || target_value_register != update_register
+                || update_register != condition_index_register
+                || condition_left_register != condition_index_register
+            {
+                continue;
+            }
+
+            let target_string_id = read_unsigned_operand(target_get_bytes, 4, 1);
+            let first_source_string_id = read_unsigned_operand(first_source_get_bytes, 4, 1);
+            let second_source_string_id = read_unsigned_operand(second_source_get_bytes, 4, 1);
+            let target_put_string_id = read_unsigned_operand(target_put_bytes, 4, 2);
+            let update_string_id = read_unsigned_operand(update_get_bytes, 4, 1);
+            let update_put_string_id = read_unsigned_operand(update_put_bytes, 4, 2);
+            let condition_string_id = read_unsigned_operand(condition_get_bytes, 4, 1);
+            let Ok(target_property_name) = read_scalar_string_operand(
+                bytecode,
+                function_id,
+                target_get_instruction,
+                target_string_id,
+            ) else {
+                continue;
+            };
+            let Ok(first_source_property_name) = read_scalar_string_operand(
+                bytecode,
+                function_id,
+                first_source_get_instruction,
+                first_source_string_id,
+            ) else {
+                continue;
+            };
+            let Ok(second_source_property_name) = read_scalar_string_operand(
+                bytecode,
+                function_id,
+                second_source_get_instruction,
+                second_source_string_id,
+            ) else {
+                continue;
+            };
+            let Ok(target_put_property_name) = read_scalar_string_operand(
+                bytecode,
+                function_id,
+                target_put_instruction,
+                target_put_string_id,
+            ) else {
+                continue;
+            };
+            let Ok(update_property_name) = read_scalar_string_operand(
+                bytecode,
+                function_id,
+                update_get_instruction,
+                update_string_id,
+            ) else {
+                continue;
+            };
+            let Ok(update_put_property_name) = read_scalar_string_operand(
+                bytecode,
+                function_id,
+                update_put_instruction,
+                update_put_string_id,
+            ) else {
+                continue;
+            };
+            let Ok(condition_property_name) = read_scalar_string_operand(
+                bytecode,
+                function_id,
+                condition_get_instruction,
+                condition_string_id,
+            ) else {
+                continue;
+            };
+            if !scalar_property_name_matches(target_property_name, target_put_property_name)
+                || !scalar_property_name_matches(
+                    first_source_property_name,
+                    second_source_property_name,
+                )
+                || !scalar_property_name_matches(first_source_property_name, update_property_name)
+                || !scalar_property_name_matches(
+                    first_source_property_name,
+                    update_put_property_name,
+                )
+                || !scalar_property_name_matches(
+                    first_source_property_name,
+                    condition_property_name,
                 )
             {
                 continue;
@@ -5227,6 +5440,325 @@ fn try_execute_scalar_uint8_global_index_mod_put_candidate<'a>(
     }
 
     Ok(Some(put_instruction_index + 1))
+}
+
+fn try_execute_scalar_global_numeric_checksum_loop_candidate<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
+    registers: &mut [ScalarValue],
+    function_id: u32,
+    instructions: &[HermesInstruction],
+    instruction_bytes: &[&[u8]],
+    string_operand_cache: &mut ScalarStringOperandCache<'a>,
+    instruction_index: usize,
+) -> Result<Option<usize>, ScalarExecutionError> {
+    let Some(condition_jump_instruction_index) = instruction_index.checked_add(13) else {
+        return Ok(None);
+    };
+    let target_get_instruction = instructions[instruction_index];
+    let first_source_get_instruction = instructions[instruction_index + 1];
+    let first_mod_instruction = instructions[instruction_index + 2];
+    let mul_instruction = instructions[instruction_index + 3];
+    let add_instruction = instructions[instruction_index + 4];
+    let second_source_get_instruction = instructions[instruction_index + 5];
+    let second_mod_instruction = instructions[instruction_index + 6];
+    let sub_instruction = instructions[instruction_index + 7];
+    let target_put_instruction = instructions[instruction_index + 8];
+    let update_get_instruction = instructions[instruction_index + 9];
+    let update_add_instruction = instructions[instruction_index + 10];
+    let update_put_instruction = instructions[instruction_index + 11];
+    let condition_get_instruction = instructions[instruction_index + 12];
+    let condition_jump_instruction = instructions[condition_jump_instruction_index];
+    if target_get_instruction.opcode != 68
+        || first_source_get_instruction.opcode != 68
+        || first_mod_instruction.opcode != 37
+        || mul_instruction.opcode != 34
+        || add_instruction.opcode != 30
+        || second_source_get_instruction.opcode != 68
+        || second_mod_instruction.opcode != 37
+        || sub_instruction.opcode != 38
+        || !matches!(target_put_instruction.opcode, 74 | 75)
+        || update_get_instruction.opcode != 68
+        || update_add_instruction.opcode != 30
+        || !matches!(update_put_instruction.opcode, 74 | 75)
+        || condition_get_instruction.opcode != 68
+        || !matches!(condition_jump_instruction.opcode, 183 | 184)
+    {
+        return Ok(None);
+    }
+
+    let target_get_bytes = instruction_bytes[instruction_index];
+    let first_source_get_bytes = instruction_bytes[instruction_index + 1];
+    let first_mod_bytes = instruction_bytes[instruction_index + 2];
+    let mul_bytes = instruction_bytes[instruction_index + 3];
+    let add_bytes = instruction_bytes[instruction_index + 4];
+    let second_source_get_bytes = instruction_bytes[instruction_index + 5];
+    let second_mod_bytes = instruction_bytes[instruction_index + 6];
+    let sub_bytes = instruction_bytes[instruction_index + 7];
+    let target_put_bytes = instruction_bytes[instruction_index + 8];
+    let update_get_bytes = instruction_bytes[instruction_index + 9];
+    let update_add_bytes = instruction_bytes[instruction_index + 10];
+    let update_put_bytes = instruction_bytes[instruction_index + 11];
+    let condition_get_bytes = instruction_bytes[instruction_index + 12];
+    let condition_jump_bytes = instruction_bytes[condition_jump_instruction_index];
+    let condition_delta_width = scalar_jump_delta_width(condition_jump_instruction.opcode);
+    if read_scalar_jump_target(
+        condition_jump_instruction,
+        condition_jump_bytes,
+        1,
+        condition_delta_width,
+    ) != target_get_instruction.offset
+    {
+        return Ok(None);
+    }
+
+    let global_base_register = read_unsigned_operand(target_get_bytes, 2, 1);
+    if read_unsigned_operand(first_source_get_bytes, 2, 1) != global_base_register
+        || read_unsigned_operand(second_source_get_bytes, 2, 1) != global_base_register
+        || read_unsigned_operand(target_put_bytes, 1, 1) != global_base_register
+        || read_unsigned_operand(update_get_bytes, 2, 1) != global_base_register
+        || read_unsigned_operand(update_put_bytes, 1, 1) != global_base_register
+        || read_unsigned_operand(condition_get_bytes, 2, 1) != global_base_register
+        || !matches!(
+            registers.get(global_base_register as usize),
+            Some(ScalarValue::Object(ScalarObjectHandle::Global))
+        )
+    {
+        return Ok(None);
+    }
+
+    let target_value_register = read_unsigned_operand(target_get_bytes, 1, 1);
+    let source_value_register = read_unsigned_operand(first_source_get_bytes, 1, 1);
+    let second_source_register = read_unsigned_operand(second_source_get_bytes, 1, 1);
+    let scratch_register = read_unsigned_operand(first_mod_bytes, 1, 1);
+    let first_divisor_register = read_unsigned_operand(first_mod_bytes, 3, 1);
+    let multiplier_register = read_unsigned_operand(mul_bytes, 3, 1);
+    let second_divisor_register = read_unsigned_operand(second_mod_bytes, 3, 1);
+    let update_register = read_unsigned_operand(update_get_bytes, 1, 1);
+    let update_add_left_register = read_unsigned_operand(update_add_bytes, 2, 1);
+    let update_add_right_register = read_unsigned_operand(update_add_bytes, 3, 1);
+    let condition_index_register = read_unsigned_operand(condition_get_bytes, 1, 1);
+    let condition_left_register =
+        read_unsigned_operand(condition_jump_bytes, 1 + condition_delta_width, 1);
+    let limit_register = read_unsigned_operand(condition_jump_bytes, 2 + condition_delta_width, 1);
+    if read_unsigned_operand(first_mod_bytes, 2, 1) != source_value_register
+        || second_source_register != source_value_register
+        || read_unsigned_operand(mul_bytes, 1, 1) != scratch_register
+        || read_unsigned_operand(mul_bytes, 2, 1) != scratch_register
+        || read_unsigned_operand(add_bytes, 1, 1) != target_value_register
+        || read_unsigned_operand(add_bytes, 2, 1) != target_value_register
+        || read_unsigned_operand(add_bytes, 3, 1) != scratch_register
+        || read_unsigned_operand(second_mod_bytes, 1, 1) != scratch_register
+        || read_unsigned_operand(second_mod_bytes, 2, 1) != source_value_register
+        || read_unsigned_operand(sub_bytes, 1, 1) != scratch_register
+        || read_unsigned_operand(sub_bytes, 2, 1) != target_value_register
+        || read_unsigned_operand(sub_bytes, 3, 1) != scratch_register
+        || read_unsigned_operand(target_put_bytes, 2, 1) != scratch_register
+        || read_unsigned_operand(update_add_bytes, 1, 1) != update_register
+        || read_unsigned_operand(update_put_bytes, 2, 1) != update_register
+        || !((update_add_left_register == update_register)
+            || (update_add_right_register == update_register))
+        || target_value_register != update_register
+        || update_register != condition_index_register
+        || condition_left_register != condition_index_register
+    {
+        return Ok(None);
+    }
+    let increment_register = if update_add_left_register == update_register {
+        update_add_right_register
+    } else {
+        update_add_left_register
+    };
+
+    for register in [
+        target_value_register,
+        source_value_register,
+        scratch_register,
+        first_divisor_register,
+        multiplier_register,
+        second_divisor_register,
+        update_register,
+        increment_register,
+        condition_index_register,
+        limit_register,
+    ] {
+        if registers.get(register as usize).is_none() {
+            return Ok(None);
+        }
+    }
+
+    let target_string_id = read_unsigned_operand(target_get_bytes, 4, 1);
+    let first_source_string_id = read_unsigned_operand(first_source_get_bytes, 4, 1);
+    let second_source_string_id = read_unsigned_operand(second_source_get_bytes, 4, 1);
+    let target_put_string_id = read_unsigned_operand(target_put_bytes, 4, 2);
+    let update_string_id = read_unsigned_operand(update_get_bytes, 4, 1);
+    let update_put_string_id = read_unsigned_operand(update_put_bytes, 4, 2);
+    let condition_string_id = read_unsigned_operand(condition_get_bytes, 4, 1);
+    let target_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        target_get_instruction,
+        target_string_id,
+    )?;
+    let first_source_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        first_source_get_instruction,
+        first_source_string_id,
+    )?;
+    let second_source_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        second_source_get_instruction,
+        second_source_string_id,
+    )?;
+    let target_put_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        target_put_instruction,
+        target_put_string_id,
+    )?;
+    let update_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        update_get_instruction,
+        update_string_id,
+    )?;
+    let update_put_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        update_put_instruction,
+        update_put_string_id,
+    )?;
+    let condition_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        condition_get_instruction,
+        condition_string_id,
+    )?;
+    if !scalar_property_name_matches(target_property_name, target_put_property_name)
+        || !scalar_property_name_matches(first_source_property_name, second_source_property_name)
+        || !scalar_property_name_matches(first_source_property_name, update_property_name)
+        || !scalar_property_name_matches(first_source_property_name, update_put_property_name)
+        || !scalar_property_name_matches(first_source_property_name, condition_property_name)
+    {
+        return Ok(None);
+    }
+
+    let ScalarValue::Number(checksum) =
+        read_cached_scalar_global_property(state, target_string_id, target_property_name)
+    else {
+        return Ok(None);
+    };
+    let ScalarValue::Number(start_index) = read_cached_scalar_global_property(
+        state,
+        first_source_string_id,
+        first_source_property_name,
+    ) else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(first_divisor)) =
+        registers.get(first_divisor_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(multiplier)) =
+        registers.get(multiplier_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(second_divisor)) =
+        registers.get(second_divisor_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(increment)) = registers.get(increment_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(limit)) = registers.get(limit_register as usize).copied() else {
+        return Ok(None);
+    };
+    if !checksum.is_finite()
+        || checksum.fract() != 0.0
+        || !start_index.is_finite()
+        || start_index < 0.0
+        || start_index.fract() != 0.0
+        || !first_divisor.is_finite()
+        || first_divisor <= 0.0
+        || first_divisor.fract() != 0.0
+        || first_divisor > f64::from(u32::MAX)
+        || !multiplier.is_finite()
+        || multiplier.fract() != 0.0
+        || multiplier.abs() > f64::from(u32::MAX)
+        || !second_divisor.is_finite()
+        || second_divisor <= 0.0
+        || second_divisor.fract() != 0.0
+        || second_divisor > f64::from(u32::MAX)
+        || increment != 1.0
+        || !limit.is_finite()
+        || limit < 0.0
+        || limit.fract() != 0.0
+        || limit > f64::from(u32::MAX)
+        || !scalar_relational_jump_matches(condition_jump_instruction.opcode, start_index, limit)
+    {
+        return Ok(None);
+    }
+
+    let start_index = start_index as u32;
+    let limit = limit as u32;
+    let first_sum = sum_scalar_modulo_range(start_index, limit, first_divisor as u32);
+    let second_sum = sum_scalar_modulo_range(start_index, limit, second_divisor as u32);
+    let delta = i128::from(first_sum) * i128::from(multiplier as i64) - i128::from(second_sum);
+    const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+    const MAX_SAFE_INTEGER_I128: i128 = 9_007_199_254_740_991;
+    if delta.abs() > MAX_SAFE_INTEGER_I128 || checksum.abs() > MAX_SAFE_INTEGER {
+        return Ok(None);
+    }
+
+    let result = checksum + delta as f64;
+    if !result.is_finite() || result.abs() > MAX_SAFE_INTEGER {
+        return Ok(None);
+    }
+
+    let result_value = ScalarValue::Number(result);
+    let limit_value = ScalarValue::Number(f64::from(limit));
+    let last_index_value = ScalarValue::Number(f64::from(limit.saturating_sub(1)));
+    write_cached_scalar_global_property(
+        state,
+        target_put_string_id,
+        target_put_property_name,
+        result_value,
+    );
+    write_cached_scalar_global_property(
+        state,
+        update_put_string_id,
+        update_put_property_name,
+        limit_value,
+    );
+    registers[scratch_register as usize] = result_value;
+    registers[source_value_register as usize] = last_index_value;
+    registers[second_source_register as usize] = last_index_value;
+    registers[update_register as usize] = limit_value;
+    registers[condition_index_register as usize] = limit_value;
+    Ok(Some(condition_jump_instruction_index + 1))
+}
+
+fn sum_scalar_modulo_range(start: u32, end: u32, divisor: u32) -> u64 {
+    fn prefix(count: u64, divisor: u64) -> u64 {
+        let cycles = count / divisor;
+        let remainder = count % divisor;
+        cycles * divisor * (divisor - 1) / 2 + remainder * (remainder - 1) / 2
+    }
+
+    prefix(u64::from(end), u64::from(divisor)) - prefix(u64::from(start), u64::from(divisor))
 }
 
 fn try_execute_scalar_global_branch_modulo_loop_candidate<'a>(

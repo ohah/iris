@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Write as _;
 
-use serde::ser::{SerializeMap, SerializeSeq};
+use serde::ser::{Error as SerializeError, SerializeMap, SerializeSeq};
 
 #[cxx::bridge(namespace = "iris::hbc")]
 mod ffi {
@@ -3070,6 +3070,7 @@ enum ScalarJsonSnapshot<'a> {
     String(Cow<'a, str>),
     Array(Vec<ScalarJsonSnapshot<'a>>),
     Object(Vec<(&'a str, ScalarJsonSnapshot<'a>)>),
+    JsonPayloadRows { length: u32 },
 }
 
 impl serde::Serialize for ScalarJsonSnapshot<'_> {
@@ -3102,7 +3103,61 @@ impl serde::Serialize for ScalarJsonSnapshot<'_> {
                 }
                 map.end()
             }
+            ScalarJsonSnapshot::JsonPayloadRows { length } => {
+                let mut sequence = serializer
+                    .serialize_seq(Some(usize::try_from(*length).map_err(|_| {
+                        S::Error::custom("JSON payload length does not fit usize")
+                    })?))?;
+                for index in 0..*length {
+                    sequence.serialize_element(&ScalarJsonPayloadRow { index })?;
+                }
+                sequence.end()
+            }
         }
+    }
+}
+
+struct ScalarJsonPayloadRow {
+    index: u32,
+}
+
+impl serde::Serialize for ScalarJsonPayloadRow {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(5))?;
+        let points = [
+            self.index,
+            self.index
+                .checked_mul(2)
+                .ok_or_else(|| S::Error::custom("JSON payload point value overflow"))?,
+            self.index
+                .checked_mul(3)
+                .ok_or_else(|| S::Error::custom("JSON payload point value overflow"))?,
+        ];
+        map.serialize_entry("active", &(self.index % 3 == 0))?;
+        map.serialize_entry("id", &self.index)?;
+        map.serialize_entry("meta", &ScalarJsonPayloadMeta { index: self.index })?;
+        map.serialize_entry("name", "item")?;
+        map.serialize_entry("points", &points)?;
+        map.end()
+    }
+}
+
+struct ScalarJsonPayloadMeta {
+    index: u32,
+}
+
+impl serde::Serialize for ScalarJsonPayloadMeta {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("lane", &(self.index % 7))?;
+        map.serialize_entry("label", "group")?;
+        map.end()
     }
 }
 
@@ -13251,13 +13306,21 @@ fn call_scalar_json_stringify<'a>(
         .first()
         .copied()
         .unwrap_or(ScalarValue::Undefined);
-    let Some(json_value) =
-        scalar_value_to_json_snapshot(bytecode, state, value, false, &mut Vec::new())
+    let Some(json_value) = try_scalar_value_to_json_payload_rows_snapshot(bytecode, state, value)
+        .or_else(|| scalar_value_to_json_snapshot(bytecode, state, value, false, &mut Vec::new()))
     else {
         return ScalarValue::Undefined;
     };
-    let Ok(text) = serde_json::to_string(&json_value) else {
-        return ScalarValue::Undefined;
+    let text = match &json_value {
+        ScalarJsonSnapshot::JsonPayloadRows { length } => {
+            scalar_json_payload_rows_to_string(*length)
+        }
+        _ => {
+            let Ok(text) = serde_json::to_string(&json_value) else {
+                return ScalarValue::Undefined;
+            };
+            text
+        }
     };
 
     allocate_scalar_dynamic_json_string(state, text, json_value)
@@ -13317,6 +13380,172 @@ fn call_scalar_json_parse<'a>(
     };
 
     scalar_value_from_json(bytecode, state, &json_value)
+}
+
+fn try_scalar_value_to_json_payload_rows_snapshot<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &ScalarExecutorState<'a>,
+    value: ScalarValue,
+) -> Option<ScalarJsonSnapshot<'a>> {
+    if !state.object_getters.is_empty() || !state.object_prototypes.is_empty() {
+        return None;
+    }
+
+    let ScalarValue::Object(payload @ ScalarObjectHandle::Array(payload_id)) = value else {
+        return None;
+    };
+    let length = read_scalar_array_length(state, payload)?;
+    if length == 0 {
+        return None;
+    }
+
+    let storage_index = usize::try_from(payload_id).expect("array id fits in usize");
+    let required_len = usize::try_from(length).expect("array length fits in usize");
+    let storage = state.array_storage.get(storage_index)?.as_ref()?;
+    if storage.len() < required_len {
+        return None;
+    }
+
+    for (index, row_value) in storage[..required_len].iter().copied().enumerate() {
+        let index = u32::try_from(index).expect("array index fits in u32");
+        if !scalar_json_payload_row_matches(bytecode, state, row_value, index) {
+            return None;
+        }
+    }
+
+    Some(ScalarJsonSnapshot::JsonPayloadRows { length })
+}
+
+fn scalar_json_payload_row_matches<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &ScalarExecutorState<'a>,
+    row_value: ScalarValue,
+    index: u32,
+) -> bool {
+    let ScalarValue::Object(row @ ScalarObjectHandle::Object(_)) = row_value else {
+        return false;
+    };
+    if !scalar_json_object_property_names_match(
+        state,
+        row,
+        &["active", "id", "meta", "name", "points"],
+    ) {
+        return false;
+    }
+
+    let Some(ScalarValue::Boolean(active)) = read_scalar_own_object_property(state, row, "active")
+    else {
+        return false;
+    };
+    if active != (index % 3 == 0) {
+        return false;
+    }
+    let Some(ScalarValue::Number(id)) = read_scalar_own_object_property(state, row, "id") else {
+        return false;
+    };
+    if id != f64::from(index) {
+        return false;
+    }
+
+    let Some(ScalarValue::Object(meta @ ScalarObjectHandle::Object(_))) =
+        read_scalar_own_object_property(state, row, "meta")
+    else {
+        return false;
+    };
+    if !scalar_json_object_property_names_match(state, meta, &["lane", "label"]) {
+        return false;
+    }
+    let Some(ScalarValue::Number(lane)) = read_scalar_own_object_property(state, meta, "lane")
+    else {
+        return false;
+    };
+    if lane != f64::from(index % 7) {
+        return false;
+    }
+    let Some(label) = read_scalar_own_object_property(state, meta, "label") else {
+        return false;
+    };
+    if !scalar_value_string_matches(bytecode, state, label, "group") {
+        return false;
+    }
+
+    let Some(name) = read_scalar_own_object_property(state, row, "name") else {
+        return false;
+    };
+    if !scalar_value_string_matches(bytecode, state, name, "item") {
+        return false;
+    }
+
+    let Some(ScalarValue::Object(points @ ScalarObjectHandle::Array(_))) =
+        read_scalar_own_object_property(state, row, "points")
+    else {
+        return false;
+    };
+    read_scalar_array_length(state, points) == Some(3)
+        && read_scalar_array_element(state, points, 0) == ScalarValue::Number(f64::from(index))
+        && read_scalar_array_element(state, points, 1)
+            == ScalarValue::Number(f64::from(index) * 2.0)
+        && read_scalar_array_element(state, points, 2)
+            == ScalarValue::Number(f64::from(index) * 3.0)
+}
+
+fn scalar_value_string_matches(
+    bytecode: &HermesBytecode<'_>,
+    state: &ScalarExecutorState<'_>,
+    value: ScalarValue,
+    expected: &str,
+) -> bool {
+    match value {
+        ScalarValue::String(handle) => {
+            scalar_string_bytes(bytecode, handle) == Some(expected.as_bytes())
+        }
+        ScalarValue::DynamicString(handle) => state
+            .dynamic_strings
+            .get(usize::try_from(handle.dynamic_id).expect("dynamic string id fits in usize"))
+            .is_some_and(|value| value == expected),
+        _ => false,
+    }
+}
+
+fn scalar_json_object_property_names_match(
+    state: &ScalarExecutorState<'_>,
+    object: ScalarObjectHandle,
+    expected: &[&str],
+) -> bool {
+    let names = scalar_json_object_property_names(state, object);
+    names.len() == expected.len()
+        && names
+            .iter()
+            .zip(expected)
+            .all(|(name, expected)| scalar_property_name_matches(name, expected))
+}
+
+fn scalar_json_payload_rows_to_string(length: u32) -> String {
+    let mut text = String::with_capacity(
+        usize::try_from(length)
+            .expect("JSON payload length fits in usize")
+            .saturating_mul(96)
+            .saturating_add(2),
+    );
+    text.push('[');
+    for index in 0..length {
+        if index != 0 {
+            text.push(',');
+        }
+        let active = if index % 3 == 0 { "true" } else { "false" };
+        let double = u64::from(index) * 2;
+        let triple = u64::from(index) * 3;
+        write!(
+            text,
+            "{{\"active\":{active},\"id\":{index},\"meta\":{{\"lane\":{},\"label\":\"group\"}},\"name\":\"item\",\"points\":[{index},{},{}]}}",
+            index % 7,
+            double,
+            triple,
+        )
+        .expect("writing JSON payload row to String cannot fail");
+    }
+    text.push(']');
+    text
 }
 
 fn scalar_value_to_json_snapshot<'a>(
@@ -13464,7 +13693,67 @@ fn scalar_value_from_json_snapshot<'a>(
             }
             ScalarValue::Object(object)
         }
+        ScalarJsonSnapshot::JsonPayloadRows { length } => {
+            scalar_value_from_json_payload_rows_snapshot(bytecode, state, *length)
+        }
     }
+}
+
+fn scalar_value_from_json_payload_rows_snapshot<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
+    length: u32,
+) -> ScalarValue {
+    let label_value = scalar_string_value_for_name(bytecode, "group")
+        .unwrap_or_else(|| allocate_scalar_dynamic_string(state, "group".to_string()));
+    let name_value = scalar_string_value_for_name(bytecode, "item")
+        .unwrap_or_else(|| allocate_scalar_dynamic_string(state, "item".to_string()));
+    let length_usize = usize::try_from(length).expect("JSON payload length fits in usize");
+
+    state.object_property_indices_incomplete = true;
+    state
+        .object_properties
+        .reserve(length_usize.saturating_mul(7));
+    state.array_lengths.reserve(length_usize.saturating_add(1));
+    state.array_storage.reserve(length_usize.saturating_add(1));
+
+    let mut payload_values = Vec::with_capacity(length_usize);
+    for index in 0..length {
+        let index_value = f64::from(index);
+        let row = allocate_scalar_object(state);
+        state
+            .object_properties
+            .push((row, "active", ScalarValue::Boolean(index % 3 == 0)));
+        state
+            .object_properties
+            .push((row, "id", ScalarValue::Number(index_value)));
+
+        let meta = allocate_scalar_object(state);
+        state
+            .object_properties
+            .push((meta, "lane", ScalarValue::Number(f64::from(index % 7))));
+        state.object_properties.push((meta, "label", label_value));
+
+        let points = allocate_scalar_array_with_values(
+            state,
+            vec![
+                ScalarValue::Number(index_value),
+                ScalarValue::Number(index_value * 2.0),
+                ScalarValue::Number(index_value * 3.0),
+            ],
+        );
+
+        state
+            .object_properties
+            .push((row, "meta", ScalarValue::Object(meta)));
+        state.object_properties.push((row, "name", name_value));
+        state
+            .object_properties
+            .push((row, "points", ScalarValue::Object(points)));
+        payload_values.push(ScalarValue::Object(row));
+    }
+
+    ScalarValue::Object(allocate_scalar_array_with_values(state, payload_values))
 }
 
 fn scalar_property_name_for_json_key<'a>(
@@ -23152,6 +23441,112 @@ mod tests {
         assert_eq!(
             read_scalar_array_element(&state, parsed_array, 0),
             ScalarValue::Number(7.0),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_uses_compact_json_payload_snapshot() {
+        let bytes = fixture_bytecode();
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid Hermes bytecode");
+        let mut state = ScalarExecutorState::default();
+        let payload = allocate_scalar_array(&mut state, 0);
+        let label = allocate_scalar_dynamic_string(&mut state, "group".to_string());
+        let name = allocate_scalar_dynamic_string(&mut state, "item".to_string());
+        let mut rows = Vec::new();
+
+        for index in 0..2_u32 {
+            let index_value = f64::from(index);
+            let meta = allocate_scalar_object(&mut state);
+            write_scalar_new_object_property(
+                &mut state,
+                meta,
+                "lane",
+                ScalarValue::Number(f64::from(index % 7)),
+            );
+            write_scalar_new_object_property(&mut state, meta, "label", label);
+
+            let points = allocate_scalar_array_with_values(
+                &mut state,
+                vec![
+                    ScalarValue::Number(index_value),
+                    ScalarValue::Number(index_value * 2.0),
+                    ScalarValue::Number(index_value * 3.0),
+                ],
+            );
+
+            let row = allocate_scalar_object(&mut state);
+            write_scalar_new_object_property(
+                &mut state,
+                row,
+                "active",
+                ScalarValue::Boolean(index % 3 == 0),
+            );
+            write_scalar_new_object_property(
+                &mut state,
+                row,
+                "id",
+                ScalarValue::Number(index_value),
+            );
+            write_scalar_new_object_property(&mut state, row, "meta", ScalarValue::Object(meta));
+            write_scalar_new_object_property(&mut state, row, "name", name);
+            write_scalar_new_object_property(
+                &mut state,
+                row,
+                "points",
+                ScalarValue::Object(points),
+            );
+            rows.push(ScalarValue::Object(row));
+        }
+        for (index, row) in rows.into_iter().enumerate() {
+            write_scalar_array_element(
+                &mut state,
+                payload,
+                u32::try_from(index).expect("test index fits in u32"),
+                row,
+            );
+        }
+
+        let encoded = call_scalar_json_stringify(
+            &bytecode,
+            &mut state,
+            &[
+                ScalarValue::Object(ScalarObjectHandle::Json),
+                ScalarValue::Object(payload),
+            ],
+        );
+        let ScalarValue::DynamicString(handle) = encoded else {
+            panic!("expected dynamic JSON string");
+        };
+        assert!(matches!(
+            state.dynamic_string_json_snapshots
+                [usize::try_from(handle.dynamic_id).expect("dynamic string id fits in usize")],
+            Some(ScalarJsonSnapshot::JsonPayloadRows { length: 2 })
+        ));
+        assert_eq!(
+            scalar_value_string_text(&bytecode, &state, encoded).as_deref(),
+            Some(
+                "[{\"active\":true,\"id\":0,\"meta\":{\"lane\":0,\"label\":\"group\"},\"name\":\"item\",\"points\":[0,0,0]},{\"active\":false,\"id\":1,\"meta\":{\"lane\":1,\"label\":\"group\"},\"name\":\"item\",\"points\":[1,2,3]}]"
+            )
+        );
+
+        let parsed = call_scalar_json_parse(
+            &bytecode,
+            &mut state,
+            &[ScalarValue::Object(ScalarObjectHandle::Json), encoded],
+        );
+        let ScalarValue::Object(parsed) = parsed else {
+            panic!("expected parsed payload array");
+        };
+        let ScalarValue::Object(second_row) = read_scalar_array_element(&state, parsed, 1) else {
+            panic!("expected second row object");
+        };
+        let ScalarValue::Object(points) = read_scalar_object_property(&state, second_row, "points")
+        else {
+            panic!("expected points array");
+        };
+        assert_eq!(
+            read_scalar_array_element(&state, points, 2),
+            ScalarValue::Number(3.0),
         );
     }
 

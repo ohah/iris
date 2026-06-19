@@ -37,6 +37,7 @@ type StrictHbcReport = {
 };
 
 type MetricSummary = {
+  absoluteSpreadMs: number | null;
   max: number | null;
   mean: number | null;
   median: number | null;
@@ -152,6 +153,7 @@ function comparisonArgs() {
       !arg.startsWith("--summary-output=") &&
       !arg.startsWith("--run-output-dir=") &&
       !arg.startsWith("--max-spread-percent=") &&
+      !arg.startsWith("--max-absolute-spread-ms=") &&
       arg !== "--reuse-existing"
     );
   });
@@ -173,6 +175,7 @@ function summarizeMetric(values: Array<number | null>): MetricSummary {
   const numericValues = values.filter((value): value is number => value != null);
   if (numericValues.length === 0) {
     return {
+      absoluteSpreadMs: null,
       max: null,
       mean: null,
       median: null,
@@ -192,6 +195,7 @@ function summarizeMetric(values: Array<number | null>): MetricSummary {
   const mean = sortedValues.reduce((sum, value) => sum + value, 0) / sortedValues.length;
 
   return {
+    absoluteSpreadMs: round(max - min),
     max: round(max),
     mean: round(mean),
     median: round(median),
@@ -201,7 +205,12 @@ function summarizeMetric(values: Array<number | null>): MetricSummary {
   };
 }
 
-function summarizeCase(id: string, runs: CaseRun[], maxSpreadPercent: number): CaseSummary {
+function summarizeCase(
+  id: string,
+  runs: CaseRun[],
+  maxSpreadPercent: number,
+  maxAbsoluteSpreadMs: number,
+): CaseSummary {
   const checksumKeys = new Set(runs.map((runEntry) => checksumKey(runEntry.checksum)));
   const checksumStable =
     checksumKeys.size === 1 && runs.every((runEntry) => runEntry.checksum.matches);
@@ -210,7 +219,13 @@ function summarizeCase(id: string, runs: CaseRun[], maxSpreadPercent: number): C
   if (!checksumStable) {
     unstableReasons.push("checksum");
   }
-  if (irisP50.relativeSpreadPercent != null && irisP50.relativeSpreadPercent > maxSpreadPercent) {
+  const exceedsRelativeSpread =
+    irisP50.relativeSpreadPercent != null && irisP50.relativeSpreadPercent > maxSpreadPercent;
+  const exceedsAbsoluteSpread =
+    maxAbsoluteSpreadMs > 0 &&
+    irisP50.absoluteSpreadMs != null &&
+    irisP50.absoluteSpreadMs > maxAbsoluteSpreadMs;
+  if (exceedsRelativeSpread && (maxAbsoluteSpreadMs <= 0 || exceedsAbsoluteSpread)) {
     unstableReasons.push("iris-p50-spread");
   }
 
@@ -232,6 +247,7 @@ function summarizeCase(id: string, runs: CaseRun[], maxSpreadPercent: number): C
 function summarizeCases(
   artifacts: Array<{ path: string; report: StrictHbcReport }>,
   maxSpreadPercent: number,
+  maxAbsoluteSpreadMs: number,
 ) {
   const firstArtifact = artifacts[0];
   if (firstArtifact == null) {
@@ -258,7 +274,7 @@ function summarizeCases(
         p95IrisOverHermes: entry.p95IrisOverHermes,
       });
     }
-    summaries.push(summarizeCase(id, runs, maxSpreadPercent));
+    summaries.push(summarizeCase(id, runs, maxSpreadPercent, maxAbsoluteSpreadMs));
   }
 
   return summaries;
@@ -272,6 +288,10 @@ function printSummary(cases: CaseSummary[]) {
       entry.irisP50.relativeSpreadPercent == null
         ? "n/a"
         : `${entry.irisP50.relativeSpreadPercent.toFixed(3)}%`,
+    irisP50AbsSpread:
+      entry.irisP50.absoluteSpreadMs == null
+        ? "n/a"
+        : `${entry.irisP50.absoluteSpreadMs.toFixed(3)}ms`,
     ratioMedian:
       entry.p50IrisOverHermes.median == null
         ? "n/a"
@@ -291,6 +311,7 @@ function main() {
     throw new Error("repeat summary requires at least two summarized runs after discard.");
   }
   const maxSpreadPercent = readFiniteNumberArg("--max-spread-percent", 5);
+  const maxAbsoluteSpreadMs = readFiniteNumberArg("--max-absolute-spread-ms", 0);
   const summaryOutputPath = resolve(root, readArg("--summary-output") ?? defaultSummaryOutputPath);
   const runOutputDir = resolve(root, readArg("--run-output-dir") ?? defaultRunOutputDir);
   const reuseExisting = process.argv.includes("--reuse-existing");
@@ -315,7 +336,7 @@ function main() {
   }
 
   const summarizedArtifacts = artifacts.slice(discardInitialRuns);
-  const cases = summarizeCases(summarizedArtifacts, maxSpreadPercent);
+  const cases = summarizeCases(summarizedArtifacts, maxSpreadPercent, maxAbsoluteSpreadMs);
   const report = {
     schemaVersion: "iris.benchmark.strict-hbc-engine-comparison-repeat-summary.v1",
     generatedBy: "tools/bench/run-strict-hbc-engine-comparison-repeat.ts",
@@ -324,8 +345,11 @@ function main() {
       scope:
         "Runs the host-side strict HBC engine comparison repeatedly and summarizes run-to-run stability. It is not an additional engine benchmark workload.",
       stableWhen:
-        "All checksums match and Iris p50 relative spread is at or below maxSpreadPercent.",
+        maxAbsoluteSpreadMs > 0
+          ? "All checksums match and Iris p50 relative spread is at or below maxSpreadPercent, or Iris p50 absolute spread is at or below maxAbsoluteSpreadMs."
+          : "All checksums match and Iris p50 relative spread is at or below maxSpreadPercent.",
       maxSpreadPercent,
+      maxAbsoluteSpreadMs,
       discardInitialRuns,
       reuseExisting,
     },

@@ -82,8 +82,8 @@ mise run check
 - `rn-android-build-engine-comparison`은 Hermes release와 실제 Iris release APK를 모두 빌드한다. 실제 비교 실행 전 기본 빌드 경로다.
 - `rn-android-build-engine-comparison-local`은 Hermes release와 로컬 skeleton 기반 Iris release를 모두 빌드한다. 성능값이 아니라 비교 preflight 검증용이다.
 - `bench-android-release-repeat`는 Android 물리 기기의 release APK에서 3회 반복 측정 summary를 남긴다.
-- `bench-strict-hbc-engine-compare-smoke`와 `bench-strict-hbc-engine-compare`는 같은 Hermes bytecode 파일을 Hermes runner와 Iris scalar executor에 실행하는 host-side strict HBC 비교다. 정식 비교 명령은 `--rounds=2`로 Hermes-first/Iris-first 실행 순서와 case 순서를 교차한다. RN release app, JSI, Fabric, TurboModule 경계 비교값은 아니다.
-- `bench-strict-hbc-engine-compare-repeat`는 같은 strict HBC 비교를 여러 번 실행하고 첫 noisy run을 제외한 stability summary를 만든다.
+- `bench-strict-hbc-engine-compare-smoke`와 `bench-strict-hbc-engine-compare`는 같은 Hermes bytecode 파일을 Hermes runner와 Iris scalar executor에 실행하는 host-side strict HBC 비교다. 정식 비교 명령은 `--rounds=2`로 Hermes-first/Iris-first 실행 순서와 case 순서를 교차한다. `--sample-inner-iterations=N`은 sub-ms case에서 한 measured sample 안에 같은 HBC 실행을 N번 묶어 timer jitter 비중을 줄인다. RN release app, JSI, Fabric, TurboModule 경계 비교값은 아니다.
+- `bench-strict-hbc-engine-compare-repeat`는 같은 strict HBC 비교를 여러 번 실행하고 첫 noisy run을 제외한 stability summary를 만든다. 기본 안정성 기준은 Iris p50 relative spread지만, sub/low-ms case는 `--max-absolute-spread-ms=N`을 명시해 절대 spread 완화 기준을 artifact에 남길 수 있다.
 - `bench-strict-hbc-compare-artifacts`는 이미 생성된 strict HBC single artifact 또는 repeat summary 두 개를 비교해 Iris p50/p95와 Hermes 대비 ratio 변화를 출력한다.
 - `bench-strict-hbc-compare-gate`는 같은 비교를 수행하되 checksum mismatch, unstable repeat summary, threshold 초과 회귀를 exit code 실패로 만든다.
 - `bench-strict-hbc-global-access`는 같은 계산을 전역 `var` read/write와 top-level lexical binding으로 각각 실행해 global property 접근 비용만 분리하는 diagnostic 비교다.

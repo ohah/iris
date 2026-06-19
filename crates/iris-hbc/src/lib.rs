@@ -3068,6 +3068,7 @@ enum ScalarFastPathCandidate {
     MathLookupPair,
     NativeMathCall2,
     ObjectNumberAddModPut,
+    GlobalBranchModuloLoop,
     Uint8GlobalIndexModPutIncLoop,
 }
 
@@ -3318,6 +3319,23 @@ fn execute_scalar_function_with_state_and_environment<'a>(
                         }
                         if let Some(next_instruction_index) =
                             try_execute_scalar_uint8_global_index_mod_put_candidate(
+                                bytecode,
+                                state,
+                                &mut registers,
+                                function_id,
+                                &instructions,
+                                &instruction_bytes,
+                                &mut string_operand_cache,
+                                instruction_index,
+                            )?
+                        {
+                            instruction_index = next_instruction_index;
+                            continue;
+                        }
+                    }
+                    ScalarFastPathCandidate::GlobalBranchModuloLoop => {
+                        if let Some(next_instruction_index) =
+                            try_execute_scalar_global_branch_modulo_loop_candidate(
                                 bytecode,
                                 state,
                                 &mut registers,
@@ -3603,6 +3621,80 @@ fn scalar_fast_path_candidates<'a>(
             let candidates = candidates
                 .get_or_insert_with(|| vec![ScalarFastPathCandidate::None; instructions.len()]);
             candidates[instruction_index] = ScalarFastPathCandidate::GlobalNumberAddModPut;
+        }
+    }
+
+    for instruction_index in 0..instructions.len().saturating_sub(18) {
+        let first_index_get_instruction = instructions[instruction_index];
+        let parity_mod_instruction = instructions[instruction_index + 1];
+        let parity_jump_instruction = instructions[instruction_index + 2];
+        let odd_get_instruction = instructions[instruction_index + 3];
+        let odd_index_get_instruction = instructions[instruction_index + 4];
+        let odd_mod_instruction = instructions[instruction_index + 5];
+        let odd_add_instruction = instructions[instruction_index + 6];
+        let odd_put_instruction = instructions[instruction_index + 7];
+        let skip_even_instruction = instructions[instruction_index + 8];
+        let even_get_instruction = instructions[instruction_index + 9];
+        let even_index_get_instruction = instructions[instruction_index + 10];
+        let even_mod_instruction = instructions[instruction_index + 11];
+        let even_add_instruction = instructions[instruction_index + 12];
+        let even_put_instruction = instructions[instruction_index + 13];
+        let update_get_instruction = instructions[instruction_index + 14];
+        let update_add_instruction = instructions[instruction_index + 15];
+        let update_put_instruction = instructions[instruction_index + 16];
+        let condition_get_instruction = instructions[instruction_index + 17];
+        let condition_jump_instruction = instructions[instruction_index + 18];
+        if first_index_get_instruction.opcode != 68
+            || parity_mod_instruction.opcode != 37
+            || !matches!(parity_jump_instruction.opcode, 211 | 212)
+            || odd_get_instruction.opcode != 68
+            || odd_index_get_instruction.opcode != 68
+            || odd_mod_instruction.opcode != 37
+            || odd_add_instruction.opcode != 30
+            || !matches!(odd_put_instruction.opcode, 74 | 75)
+            || !matches!(skip_even_instruction.opcode, 174 | 175)
+            || even_get_instruction.opcode != 68
+            || even_index_get_instruction.opcode != 68
+            || even_mod_instruction.opcode != 37
+            || even_add_instruction.opcode != 30
+            || !matches!(even_put_instruction.opcode, 74 | 75)
+            || update_get_instruction.opcode != 68
+            || update_add_instruction.opcode != 30
+            || !matches!(update_put_instruction.opcode, 74 | 75)
+            || condition_get_instruction.opcode != 68
+            || !matches!(condition_jump_instruction.opcode, 183 | 184)
+        {
+            continue;
+        }
+
+        let parity_jump_bytes = instruction_bytes[instruction_index + 2];
+        let skip_even_bytes = instruction_bytes[instruction_index + 8];
+        let condition_jump_bytes = instruction_bytes[instruction_index + 18];
+        let parity_delta_width = scalar_jump_delta_width(parity_jump_instruction.opcode);
+        let skip_delta_width = scalar_jump_delta_width(skip_even_instruction.opcode);
+        let condition_delta_width = scalar_jump_delta_width(condition_jump_instruction.opcode);
+        if read_scalar_jump_target(
+            parity_jump_instruction,
+            parity_jump_bytes,
+            1,
+            parity_delta_width,
+        ) != even_get_instruction.offset
+            || read_scalar_jump_target(skip_even_instruction, skip_even_bytes, 1, skip_delta_width)
+                != update_get_instruction.offset
+            || read_scalar_jump_target(
+                condition_jump_instruction,
+                condition_jump_bytes,
+                1,
+                condition_delta_width,
+            ) != first_index_get_instruction.offset
+        {
+            continue;
+        }
+
+        let candidates = candidates
+            .get_or_insert_with(|| vec![ScalarFastPathCandidate::None; instructions.len()]);
+        if candidates[instruction_index] == ScalarFastPathCandidate::None {
+            candidates[instruction_index] = ScalarFastPathCandidate::GlobalBranchModuloLoop;
         }
     }
 
@@ -5135,6 +5227,404 @@ fn try_execute_scalar_uint8_global_index_mod_put_candidate<'a>(
     }
 
     Ok(Some(put_instruction_index + 1))
+}
+
+fn try_execute_scalar_global_branch_modulo_loop_candidate<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
+    registers: &mut [ScalarValue],
+    function_id: u32,
+    instructions: &[HermesInstruction],
+    instruction_bytes: &[&[u8]],
+    string_operand_cache: &mut ScalarStringOperandCache<'a>,
+    instruction_index: usize,
+) -> Result<Option<usize>, ScalarExecutionError> {
+    let Some(condition_jump_instruction_index) = instruction_index.checked_add(18) else {
+        return Ok(None);
+    };
+    let first_index_get_instruction = instructions[instruction_index];
+    let parity_mod_instruction = instructions[instruction_index + 1];
+    let parity_jump_instruction = instructions[instruction_index + 2];
+    let odd_get_instruction = instructions[instruction_index + 3];
+    let odd_index_get_instruction = instructions[instruction_index + 4];
+    let odd_mod_instruction = instructions[instruction_index + 5];
+    let odd_add_instruction = instructions[instruction_index + 6];
+    let odd_put_instruction = instructions[instruction_index + 7];
+    let skip_even_instruction = instructions[instruction_index + 8];
+    let even_get_instruction = instructions[instruction_index + 9];
+    let even_index_get_instruction = instructions[instruction_index + 10];
+    let even_mod_instruction = instructions[instruction_index + 11];
+    let even_add_instruction = instructions[instruction_index + 12];
+    let even_put_instruction = instructions[instruction_index + 13];
+    let update_get_instruction = instructions[instruction_index + 14];
+    let update_add_instruction = instructions[instruction_index + 15];
+    let update_put_instruction = instructions[instruction_index + 16];
+    let condition_get_instruction = instructions[instruction_index + 17];
+    let condition_jump_instruction = instructions[condition_jump_instruction_index];
+    if first_index_get_instruction.opcode != 68
+        || parity_mod_instruction.opcode != 37
+        || !matches!(parity_jump_instruction.opcode, 211 | 212)
+        || odd_get_instruction.opcode != 68
+        || odd_index_get_instruction.opcode != 68
+        || odd_mod_instruction.opcode != 37
+        || odd_add_instruction.opcode != 30
+        || !matches!(odd_put_instruction.opcode, 74 | 75)
+        || !matches!(skip_even_instruction.opcode, 174 | 175)
+        || even_get_instruction.opcode != 68
+        || even_index_get_instruction.opcode != 68
+        || even_mod_instruction.opcode != 37
+        || even_add_instruction.opcode != 30
+        || !matches!(even_put_instruction.opcode, 74 | 75)
+        || update_get_instruction.opcode != 68
+        || update_add_instruction.opcode != 30
+        || !matches!(update_put_instruction.opcode, 74 | 75)
+        || condition_get_instruction.opcode != 68
+        || !matches!(condition_jump_instruction.opcode, 183 | 184)
+    {
+        return Ok(None);
+    }
+
+    let first_index_get_bytes = instruction_bytes[instruction_index];
+    let parity_mod_bytes = instruction_bytes[instruction_index + 1];
+    let parity_jump_bytes = instruction_bytes[instruction_index + 2];
+    let odd_get_bytes = instruction_bytes[instruction_index + 3];
+    let odd_index_get_bytes = instruction_bytes[instruction_index + 4];
+    let odd_mod_bytes = instruction_bytes[instruction_index + 5];
+    let odd_add_bytes = instruction_bytes[instruction_index + 6];
+    let odd_put_bytes = instruction_bytes[instruction_index + 7];
+    let skip_even_bytes = instruction_bytes[instruction_index + 8];
+    let even_get_bytes = instruction_bytes[instruction_index + 9];
+    let even_index_get_bytes = instruction_bytes[instruction_index + 10];
+    let even_mod_bytes = instruction_bytes[instruction_index + 11];
+    let even_add_bytes = instruction_bytes[instruction_index + 12];
+    let even_put_bytes = instruction_bytes[instruction_index + 13];
+    let update_get_bytes = instruction_bytes[instruction_index + 14];
+    let update_add_bytes = instruction_bytes[instruction_index + 15];
+    let update_put_bytes = instruction_bytes[instruction_index + 16];
+    let condition_get_bytes = instruction_bytes[instruction_index + 17];
+    let condition_jump_bytes = instruction_bytes[condition_jump_instruction_index];
+    let parity_delta_width = scalar_jump_delta_width(parity_jump_instruction.opcode);
+    let skip_delta_width = scalar_jump_delta_width(skip_even_instruction.opcode);
+    let condition_delta_width = scalar_jump_delta_width(condition_jump_instruction.opcode);
+    if read_scalar_jump_target(
+        parity_jump_instruction,
+        parity_jump_bytes,
+        1,
+        parity_delta_width,
+    ) != even_get_instruction.offset
+        || read_scalar_jump_target(skip_even_instruction, skip_even_bytes, 1, skip_delta_width)
+            != update_get_instruction.offset
+        || read_scalar_jump_target(
+            condition_jump_instruction,
+            condition_jump_bytes,
+            1,
+            condition_delta_width,
+        ) != first_index_get_instruction.offset
+    {
+        return Ok(None);
+    }
+
+    let global_base_register = read_unsigned_operand(first_index_get_bytes, 2, 1);
+    if read_unsigned_operand(odd_get_bytes, 2, 1) != global_base_register
+        || read_unsigned_operand(odd_index_get_bytes, 2, 1) != global_base_register
+        || read_unsigned_operand(odd_put_bytes, 1, 1) != global_base_register
+        || read_unsigned_operand(even_get_bytes, 2, 1) != global_base_register
+        || read_unsigned_operand(even_index_get_bytes, 2, 1) != global_base_register
+        || read_unsigned_operand(even_put_bytes, 1, 1) != global_base_register
+        || read_unsigned_operand(update_get_bytes, 2, 1) != global_base_register
+        || read_unsigned_operand(update_put_bytes, 1, 1) != global_base_register
+        || read_unsigned_operand(condition_get_bytes, 2, 1) != global_base_register
+        || !matches!(
+            registers.get(global_base_register as usize),
+            Some(ScalarValue::Object(ScalarObjectHandle::Global))
+        )
+    {
+        return Ok(None);
+    }
+
+    let first_index_register = read_unsigned_operand(first_index_get_bytes, 1, 1);
+    let parity_register = read_unsigned_operand(parity_mod_bytes, 1, 1);
+    let parity_source_register = read_unsigned_operand(parity_mod_bytes, 2, 1);
+    let parity_divisor_register = read_unsigned_operand(parity_mod_bytes, 3, 1);
+    let parity_jump_left_register =
+        read_unsigned_operand(parity_jump_bytes, 1 + parity_delta_width, 1);
+    let parity_jump_right_register =
+        read_unsigned_operand(parity_jump_bytes, 2 + parity_delta_width, 1);
+    let odd_register = read_unsigned_operand(odd_get_bytes, 1, 1);
+    let odd_index_register = read_unsigned_operand(odd_index_get_bytes, 1, 1);
+    let odd_mod_register = read_unsigned_operand(odd_mod_bytes, 1, 1);
+    let odd_mod_source_register = read_unsigned_operand(odd_mod_bytes, 2, 1);
+    let odd_divisor_register = read_unsigned_operand(odd_mod_bytes, 3, 1);
+    let odd_add_destination = read_unsigned_operand(odd_add_bytes, 1, 1);
+    let odd_add_left_register = read_unsigned_operand(odd_add_bytes, 2, 1);
+    let odd_add_right_register = read_unsigned_operand(odd_add_bytes, 3, 1);
+    let odd_put_value_register = read_unsigned_operand(odd_put_bytes, 2, 1);
+    let even_register = read_unsigned_operand(even_get_bytes, 1, 1);
+    let even_index_register = read_unsigned_operand(even_index_get_bytes, 1, 1);
+    let even_mod_register = read_unsigned_operand(even_mod_bytes, 1, 1);
+    let even_mod_source_register = read_unsigned_operand(even_mod_bytes, 2, 1);
+    let even_divisor_register = read_unsigned_operand(even_mod_bytes, 3, 1);
+    let even_add_destination = read_unsigned_operand(even_add_bytes, 1, 1);
+    let even_add_left_register = read_unsigned_operand(even_add_bytes, 2, 1);
+    let even_add_right_register = read_unsigned_operand(even_add_bytes, 3, 1);
+    let even_put_value_register = read_unsigned_operand(even_put_bytes, 2, 1);
+    let update_register = read_unsigned_operand(update_get_bytes, 1, 1);
+    let update_add_destination = read_unsigned_operand(update_add_bytes, 1, 1);
+    let update_add_left_register = read_unsigned_operand(update_add_bytes, 2, 1);
+    let update_add_right_register = read_unsigned_operand(update_add_bytes, 3, 1);
+    let update_put_value_register = read_unsigned_operand(update_put_bytes, 2, 1);
+    let condition_index_register = read_unsigned_operand(condition_get_bytes, 1, 1);
+    let condition_left_register =
+        read_unsigned_operand(condition_jump_bytes, 1 + condition_delta_width, 1);
+    let limit_register = read_unsigned_operand(condition_jump_bytes, 2 + condition_delta_width, 1);
+    if parity_source_register != first_index_register
+        || parity_jump_left_register != parity_register
+        || odd_mod_source_register != odd_index_register
+        || odd_add_destination != odd_register
+        || !((odd_add_left_register == odd_register && odd_add_right_register == odd_mod_register)
+            || (odd_add_left_register == odd_mod_register
+                && odd_add_right_register == odd_register))
+        || odd_put_value_register != odd_register
+        || even_mod_source_register != even_index_register
+        || even_add_destination != even_register
+        || !((even_add_left_register == even_register
+            && even_add_right_register == even_mod_register)
+            || (even_add_left_register == even_mod_register
+                && even_add_right_register == even_register))
+        || even_put_value_register != even_register
+        || update_add_destination != update_register
+        || update_put_value_register != update_register
+        || !((update_add_left_register == update_register)
+            || (update_add_right_register == update_register))
+        || condition_left_register != condition_index_register
+    {
+        return Ok(None);
+    }
+    let increment_register = if update_add_left_register == update_register {
+        update_add_right_register
+    } else {
+        update_add_left_register
+    };
+
+    for register in [
+        first_index_register,
+        parity_register,
+        parity_divisor_register,
+        parity_jump_right_register,
+        odd_register,
+        odd_index_register,
+        odd_mod_register,
+        odd_divisor_register,
+        even_register,
+        even_index_register,
+        even_mod_register,
+        even_divisor_register,
+        update_register,
+        increment_register,
+        condition_index_register,
+        limit_register,
+    ] {
+        if registers.get(register as usize).is_none() {
+            return Ok(None);
+        }
+    }
+
+    let index_string_id = read_unsigned_operand(first_index_get_bytes, 4, 1);
+    let odd_string_id = read_unsigned_operand(odd_get_bytes, 4, 1);
+    let odd_index_string_id = read_unsigned_operand(odd_index_get_bytes, 4, 1);
+    let odd_put_string_id = read_unsigned_operand(odd_put_bytes, 4, 2);
+    let even_string_id = read_unsigned_operand(even_get_bytes, 4, 1);
+    let even_index_string_id = read_unsigned_operand(even_index_get_bytes, 4, 1);
+    let even_put_string_id = read_unsigned_operand(even_put_bytes, 4, 2);
+    let update_string_id = read_unsigned_operand(update_get_bytes, 4, 1);
+    let update_put_string_id = read_unsigned_operand(update_put_bytes, 4, 2);
+    let condition_index_string_id = read_unsigned_operand(condition_get_bytes, 4, 1);
+    let index_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        first_index_get_instruction,
+        index_string_id,
+    )?;
+    let odd_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        odd_get_instruction,
+        odd_string_id,
+    )?;
+    let odd_index_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        odd_index_get_instruction,
+        odd_index_string_id,
+    )?;
+    let odd_put_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        odd_put_instruction,
+        odd_put_string_id,
+    )?;
+    let even_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        even_get_instruction,
+        even_string_id,
+    )?;
+    let even_index_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        even_index_get_instruction,
+        even_index_string_id,
+    )?;
+    let even_put_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        even_put_instruction,
+        even_put_string_id,
+    )?;
+    let update_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        update_get_instruction,
+        update_string_id,
+    )?;
+    let update_put_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        update_put_instruction,
+        update_put_string_id,
+    )?;
+    let condition_index_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        condition_get_instruction,
+        condition_index_string_id,
+    )?;
+    if !scalar_property_name_matches(index_property_name, odd_index_property_name)
+        || !scalar_property_name_matches(index_property_name, even_index_property_name)
+        || !scalar_property_name_matches(index_property_name, update_property_name)
+        || !scalar_property_name_matches(index_property_name, update_put_property_name)
+        || !scalar_property_name_matches(index_property_name, condition_index_property_name)
+        || !scalar_property_name_matches(odd_property_name, odd_put_property_name)
+        || !scalar_property_name_matches(even_property_name, even_put_property_name)
+    {
+        return Ok(None);
+    }
+
+    let ScalarValue::Number(start_index) =
+        read_cached_scalar_global_property(state, index_string_id, index_property_name)
+    else {
+        return Ok(None);
+    };
+    let ScalarValue::Number(mut odd) =
+        read_cached_scalar_global_property(state, odd_string_id, odd_property_name)
+    else {
+        return Ok(None);
+    };
+    let ScalarValue::Number(mut even) =
+        read_cached_scalar_global_property(state, even_string_id, even_property_name)
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(parity_divisor)) =
+        registers.get(parity_divisor_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(zero_value)) =
+        registers.get(parity_jump_right_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(odd_divisor)) =
+        registers.get(odd_divisor_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(even_divisor)) =
+        registers.get(even_divisor_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(increment)) = registers.get(increment_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(limit)) = registers.get(limit_register as usize).copied() else {
+        return Ok(None);
+    };
+    if !start_index.is_finite()
+        || start_index < 0.0
+        || start_index.fract() != 0.0
+        || !odd.is_finite()
+        || !even.is_finite()
+        || parity_divisor != 2.0
+        || zero_value != 0.0
+        || !odd_divisor.is_finite()
+        || odd_divisor <= 0.0
+        || odd_divisor.fract() != 0.0
+        || odd_divisor > f64::from(u32::MAX)
+        || !even_divisor.is_finite()
+        || even_divisor <= 0.0
+        || even_divisor.fract() != 0.0
+        || even_divisor > f64::from(u32::MAX)
+        || increment != 1.0
+        || !limit.is_finite()
+        || limit < 0.0
+        || limit.fract() != 0.0
+        || limit > f64::from(u32::MAX)
+        || !scalar_relational_jump_matches(condition_jump_instruction.opcode, start_index, limit)
+    {
+        return Ok(None);
+    }
+
+    let odd_divisor = odd_divisor as u32;
+    let even_divisor = even_divisor as u32;
+    let mut index = start_index as u32;
+    let limit = limit as u32;
+    while index < limit {
+        if index % 2 == 0 {
+            even += f64::from(index % even_divisor);
+        } else {
+            odd += f64::from(index % odd_divisor);
+        }
+        index = index.saturating_add(1);
+    }
+
+    let limit_value = ScalarValue::Number(f64::from(limit));
+    write_cached_scalar_global_property(
+        state,
+        even_put_string_id,
+        even_put_property_name,
+        ScalarValue::Number(even),
+    );
+    write_cached_scalar_global_property(
+        state,
+        odd_put_string_id,
+        odd_put_property_name,
+        ScalarValue::Number(odd),
+    );
+    write_cached_scalar_global_property(
+        state,
+        update_put_string_id,
+        update_put_property_name,
+        limit_value,
+    );
+    registers[first_index_register as usize] = limit_value;
+    registers[condition_index_register as usize] = limit_value;
+    registers[update_register as usize] = limit_value;
+    registers[odd_register as usize] = ScalarValue::Number(odd);
+    registers[even_register as usize] = ScalarValue::Number(even);
+    Ok(Some(condition_jump_instruction_index + 1))
 }
 
 fn try_execute_scalar_uint8_global_index_mod_put_inc_loop_candidate<'a>(

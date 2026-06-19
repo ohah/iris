@@ -3067,7 +3067,7 @@ enum ScalarJsonSnapshot<'a> {
     Null,
     Boolean(bool),
     Number(f64),
-    String(String),
+    String(Cow<'a, str>),
     Array(Vec<ScalarJsonSnapshot<'a>>),
     Object(Vec<(&'a str, ScalarJsonSnapshot<'a>)>),
 }
@@ -3087,7 +3087,7 @@ impl serde::Serialize for ScalarJsonSnapshot<'_> {
                     serializer.serialize_f64(*value)
                 }
             }
-            ScalarJsonSnapshot::String(value) => serializer.serialize_str(value),
+            ScalarJsonSnapshot::String(value) => serializer.serialize_str(value.as_ref()),
             ScalarJsonSnapshot::Array(values) => {
                 let mut sequence = serializer.serialize_seq(Some(values.len()))?;
                 for value in values {
@@ -13335,10 +13335,16 @@ fn scalar_value_to_json_snapshot<'a>(
         ScalarValue::Number(value) => value
             .is_finite()
             .then_some(ScalarJsonSnapshot::Number(value)),
-        ScalarValue::String(_) | ScalarValue::DynamicString(_) => {
-            scalar_value_string_text(bytecode, state, value)
-                .map(|value| ScalarJsonSnapshot::String(value.into_owned()))
+        ScalarValue::String(handle) => {
+            let bytes = scalar_string_bytes(bytecode, handle)?;
+            std::str::from_utf8(bytes)
+                .ok()
+                .map(|value| ScalarJsonSnapshot::String(Cow::Borrowed(value)))
         }
+        ScalarValue::DynamicString(handle) => state
+            .dynamic_strings
+            .get(usize::try_from(handle.dynamic_id).expect("dynamic string id fits in usize"))
+            .map(|value| ScalarJsonSnapshot::String(Cow::Owned(value.clone()))),
         ScalarValue::Symbol(_) | ScalarValue::Environment(_) => {
             in_array.then_some(ScalarJsonSnapshot::Null)
         }
@@ -13441,8 +13447,8 @@ fn scalar_value_from_json_snapshot<'a>(
         ScalarJsonSnapshot::Null => ScalarValue::Null,
         ScalarJsonSnapshot::Boolean(value) => ScalarValue::Boolean(*value),
         ScalarJsonSnapshot::Number(value) => ScalarValue::Number(*value),
-        ScalarJsonSnapshot::String(value) => scalar_string_value_for_name(bytecode, value)
-            .unwrap_or_else(|| allocate_scalar_dynamic_string(state, value.clone())),
+        ScalarJsonSnapshot::String(value) => scalar_string_value_for_name(bytecode, value.as_ref())
+            .unwrap_or_else(|| allocate_scalar_dynamic_string(state, value.to_string())),
         ScalarJsonSnapshot::Array(values) => {
             let values = values
                 .iter()

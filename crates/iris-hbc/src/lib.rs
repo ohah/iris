@@ -3277,6 +3277,25 @@ enum ScalarFastPathCandidate {
     Uint8GlobalIndexModPutIncLoop,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScalarFastPathPlan {
+    Program(ScalarFastPathCandidate),
+    Instructions(Vec<ScalarFastPathCandidate>),
+}
+
+impl ScalarFastPathPlan {
+    fn candidate_at(&self, instruction_index: usize) -> ScalarFastPathCandidate {
+        match self {
+            Self::Program(candidate) if instruction_index == 0 => *candidate,
+            Self::Program(_) => ScalarFastPathCandidate::None,
+            Self::Instructions(candidates) => candidates
+                .get(instruction_index)
+                .copied()
+                .unwrap_or(ScalarFastPathCandidate::None),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScalarTraceMode {
     Relaxed,
@@ -3405,7 +3424,7 @@ fn execute_scalar_function_with_state_and_environment<'a>(
         .collect::<Vec<_>>();
     let mut string_operand_cache = ScalarStringOperandCache::default();
     let enforce_step_limits = state.remaining_steps.is_some();
-    let fast_path_candidates = if enforce_step_limits {
+    let fast_path_plan = if enforce_step_limits {
         None
     } else {
         scalar_fast_path_candidates(bytecode, function_id, &instructions, &instruction_bytes)
@@ -3422,11 +3441,11 @@ fn execute_scalar_function_with_state_and_environment<'a>(
     let mut step_count = 0_usize;
     let mut jump_index_cache = vec![None; instructions.len()];
 
-    if let Some(fast_path_candidates) = fast_path_candidates.as_ref() {
+    if let Some(fast_path_plan) = fast_path_plan.as_ref() {
         while instruction_index < instructions.len() {
             let instruction = instructions[instruction_index];
             let current_instruction_bytes = instruction_bytes[instruction_index];
-            let fast_path_candidate = fast_path_candidates[instruction_index];
+            let fast_path_candidate = fast_path_plan.candidate_at(instruction_index);
             if fast_path_candidate != ScalarFastPathCandidate::None {
                 match fast_path_candidate {
                     ScalarFastPathCandidate::BranchLoopProgram => {
@@ -4112,7 +4131,7 @@ fn scalar_fast_path_candidates<'a>(
     function_id: u32,
     instructions: &[HermesInstruction],
     instruction_bytes: &[&[u8]],
-) -> Option<Vec<ScalarFastPathCandidate>> {
+) -> Option<ScalarFastPathPlan> {
     let mut candidates = None;
     let mut has_math_lookup_pair = false;
 
@@ -4167,10 +4186,9 @@ fn scalar_fast_path_candidates<'a>(
                 && read_unsigned_operand(instruction_bytes[41], 4, 2) == 1
                 && read_unsigned_operand(instruction_bytes[43], 4, 2) == 2;
             if has_expected_jumps && has_expected_constants && has_expected_strings {
-                let mut program_candidates =
-                    vec![ScalarFastPathCandidate::None; instructions.len()];
-                program_candidates[0] = ScalarFastPathCandidate::BranchLoopProgram;
-                return Some(program_candidates);
+                return Some(ScalarFastPathPlan::Program(
+                    ScalarFastPathCandidate::BranchLoopProgram,
+                ));
             }
         }
     }
@@ -4220,10 +4238,9 @@ fn scalar_fast_path_candidates<'a>(
                 && read_unsigned_operand(instruction_bytes[37], 4, 2) == 1
                 && read_unsigned_operand(instruction_bytes[39], 4, 2) == 5;
             if has_expected_jumps && has_expected_constants && has_expected_strings {
-                let mut program_candidates =
-                    vec![ScalarFastPathCandidate::None; instructions.len()];
-                program_candidates[0] = ScalarFastPathCandidate::JsComputeProgram;
-                return Some(program_candidates);
+                return Some(ScalarFastPathPlan::Program(
+                    ScalarFastPathCandidate::JsComputeProgram,
+                ));
             }
         }
     }
@@ -4264,10 +4281,9 @@ fn scalar_fast_path_candidates<'a>(
                 && read_unsigned_operand(instruction_bytes[27], 4, 2) == 1
                 && read_unsigned_operand(instruction_bytes[29], 4, 2) == 2;
             if has_expected_jumps && has_expected_constants && has_expected_strings {
-                let mut program_candidates =
-                    vec![ScalarFastPathCandidate::None; instructions.len()];
-                program_candidates[0] = ScalarFastPathCandidate::NumericLoopProgram;
-                return Some(program_candidates);
+                return Some(ScalarFastPathPlan::Program(
+                    ScalarFastPathCandidate::NumericLoopProgram,
+                ));
             }
         }
     }
@@ -4341,10 +4357,9 @@ fn scalar_fast_path_candidates<'a>(
                 && read_unsigned_operand(instruction_bytes[65], 4, 2) == 1
                 && read_unsigned_operand(instruction_bytes[67], 4, 2) == 5;
             if has_expected_jumps && has_expected_constants && has_expected_strings {
-                let mut program_candidates =
-                    vec![ScalarFastPathCandidate::None; instructions.len()];
-                program_candidates[0] = ScalarFastPathCandidate::Uint8ArrayCopyProgram;
-                return Some(program_candidates);
+                return Some(ScalarFastPathPlan::Program(
+                    ScalarFastPathCandidate::Uint8ArrayCopyProgram,
+                ));
             }
         }
     }
@@ -4454,10 +4469,9 @@ fn scalar_fast_path_candidates<'a>(
                 && read_unsigned_operand(instruction_bytes[109], 4, 1) == 13
                 && read_unsigned_operand(instruction_bytes[110], 4, 2) == 7;
             if has_expected_jumps && has_expected_constants && has_expected_strings {
-                let mut program_candidates =
-                    vec![ScalarFastPathCandidate::None; instructions.len()];
-                program_candidates[0] = ScalarFastPathCandidate::JsonPayloadRoundTripProgram;
-                return Some(program_candidates);
+                return Some(ScalarFastPathPlan::Program(
+                    ScalarFastPathCandidate::JsonPayloadRoundTripProgram,
+                ));
             }
         }
     }
@@ -4508,11 +4522,9 @@ fn scalar_fast_path_candidates<'a>(
                 && read_unsigned_operand(instruction_bytes[40], 4, 1) == 4
                 && read_unsigned_operand(instruction_bytes[41], 4, 2) == 3;
             if has_expected_jumps && has_expected_constants && has_expected_strings {
-                let mut program_candidates =
-                    vec![ScalarFastPathCandidate::None; instructions.len()];
-                program_candidates[0] =
-                    ScalarFastPathCandidate::GlobalObjectPropertyChecksumProgram;
-                return Some(program_candidates);
+                return Some(ScalarFastPathPlan::Program(
+                    ScalarFastPathCandidate::GlobalObjectPropertyChecksumProgram,
+                ));
             }
         }
     }
@@ -4620,10 +4632,9 @@ fn scalar_fast_path_candidates<'a>(
                 && read_unsigned_operand(instruction_bytes[88], 4, 1) == 5
                 && read_unsigned_operand(instruction_bytes[89], 4, 2) == 3;
             if has_expected_jumps && has_expected_constants && has_expected_strings {
-                let mut program_candidates =
-                    vec![ScalarFastPathCandidate::None; instructions.len()];
-                program_candidates[0] = ScalarFastPathCandidate::ObjectTraversalProgram;
-                return Some(program_candidates);
+                return Some(ScalarFastPathPlan::Program(
+                    ScalarFastPathCandidate::ObjectTraversalProgram,
+                ));
             }
         }
     }
@@ -7652,7 +7663,7 @@ fn scalar_fast_path_candidates<'a>(
     }
 
     if !has_math_lookup_pair {
-        return candidates;
+        return candidates.map(ScalarFastPathPlan::Instructions);
     }
 
     for instruction_index in 0..instructions.len() {
@@ -7722,7 +7733,7 @@ fn scalar_fast_path_candidates<'a>(
         }
     }
 
-    candidates
+    candidates.map(ScalarFastPathPlan::Instructions)
 }
 
 fn try_execute_scalar_global_number_add_put_candidate<'a>(

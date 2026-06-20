@@ -3055,6 +3055,8 @@ struct ScalarExecutorState<'a> {
     object_properties: Vec<(ScalarObjectHandle, &'a str, ScalarValue)>,
     object_slot_names: Vec<(ScalarObjectHandle, u32, &'a str)>,
     object_slots: Vec<(ScalarObjectHandle, u32, ScalarValue)>,
+    json_payload_layouts: Vec<ScalarJsonPayloadLayout<'a>>,
+    json_payload_materialized_objects: Vec<ScalarObjectHandle>,
     object_traversal_layouts: Vec<ScalarObjectTraversalLayout<'a>>,
     object_traversal_materialized_objects: Vec<ScalarObjectHandle>,
     pending_constructor_this_values: Vec<(ScalarFunctionHandle, ScalarValue)>,
@@ -3089,6 +3091,24 @@ struct ScalarObjectTraversalLayout<'a> {
     id_property_name: &'a str,
     lane_property_name: &'a str,
     nested_property_name: &'a str,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScalarJsonPayloadLayout<'a> {
+    first_object_id: u32,
+    start_index: u32,
+    length: u32,
+    lane_divisor: u32,
+    active_divisor: u32,
+    label_value: ScalarValue,
+    name_value: ScalarValue,
+    lane_property_name: &'a str,
+    label_property_name: &'a str,
+    active_property_name: &'a str,
+    id_property_name: &'a str,
+    meta_property_name: &'a str,
+    name_property_name: &'a str,
+    points_property_name: &'a str,
 }
 
 impl serde::Serialize for ScalarJsonSnapshot<'_> {
@@ -13036,9 +13056,6 @@ fn try_execute_scalar_json_payload_build_loop_candidate<'a>(
     if iteration_count > 5_000_000 {
         return Ok(None);
     }
-    let Some(property_count) = iteration_count.checked_mul(7) else {
-        return Ok(None);
-    };
     let Some(object_count) = iteration_count.checked_mul(3) else {
         return Ok(None);
     };
@@ -13051,7 +13068,22 @@ fn try_execute_scalar_json_payload_build_loop_candidate<'a>(
     let first_object_id = state.next_object_id;
     state.next_object_id = next_object_id;
     state.object_property_indices_incomplete = true;
-    state.object_properties.reserve(property_count);
+    state.json_payload_layouts.push(ScalarJsonPayloadLayout {
+        first_object_id,
+        start_index,
+        length: limit - start_index,
+        lane_divisor,
+        active_divisor,
+        label_value,
+        name_value,
+        lane_property_name: "lane",
+        label_property_name: "label",
+        active_property_name: "active",
+        id_property_name: "id",
+        meta_property_name: "meta",
+        name_property_name: "name",
+        points_property_name: "points",
+    });
     let last_storage_index = usize::try_from(next_object_id - 1).expect("object id fits in usize");
     if state.array_lengths.len() <= last_storage_index {
         state
@@ -13072,7 +13104,6 @@ fn try_execute_scalar_json_payload_build_loop_candidate<'a>(
     let mut payload_values = Vec::with_capacity(iteration_count);
     let mut fused_checksum = 0.0;
     let should_fuse_checksum = program_suffix.is_some();
-    let object_properties = &mut state.object_properties;
     for index in start_index..limit {
         let index_value = f64::from(index);
         let point_one_value = f64::from(index * points_one_multiplier);
@@ -13087,11 +13118,6 @@ fn try_execute_scalar_json_payload_build_loop_candidate<'a>(
         let object_offset = row_offset
             .checked_mul(3)
             .expect("object offset fits in u32");
-        let meta = ScalarObjectHandle::Object(
-            first_object_id
-                .checked_add(object_offset)
-                .expect("reserved meta object id fits in u32"),
-        );
         let points = ScalarObjectHandle::Array(
             first_object_id
                 .checked_add(object_offset + 1)
@@ -13102,12 +13128,6 @@ fn try_execute_scalar_json_payload_build_loop_candidate<'a>(
                 .checked_add(object_offset + 2)
                 .expect("reserved row object id fits in u32"),
         );
-        object_properties.push((
-            meta,
-            "lane",
-            ScalarValue::Number(f64::from(index % lane_divisor)),
-        ));
-        object_properties.push((meta, "label", label_value));
 
         let points_storage_index = usize::try_from(match points {
             ScalarObjectHandle::Array(points_id) => points_id,
@@ -13121,15 +13141,6 @@ fn try_execute_scalar_json_payload_build_loop_candidate<'a>(
             ScalarValue::Number(point_two_value),
         ]);
 
-        object_properties.push((
-            row,
-            "active",
-            ScalarValue::Boolean(index % active_divisor == 0),
-        ));
-        object_properties.push((row, "id", ScalarValue::Number(index_value)));
-        object_properties.push((row, "meta", ScalarValue::Object(meta)));
-        object_properties.push((row, "name", name_value));
-        object_properties.push((row, "points", ScalarValue::Object(points)));
         payload_values.push(ScalarValue::Object(row));
     }
     let last_row_offset = (limit - start_index - 1)
@@ -21953,6 +21964,7 @@ fn delete_scalar_property(
         }
         ScalarValue::Object(handle) => {
             materialize_scalar_object_traversal_object(state, handle);
+            materialize_scalar_json_payload_object(state, handle);
             state
                 .object_properties
                 .retain(|(object, name, _)| *object != handle || *name != property_name);
@@ -22276,6 +22288,7 @@ fn write_scalar_named_object_property_index<'a>(
     value: ScalarValue,
 ) -> usize {
     materialize_scalar_object_traversal_object(state, object);
+    materialize_scalar_json_payload_object(state, object);
     if !state.object_getters.is_empty() {
         state.object_getters.retain(|(stored_object, name, _)| {
             !(*stored_object == object && *name == property_name)
@@ -22378,6 +22391,7 @@ fn write_scalar_named_object_getter_property<'a>(
     getter: ScalarValue,
 ) {
     materialize_scalar_object_traversal_object(state, object);
+    materialize_scalar_json_payload_object(state, object);
     state
         .object_properties
         .retain(|(stored_object, name, _)| !(*stored_object == object && *name == property_name));
@@ -22515,6 +22529,158 @@ fn scalar_object_traversal_property_names<'a>(
         layout.lane_property_name,
         layout.nested_property_name,
     ])
+}
+
+fn scalar_json_payload_layout_entry<'state, 'a>(
+    state: &'state ScalarExecutorState<'a>,
+    object: ScalarObjectHandle,
+) -> Option<(&'state ScalarJsonPayloadLayout<'a>, u32, bool)> {
+    if state.json_payload_materialized_objects.contains(&object) {
+        return None;
+    }
+    let ScalarObjectHandle::Object(object_id) = object else {
+        return None;
+    };
+
+    for layout in state.json_payload_layouts.iter().rev() {
+        let Some(object_count) = layout.length.checked_mul(3) else {
+            continue;
+        };
+        let Some(end_object_id) = layout.first_object_id.checked_add(object_count) else {
+            continue;
+        };
+        if object_id < layout.first_object_id || object_id >= end_object_id {
+            continue;
+        }
+        let offset = object_id - layout.first_object_id;
+        match offset % 3 {
+            0 => return Some((layout, offset / 3, true)),
+            2 => return Some((layout, offset / 3, false)),
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn read_scalar_json_payload_property(
+    state: &ScalarExecutorState<'_>,
+    object: ScalarObjectHandle,
+    property_name: &str,
+) -> Option<ScalarValue> {
+    let (layout, row_offset, is_meta) = scalar_json_payload_layout_entry(state, object)?;
+    let index = layout.start_index.checked_add(row_offset)?;
+    if is_meta {
+        if scalar_property_name_matches(layout.lane_property_name, property_name) {
+            return Some(ScalarValue::Number(f64::from(index % layout.lane_divisor)));
+        }
+        if scalar_property_name_matches(layout.label_property_name, property_name) {
+            return Some(layout.label_value);
+        }
+        return None;
+    }
+
+    if scalar_property_name_matches(layout.active_property_name, property_name) {
+        return Some(ScalarValue::Boolean(index % layout.active_divisor == 0));
+    }
+    if scalar_property_name_matches(layout.id_property_name, property_name) {
+        return Some(ScalarValue::Number(f64::from(index)));
+    }
+    let object_offset = row_offset.checked_mul(3)?;
+    if scalar_property_name_matches(layout.meta_property_name, property_name) {
+        let meta_id = layout.first_object_id.checked_add(object_offset)?;
+        return Some(ScalarValue::Object(ScalarObjectHandle::Object(meta_id)));
+    }
+    if scalar_property_name_matches(layout.name_property_name, property_name) {
+        return Some(layout.name_value);
+    }
+    if scalar_property_name_matches(layout.points_property_name, property_name) {
+        let points_id = layout.first_object_id.checked_add(object_offset + 1)?;
+        return Some(ScalarValue::Object(ScalarObjectHandle::Array(points_id)));
+    }
+    None
+}
+
+fn scalar_json_payload_property_names<'a>(
+    state: &ScalarExecutorState<'a>,
+    object: ScalarObjectHandle,
+) -> Option<Vec<&'a str>> {
+    let (layout, _, is_meta) = scalar_json_payload_layout_entry(state, object)?;
+    if is_meta {
+        return Some(vec![layout.lane_property_name, layout.label_property_name]);
+    }
+    Some(vec![
+        layout.active_property_name,
+        layout.id_property_name,
+        layout.meta_property_name,
+        layout.name_property_name,
+        layout.points_property_name,
+    ])
+}
+
+fn materialize_scalar_json_payload_object<'a>(
+    state: &mut ScalarExecutorState<'a>,
+    object: ScalarObjectHandle,
+) {
+    if state.json_payload_materialized_objects.contains(&object) {
+        return;
+    }
+
+    let Some((layout, row_offset, is_meta)) = scalar_json_payload_layout_entry(state, object)
+    else {
+        return;
+    };
+    let index = layout
+        .start_index
+        .checked_add(row_offset)
+        .expect("JSON payload row index fits in u32");
+    let entries = if is_meta {
+        vec![
+            (
+                layout.lane_property_name,
+                ScalarValue::Number(f64::from(index % layout.lane_divisor)),
+            ),
+            (layout.label_property_name, layout.label_value),
+        ]
+    } else {
+        let object_offset = row_offset
+            .checked_mul(3)
+            .expect("JSON payload object offset fits in u32");
+        let meta_id = layout
+            .first_object_id
+            .checked_add(object_offset)
+            .expect("JSON payload meta id fits in u32");
+        let points_id = layout
+            .first_object_id
+            .checked_add(object_offset + 1)
+            .expect("JSON payload points id fits in u32");
+        vec![
+            (
+                layout.active_property_name,
+                ScalarValue::Boolean(index % layout.active_divisor == 0),
+            ),
+            (
+                layout.id_property_name,
+                ScalarValue::Number(f64::from(index)),
+            ),
+            (
+                layout.meta_property_name,
+                ScalarValue::Object(ScalarObjectHandle::Object(meta_id)),
+            ),
+            (layout.name_property_name, layout.name_value),
+            (
+                layout.points_property_name,
+                ScalarValue::Object(ScalarObjectHandle::Array(points_id)),
+            ),
+        ]
+    };
+
+    state.json_payload_materialized_objects.push(object);
+    state.object_property_indices_incomplete = true;
+    clear_scalar_object_property_operand_cache(state);
+    for (property_name, value) in entries {
+        state.object_properties.push((object, property_name, value));
+    }
 }
 
 fn materialize_scalar_object_traversal_object<'a>(
@@ -22700,6 +22866,9 @@ fn scalar_linear_object_property_names<'a>(
 ) -> Vec<&'a str> {
     let mut names: Vec<&'a str> = Vec::new();
     if let Some(compact_names) = scalar_object_traversal_property_names(state, object) {
+        names.extend(compact_names);
+    }
+    if let Some(compact_names) = scalar_json_payload_property_names(state, object) {
         names.extend(compact_names);
     }
     for (stored_object, name, _) in &state.object_properties {
@@ -23026,6 +23195,7 @@ fn read_scalar_own_object_property(
         .map(|(_, slot, _)| *slot);
     slot.and_then(|slot| read_scalar_object_slot_value(state, handle, slot))
         .or_else(|| read_scalar_object_traversal_property(state, handle, property_name))
+        .or_else(|| read_scalar_json_payload_property(state, handle, property_name))
 }
 
 fn read_scalar_rn_object_stub_property(property_name: &str) -> Option<ScalarValue> {
@@ -23059,6 +23229,7 @@ fn scalar_object_has_own_named_property(
 ) -> bool {
     scalar_own_object_property_index(state, handle, property_name).is_some()
         || read_scalar_object_traversal_property(state, handle, property_name).is_some()
+        || read_scalar_json_payload_property(state, handle, property_name).is_some()
 }
 
 fn read_scalar_function_property(
@@ -27920,6 +28091,121 @@ mod tests {
         assert_eq!(
             read_scalar_own_object_property(&state, first_nested, "score"),
             Some(ScalarValue::Number(0.0)),
+        );
+    }
+
+    #[test]
+    fn scalar_json_payload_layout_reads_and_materializes_properties() {
+        let mut state = ScalarExecutorState::default();
+        let label_value = ScalarValue::String(ScalarStringHandle {
+            string_id: 1,
+            is_empty: false,
+        });
+        let name_value = ScalarValue::String(ScalarStringHandle {
+            string_id: 2,
+            is_empty: false,
+        });
+        state.json_payload_layouts.push(ScalarJsonPayloadLayout {
+            first_object_id: 20,
+            start_index: 5,
+            length: 2,
+            lane_divisor: 7,
+            active_divisor: 3,
+            label_value,
+            name_value,
+            lane_property_name: "lane",
+            label_property_name: "label",
+            active_property_name: "active",
+            id_property_name: "id",
+            meta_property_name: "meta",
+            name_property_name: "name",
+            points_property_name: "points",
+        });
+        state.array_lengths.resize_with(25, || None);
+        state.array_inline3_storage.resize_with(25, || None);
+        state.array_lengths[24] = Some(3);
+        state.array_inline3_storage[24] = Some([
+            ScalarValue::Number(6.0),
+            ScalarValue::Number(12.0),
+            ScalarValue::Number(18.0),
+        ]);
+
+        let second_meta = ScalarObjectHandle::Object(23);
+        let second_points = ScalarObjectHandle::Array(24);
+        let second_row = ScalarObjectHandle::Object(25);
+
+        assert_eq!(
+            read_scalar_own_object_property(&state, second_row, "active"),
+            Some(ScalarValue::Boolean(true)),
+        );
+        assert_eq!(
+            read_scalar_own_object_property(&state, second_row, "id"),
+            Some(ScalarValue::Number(6.0)),
+        );
+        assert_eq!(
+            read_scalar_own_object_property(&state, second_row, "meta"),
+            Some(ScalarValue::Object(second_meta)),
+        );
+        assert_eq!(
+            read_scalar_own_object_property(&state, second_row, "name"),
+            Some(name_value),
+        );
+        assert_eq!(
+            read_scalar_own_object_property(&state, second_row, "points"),
+            Some(ScalarValue::Object(second_points)),
+        );
+        assert_eq!(
+            read_scalar_own_object_property(&state, second_meta, "lane"),
+            Some(ScalarValue::Number(6.0)),
+        );
+        assert_eq!(
+            read_scalar_own_object_property(&state, second_meta, "label"),
+            Some(label_value),
+        );
+        assert_eq!(
+            read_scalar_array_element(&state, second_points, 2),
+            ScalarValue::Number(18.0),
+        );
+        assert_eq!(
+            scalar_linear_object_property_names(&state, second_row),
+            vec!["active", "id", "meta", "name", "points"],
+        );
+
+        write_scalar_named_object_property(
+            &mut state,
+            second_row,
+            "active",
+            ScalarValue::Boolean(false),
+        );
+        assert_eq!(
+            read_scalar_own_object_property(&state, second_row, "active"),
+            Some(ScalarValue::Boolean(false)),
+        );
+        assert_eq!(
+            read_scalar_own_object_property(&state, second_row, "id"),
+            Some(ScalarValue::Number(6.0)),
+        );
+
+        delete_scalar_property(
+            &mut state,
+            1,
+            HermesInstruction {
+                offset: 123,
+                opcode: DEL_BY_VAL_OPCODE,
+                width: 5,
+            },
+            0,
+            ScalarValue::Object(second_row),
+            ScalarPropertyKey::Name("id"),
+        )
+        .expect("delete compact JSON row property");
+        assert_eq!(
+            read_scalar_own_object_property(&state, second_row, "id"),
+            None
+        );
+        assert_eq!(
+            read_scalar_own_object_property(&state, second_meta, "lane"),
+            Some(ScalarValue::Number(6.0)),
         );
     }
 

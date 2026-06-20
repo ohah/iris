@@ -19090,6 +19090,30 @@ fn execute_scalar_instruction<'a>(
             let destination = read_unsigned_operand(instruction_bytes, 1, 1);
             let left_register = read_unsigned_operand(instruction_bytes, 2, 1);
             let right_register = read_unsigned_operand(instruction_bytes, 3, 1);
+            // Most strict HBC hot loops reach these opcodes with number operands.
+            // Keep generic Add(32) on the full coercion path for string behavior.
+            if instruction.opcode != 32 {
+                if let (
+                    Some(ScalarValue::Number(left)),
+                    Some(ScalarValue::Number(right)),
+                    Some(destination_slot),
+                ) = (
+                    registers.get(left_register as usize).copied(),
+                    registers.get(right_register as usize).copied(),
+                    registers.get_mut(destination as usize),
+                ) {
+                    let value = match instruction.opcode {
+                        30 | 31 => left + right,
+                        33 | 34 => left * right,
+                        35 | 36 => left / right,
+                        37 => left % right,
+                        38 | 39 => left - right,
+                        _ => unreachable!("matched number arithmetic opcodes"),
+                    };
+                    *destination_slot = ScalarValue::Number(value);
+                    return Ok(ScalarInstructionResult::Continue);
+                }
+            }
             let left_value =
                 read_scalar_register(registers, function_id, instruction, left_register)?;
             let right_value =

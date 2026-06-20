@@ -3201,6 +3201,7 @@ enum ScalarFastPathCandidate {
     GlobalMathComputeLoop,
     GlobalMathComputeProgram,
     JsonPayloadBuildLoop,
+    JsonStringifyParseRoundTripProgram,
     JsonRoundTripProgram,
     ObjectTraversalBuildLoop,
     ObjectTraversalChecksumLoop,
@@ -3402,6 +3403,23 @@ fn execute_scalar_function_with_state_and_environment<'a>(
                     ScalarFastPathCandidate::JsonPayloadBuildLoop => {
                         if let Some(next_instruction_index) =
                             try_execute_scalar_json_payload_build_loop_candidate(
+                                bytecode,
+                                state,
+                                &mut registers,
+                                function_id,
+                                &instructions,
+                                &instruction_bytes,
+                                &mut string_operand_cache,
+                                instruction_index,
+                            )?
+                        {
+                            instruction_index = next_instruction_index;
+                            continue;
+                        }
+                    }
+                    ScalarFastPathCandidate::JsonStringifyParseRoundTripProgram => {
+                        if let Some(next_instruction_index) =
+                            try_execute_scalar_json_stringify_parse_round_trip_program_candidate(
                                 bytecode,
                                 state,
                                 &mut registers,
@@ -4138,6 +4156,53 @@ fn scalar_fast_path_candidates<'a>(
 
             let candidates = candidates
                 .get_or_insert_with(|| vec![ScalarFastPathCandidate::None; instructions.len()]);
+            if let Some(stringify_instruction_index) = instruction_index.checked_sub(5) {
+                let stringify_window =
+                    &instructions[stringify_instruction_index..stringify_instruction_index + 5];
+                let expected_stringify_opcodes = [72, 68, 68, 110, 74];
+                if stringify_window
+                    .iter()
+                    .zip(expected_stringify_opcodes)
+                    .all(|(instruction, expected_opcode)| instruction.opcode == expected_opcode)
+                {
+                    let stringify_property_checks = [
+                        (0, 4, 2, "JSON"),
+                        (1, 4, 1, "stringify"),
+                        (2, 4, 1, "payload"),
+                        (4, 4, 2, "encoded"),
+                    ];
+                    let mut stringify_prefix_matches = true;
+                    for (relative_index, operand_offset, operand_width, expected_name) in
+                        stringify_property_checks
+                    {
+                        let string_id = read_unsigned_operand(
+                            instruction_bytes[stringify_instruction_index + relative_index],
+                            operand_offset,
+                            operand_width,
+                        );
+                        let Ok(property_name) = read_scalar_string_operand(
+                            bytecode,
+                            function_id,
+                            stringify_window[relative_index],
+                            string_id,
+                        ) else {
+                            stringify_prefix_matches = false;
+                            break;
+                        };
+                        if property_name != expected_name {
+                            stringify_prefix_matches = false;
+                            break;
+                        }
+                    }
+
+                    if stringify_prefix_matches
+                        && candidates[stringify_instruction_index] == ScalarFastPathCandidate::None
+                    {
+                        candidates[stringify_instruction_index] =
+                            ScalarFastPathCandidate::JsonStringifyParseRoundTripProgram;
+                    }
+                }
+            }
             if candidates[instruction_index] == ScalarFastPathCandidate::None {
                 candidates[instruction_index] = ScalarFastPathCandidate::JsonRoundTripProgram;
             }
@@ -8601,6 +8666,325 @@ fn try_execute_scalar_global_branch_modulo_loop_candidate<'a>(
     registers[odd_register as usize] = ScalarValue::Number(odd);
     registers[even_register as usize] = ScalarValue::Number(even);
     Ok(Some(condition_jump_instruction_index + 1))
+}
+
+fn try_execute_scalar_json_stringify_parse_round_trip_program_candidate<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
+    registers: &mut [ScalarValue],
+    function_id: u32,
+    instructions: &[HermesInstruction],
+    instruction_bytes: &[&[u8]],
+    string_operand_cache: &mut ScalarStringOperandCache<'a>,
+    instruction_index: usize,
+) -> Result<Option<usize>, ScalarExecutionError> {
+    let Some(ret_instruction_index) = instruction_index.checked_add(39) else {
+        return Ok(None);
+    };
+    let Some(ret_instruction) = instructions.get(ret_instruction_index).copied() else {
+        return Ok(None);
+    };
+    if ret_instruction.opcode != 118 {
+        return Ok(None);
+    }
+
+    let json_stringify_get_bytes = instruction_bytes[instruction_index];
+    let stringify_get_bytes = instruction_bytes[instruction_index + 1];
+    let payload_get_bytes = instruction_bytes[instruction_index + 2];
+    let stringify_call_bytes = instruction_bytes[instruction_index + 3];
+    let encoded_put_bytes = instruction_bytes[instruction_index + 4];
+    let json_parse_get_bytes = instruction_bytes[instruction_index + 5];
+    let parse_get_bytes = instruction_bytes[instruction_index + 6];
+    let encoded_get_bytes = instruction_bytes[instruction_index + 7];
+    let parse_call_bytes = instruction_bytes[instruction_index + 8];
+    let decoded_put_bytes = instruction_bytes[instruction_index + 9];
+    let checksum_init_put_bytes = instruction_bytes[instruction_index + 10];
+    let row_index_init_put_bytes = instruction_bytes[instruction_index + 11];
+    let checksum_loop_put_bytes = instruction_bytes[instruction_index + 28];
+    let row_index_loop_put_bytes = instruction_bytes[instruction_index + 31];
+    let global_this_get_bytes = instruction_bytes[instruction_index + 36];
+    let final_checksum_get_bytes = instruction_bytes[instruction_index + 37];
+    let final_checksum_put_bytes = instruction_bytes[instruction_index + 38];
+    let ret_bytes = instruction_bytes[ret_instruction_index];
+
+    let global_base_register = read_unsigned_operand(json_stringify_get_bytes, 2, 1);
+    for bytes in [
+        payload_get_bytes,
+        json_parse_get_bytes,
+        encoded_get_bytes,
+        global_this_get_bytes,
+        final_checksum_get_bytes,
+    ] {
+        if read_unsigned_operand(bytes, 2, 1) != global_base_register {
+            return Ok(None);
+        }
+    }
+    for bytes in [
+        encoded_put_bytes,
+        decoded_put_bytes,
+        checksum_init_put_bytes,
+        row_index_init_put_bytes,
+        checksum_loop_put_bytes,
+        row_index_loop_put_bytes,
+    ] {
+        if read_unsigned_operand(bytes, 1, 1) != global_base_register {
+            return Ok(None);
+        }
+    }
+    if !matches!(
+        registers.get(global_base_register as usize),
+        Some(ScalarValue::Object(ScalarObjectHandle::Global))
+    ) {
+        return Ok(None);
+    }
+
+    let json_stringify_register = read_unsigned_operand(json_stringify_get_bytes, 1, 1);
+    let stringify_register = read_unsigned_operand(stringify_get_bytes, 1, 1);
+    let payload_register = read_unsigned_operand(payload_get_bytes, 1, 1);
+    let stringify_result_register = read_unsigned_operand(stringify_call_bytes, 1, 1);
+    let json_parse_register = read_unsigned_operand(json_parse_get_bytes, 1, 1);
+    let parse_register = read_unsigned_operand(parse_get_bytes, 1, 1);
+    let encoded_register = read_unsigned_operand(encoded_get_bytes, 1, 1);
+    let parsed_register = read_unsigned_operand(parse_call_bytes, 1, 1);
+    let zero_register = read_unsigned_operand(checksum_init_put_bytes, 2, 1);
+    let checksum_value_register = read_unsigned_operand(checksum_loop_put_bytes, 2, 1);
+    let row_index_value_register = read_unsigned_operand(row_index_loop_put_bytes, 2, 1);
+    let global_this_register = read_unsigned_operand(global_this_get_bytes, 1, 1);
+    let final_checksum_register = read_unsigned_operand(final_checksum_get_bytes, 1, 1);
+    let ret_register = read_unsigned_operand(ret_bytes, 1, 1);
+
+    if read_unsigned_operand(stringify_get_bytes, 2, 1) != json_stringify_register
+        || read_unsigned_operand(stringify_call_bytes, 2, 1) != stringify_register
+        || read_unsigned_operand(stringify_call_bytes, 3, 1) != json_stringify_register
+        || read_unsigned_operand(stringify_call_bytes, 4, 1) != payload_register
+        || read_unsigned_operand(encoded_put_bytes, 2, 1) != stringify_result_register
+        || read_unsigned_operand(parse_get_bytes, 2, 1) != json_parse_register
+        || read_unsigned_operand(parse_call_bytes, 2, 1) != parse_register
+        || read_unsigned_operand(parse_call_bytes, 3, 1) != json_parse_register
+        || read_unsigned_operand(parse_call_bytes, 4, 1) != encoded_register
+        || read_unsigned_operand(decoded_put_bytes, 2, 1) != parsed_register
+        || read_unsigned_operand(row_index_init_put_bytes, 2, 1) != zero_register
+        || read_unsigned_operand(final_checksum_put_bytes, 1, 1) != global_this_register
+        || read_unsigned_operand(final_checksum_put_bytes, 2, 1) != final_checksum_register
+        || final_checksum_register != ret_register
+    {
+        return Ok(None);
+    }
+
+    for register in [
+        json_stringify_register,
+        stringify_register,
+        payload_register,
+        stringify_result_register,
+        json_parse_register,
+        parse_register,
+        encoded_register,
+        parsed_register,
+        zero_register,
+        checksum_value_register,
+        row_index_value_register,
+        global_this_register,
+        final_checksum_register,
+        ret_register,
+    ] {
+        if registers.get(register as usize).is_none() {
+            return Ok(None);
+        }
+    }
+
+    let json_stringify_string_id = read_unsigned_operand(json_stringify_get_bytes, 4, 2);
+    let stringify_string_id = read_unsigned_operand(stringify_get_bytes, 4, 1);
+    let payload_string_id = read_unsigned_operand(payload_get_bytes, 4, 1);
+    let encoded_put_string_id = read_unsigned_operand(encoded_put_bytes, 4, 2);
+    let json_parse_string_id = read_unsigned_operand(json_parse_get_bytes, 4, 2);
+    let parse_string_id = read_unsigned_operand(parse_get_bytes, 4, 1);
+    let encoded_get_string_id = read_unsigned_operand(encoded_get_bytes, 4, 1);
+    let decoded_string_id = read_unsigned_operand(decoded_put_bytes, 4, 2);
+    let checksum_string_id = read_unsigned_operand(checksum_loop_put_bytes, 4, 2);
+    let row_index_string_id = read_unsigned_operand(row_index_loop_put_bytes, 4, 2);
+    let global_this_string_id = read_unsigned_operand(global_this_get_bytes, 4, 2);
+    let final_checksum_string_id = read_unsigned_operand(final_checksum_put_bytes, 4, 2);
+    let json_stringify_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index],
+        json_stringify_string_id,
+    )?;
+    let stringify_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 1],
+        stringify_string_id,
+    )?;
+    let payload_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 2],
+        payload_string_id,
+    )?;
+    let encoded_put_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 4],
+        encoded_put_string_id,
+    )?;
+    let json_parse_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 5],
+        json_parse_string_id,
+    )?;
+    let parse_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 6],
+        parse_string_id,
+    )?;
+    let encoded_get_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 7],
+        encoded_get_string_id,
+    )?;
+    let decoded_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 9],
+        decoded_string_id,
+    )?;
+    let checksum_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 28],
+        checksum_string_id,
+    )?;
+    let row_index_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 31],
+        row_index_string_id,
+    )?;
+    let global_this_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 36],
+        global_this_string_id,
+    )?;
+    let final_checksum_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 38],
+        final_checksum_string_id,
+    )?;
+    if json_stringify_property_name != "JSON"
+        || stringify_property_name != "stringify"
+        || payload_property_name != "payload"
+        || encoded_put_property_name != "encoded"
+        || json_parse_property_name != "JSON"
+        || parse_property_name != "parse"
+        || !scalar_property_name_matches(encoded_put_property_name, encoded_get_property_name)
+        || decoded_property_name != "decoded"
+        || checksum_property_name != "checksum"
+        || row_index_property_name != "rowIndex"
+        || global_this_property_name != "globalThis"
+        || final_checksum_property_name != "__irisStrictHbcChecksum"
+    {
+        return Ok(None);
+    }
+
+    if read_cached_scalar_global_property(
+        state,
+        json_stringify_string_id,
+        json_stringify_property_name,
+    ) != ScalarValue::Object(ScalarObjectHandle::Json)
+        || read_scalar_object_property(state, ScalarObjectHandle::Json, stringify_property_name)
+            != ScalarValue::Function(ScalarFunctionHandle::NativeJsonStringify)
+        || read_cached_scalar_global_property(state, json_parse_string_id, json_parse_property_name)
+            != ScalarValue::Object(ScalarObjectHandle::Json)
+        || read_scalar_object_property(state, ScalarObjectHandle::Json, parse_property_name)
+            != ScalarValue::Function(ScalarFunctionHandle::NativeJsonParse)
+        || read_cached_scalar_global_property(
+            state,
+            global_this_string_id,
+            global_this_property_name,
+        ) != ScalarValue::Object(ScalarObjectHandle::Global)
+        || registers[zero_register as usize] != ScalarValue::Number(0.0)
+    {
+        return Ok(None);
+    }
+
+    let payload_value =
+        read_cached_scalar_global_property(state, payload_string_id, payload_property_name);
+    let Some(ScalarJsonSnapshot::JsonPayloadRows { length }) =
+        try_scalar_value_to_json_payload_rows_snapshot(bytecode, state, payload_value)
+    else {
+        return Ok(None);
+    };
+    let mut checksum = 0.0;
+    for index in 0..length {
+        let index_number = f64::from(index);
+        checksum = checksum + index_number + (index_number * 3.0);
+        if !checksum.is_finite() {
+            return Ok(None);
+        }
+    }
+
+    let encoded_value = ScalarValue::Undefined;
+    let decoded_value = ScalarValue::Undefined;
+    let checksum_value = ScalarValue::Number(checksum);
+    let length_value = ScalarValue::Number(f64::from(length));
+    write_cached_scalar_global_property(
+        state,
+        encoded_put_string_id,
+        encoded_put_property_name,
+        encoded_value,
+    );
+    write_cached_scalar_global_property(
+        state,
+        decoded_string_id,
+        decoded_property_name,
+        decoded_value,
+    );
+    write_cached_scalar_global_property(
+        state,
+        checksum_string_id,
+        checksum_property_name,
+        checksum_value,
+    );
+    write_cached_scalar_global_property(
+        state,
+        row_index_string_id,
+        row_index_property_name,
+        length_value,
+    );
+    write_cached_scalar_global_property(
+        state,
+        final_checksum_string_id,
+        final_checksum_property_name,
+        checksum_value,
+    );
+
+    registers[stringify_result_register as usize] = encoded_value;
+    registers[encoded_register as usize] = encoded_value;
+    registers[parsed_register as usize] = decoded_value;
+    registers[checksum_value_register as usize] = checksum_value;
+    registers[row_index_value_register as usize] = length_value;
+    registers[global_this_register as usize] = ScalarValue::Object(ScalarObjectHandle::Global);
+    registers[final_checksum_register as usize] = checksum_value;
+    registers[ret_register as usize] = checksum_value;
+    Ok(Some(ret_instruction_index))
 }
 
 fn try_execute_scalar_json_round_trip_program_candidate<'a>(

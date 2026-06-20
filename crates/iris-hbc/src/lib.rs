@@ -7537,11 +7537,19 @@ fn try_execute_scalar_property_loop_candidate<'a>(
     if score >= divisor {
         return Ok(None);
     }
-    let mut checksum_delta = 0_u64;
-    for index in start_index..limit {
-        score = ((u64::from(score) + u64::from(index % divisor)) % u64::from(divisor)) as u32;
-        checksum_delta += u64::from(score);
-    }
+    let checksum_delta = if let Some((final_score, checksum_delta)) =
+        sum_scalar_modular_accumulator_sequence(start_index, limit, score, divisor)
+    {
+        score = final_score;
+        checksum_delta
+    } else {
+        let mut checksum_delta = 0_u64;
+        for index in start_index..limit {
+            score = ((u64::from(score) + u64::from(index % divisor)) % u64::from(divisor)) as u32;
+            checksum_delta += u64::from(score);
+        }
+        checksum_delta
+    };
 
     const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
     let result = checksum + checksum_delta as f64;
@@ -8080,6 +8088,114 @@ fn sum_scalar_modulo_range(start: u32, end: u32, divisor: u32) -> u64 {
     prefix(u64::from(end), u64::from(divisor)) - prefix(u64::from(start), u64::from(divisor))
 }
 
+#[inline(never)]
+fn sum_scalar_modular_accumulator_sequence(
+    start: u32,
+    end: u32,
+    start_score: u32,
+    divisor: u32,
+) -> Option<(u32, u64)> {
+    const MAX_PATTERN_DIVISOR: u32 = 4096;
+
+    if divisor == 0 || start > end || start_score >= divisor || divisor > MAX_PATTERN_DIVISOR {
+        return None;
+    }
+
+    let iteration_count = end - start;
+    if iteration_count == 0 {
+        return Some((start_score, 0));
+    }
+
+    let divisor_sum = u64::from(divisor) * u64::from(divisor - 1) / 2;
+    let period_length = if divisor_sum % u64::from(divisor) == 0 {
+        divisor
+    } else {
+        divisor.checked_mul(2)?
+    };
+    if iteration_count < period_length {
+        return Some(sum_scalar_modular_accumulator_prefix(
+            start,
+            iteration_count,
+            start_score,
+            divisor,
+        ));
+    }
+
+    let (period_score, period_sum) =
+        sum_scalar_modular_accumulator_prefix(start, period_length, start_score, divisor);
+    if period_score != start_score {
+        return None;
+    }
+
+    let full_periods = iteration_count / period_length;
+    let remainder = iteration_count % period_length;
+    let (final_score, remainder_sum) =
+        sum_scalar_modular_accumulator_prefix(start, remainder, start_score, divisor);
+    let checksum_delta = period_sum
+        .checked_mul(u64::from(full_periods))?
+        .checked_add(remainder_sum)?;
+    Some((final_score, checksum_delta))
+}
+
+#[inline(never)]
+fn sum_scalar_modular_accumulator_prefix(
+    start: u32,
+    count: u32,
+    mut score: u32,
+    divisor: u32,
+) -> (u32, u64) {
+    let mut checksum_delta = 0_u64;
+    for offset in 0..count {
+        let index = start
+            .checked_add(offset)
+            .expect("modular accumulator prefix stays within u32 range");
+        score = ((u64::from(score) + u64::from(index % divisor)) % u64::from(divisor)) as u32;
+        checksum_delta += u64::from(score);
+    }
+    (score, checksum_delta)
+}
+
+fn sum_scalar_parity_modulo_range(start: u32, end: u32, parity: u32, divisor: u32) -> Option<u64> {
+    const MAX_PATTERN_DIVISOR: u32 = 4096;
+
+    if start > end || parity > 1 || divisor == 0 || divisor > MAX_PATTERN_DIVISOR {
+        return None;
+    }
+
+    let first = if start % 2 == parity {
+        start
+    } else {
+        start.checked_add(1)?
+    };
+    if first >= end {
+        return Some(0);
+    }
+
+    let count = ((end - 1 - first) / 2) + 1;
+    let period_length = if divisor % 2 == 0 {
+        divisor / 2
+    } else {
+        divisor
+    }
+    .max(1);
+    let period_sum = sum_scalar_strided_modulo_prefix(first, period_length, divisor);
+    let full_periods = count / period_length;
+    let remainder = count % period_length;
+    period_sum
+        .checked_mul(u64::from(full_periods))?
+        .checked_add(sum_scalar_strided_modulo_prefix(first, remainder, divisor))
+}
+
+fn sum_scalar_strided_modulo_prefix(start: u32, count: u32, divisor: u32) -> u64 {
+    let mut checksum_delta = 0_u64;
+    let start_modulo = u64::from(start % divisor);
+    let divisor = u64::from(divisor);
+    for offset in 0..count {
+        checksum_delta += (start_modulo + (u64::from(offset) * 2)) % divisor;
+    }
+    checksum_delta
+}
+
 fn try_execute_scalar_global_branch_modulo_loop_candidate<'a>(
     bytecode: &HermesBytecode<'a>,
     state: &mut ScalarExecutorState<'a>,
@@ -8440,15 +8556,24 @@ fn try_execute_scalar_global_branch_modulo_loop_candidate<'a>(
 
     let odd_divisor = odd_divisor as u32;
     let even_divisor = even_divisor as u32;
-    let mut index = start_index as u32;
+    let start_index = start_index as u32;
     let limit = limit as u32;
-    while index < limit {
-        if index % 2 == 0 {
-            even += f64::from(index % even_divisor);
-        } else {
-            odd += f64::from(index % odd_divisor);
+    if let (Some(even_delta), Some(odd_delta)) = (
+        sum_scalar_parity_modulo_range(start_index, limit, 0, even_divisor),
+        sum_scalar_parity_modulo_range(start_index, limit, 1, odd_divisor),
+    ) {
+        even += even_delta as f64;
+        odd += odd_delta as f64;
+    } else {
+        let mut index = start_index;
+        while index < limit {
+            if index % 2 == 0 {
+                even += f64::from(index % even_divisor);
+            } else {
+                odd += f64::from(index % odd_divisor);
+            }
+            index = index.saturating_add(1);
         }
-        index = index.saturating_add(1);
     }
 
     let limit_value = ScalarValue::Number(f64::from(limit));
@@ -24606,6 +24731,63 @@ mod tests {
             read_scalar_array_element(&state, points, 2),
             ScalarValue::Number(3.0),
         );
+    }
+
+    #[test]
+    fn scalar_modular_accumulator_sequence_matches_naive_loop() {
+        fn naive(start: u32, end: u32, mut score: u32, divisor: u32) -> (u32, u64) {
+            let mut checksum_delta = 0_u64;
+            for index in start..end {
+                score =
+                    ((u64::from(score) + u64::from(index % divisor)) % u64::from(divisor)) as u32;
+                checksum_delta += u64::from(score);
+            }
+            (score, checksum_delta)
+        }
+
+        for (start, end, score, divisor) in [
+            (0, 0, 0, 7),
+            (0, 10, 1, 3),
+            (3, 21, 2, 8),
+            (0, 80_000, 1, 1009),
+        ] {
+            assert_eq!(
+                sum_scalar_modular_accumulator_sequence(start, end, score, divisor),
+                Some(naive(start, end, score, divisor)),
+            );
+        }
+
+        assert_eq!(sum_scalar_modular_accumulator_sequence(0, 10, 10, 7), None);
+        assert_eq!(sum_scalar_modular_accumulator_sequence(10, 0, 0, 7), None);
+    }
+
+    #[test]
+    fn scalar_parity_modulo_range_matches_naive_loop() {
+        fn naive(start: u32, end: u32, parity: u32, divisor: u32) -> u64 {
+            let mut checksum_delta = 0_u64;
+            for index in start..end {
+                if index % 2 == parity {
+                    checksum_delta += u64::from(index % divisor);
+                }
+            }
+            checksum_delta
+        }
+
+        for (start, end, parity, divisor) in [
+            (0, 0, 0, 97),
+            (0, 10, 1, 4),
+            (3, 21, 0, 8),
+            (0, 120_000, 0, 97),
+            (0, 120_000, 1, 89),
+        ] {
+            assert_eq!(
+                sum_scalar_parity_modulo_range(start, end, parity, divisor),
+                Some(naive(start, end, parity, divisor)),
+            );
+        }
+
+        assert_eq!(sum_scalar_parity_modulo_range(0, 10, 2, 7), None);
+        assert_eq!(sum_scalar_parity_modulo_range(10, 0, 0, 7), None);
     }
 
     #[test]

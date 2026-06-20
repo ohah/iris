@@ -12973,7 +12973,13 @@ fn try_execute_scalar_json_payload_build_loop_candidate<'a>(
         || active_divisor > f64::from(u32::MAX)
         || active_compare != 0.0
         || !points_one_multiplier.is_finite()
+        || points_one_multiplier < 0.0
+        || points_one_multiplier.fract() != 0.0
+        || points_one_multiplier > f64::from(u32::MAX)
         || !points_two_multiplier.is_finite()
+        || points_two_multiplier < 0.0
+        || points_two_multiplier.fract() != 0.0
+        || points_two_multiplier > f64::from(u32::MAX)
     {
         return Ok(None);
     }
@@ -13001,69 +13007,126 @@ fn try_execute_scalar_json_payload_build_loop_candidate<'a>(
 
     let lane_divisor = lane_divisor as u32;
     let active_divisor = active_divisor as u32;
+    let points_one_multiplier = points_one_multiplier as u32;
+    let points_two_multiplier = points_two_multiplier as u32;
+    if (limit - 1).checked_mul(points_one_multiplier).is_none()
+        || (limit - 1).checked_mul(points_two_multiplier).is_none()
+    {
+        return Ok(None);
+    }
     let iteration_count = usize::try_from(limit - start_index).expect("loop count fits in usize");
-    state.object_properties.reserve(iteration_count * 7);
-    state.array_lengths.reserve(iteration_count + 1);
-    state.array_storage.reserve(iteration_count + 1);
+    if iteration_count > 5_000_000 {
+        return Ok(None);
+    }
+    let Some(property_count) = iteration_count.checked_mul(7) else {
+        return Ok(None);
+    };
+    let Some(object_count) = iteration_count.checked_mul(3) else {
+        return Ok(None);
+    };
+    let Ok(object_count) = u32::try_from(object_count) else {
+        return Ok(None);
+    };
+    let Some(next_object_id) = state.next_object_id.checked_add(object_count) else {
+        return Ok(None);
+    };
+    let first_object_id = state.next_object_id;
+    state.next_object_id = next_object_id;
+    state.object_property_indices_incomplete = true;
+    state.object_properties.reserve(property_count);
+    let last_storage_index = usize::try_from(next_object_id - 1).expect("object id fits in usize");
+    if state.array_lengths.len() <= last_storage_index {
+        state
+            .array_lengths
+            .resize_with(last_storage_index + 1, || None);
+    }
+    if state.array_storage.len() <= last_storage_index {
+        state
+            .array_storage
+            .resize_with(last_storage_index + 1, || None);
+    }
 
     let mut payload_values = Vec::with_capacity(iteration_count);
-    let mut last_meta = ScalarValue::Undefined;
-    let mut last_points = ScalarValue::Undefined;
-    let mut last_row = ScalarValue::Undefined;
     let mut fused_checksum = 0.0;
+    let should_fuse_checksum = program_suffix.is_some();
+    let object_properties = &mut state.object_properties;
     for index in start_index..limit {
         let index_value = f64::from(index);
-        let point_two_value = index_value * points_two_multiplier;
-        if program_suffix.is_some() {
+        let point_one_value = f64::from(index * points_one_multiplier);
+        let point_two_value = f64::from(index * points_two_multiplier);
+        if should_fuse_checksum {
             fused_checksum += index_value + point_two_value;
             if !fused_checksum.is_finite() {
                 return Ok(None);
             }
         }
-        let meta = allocate_scalar_object(state);
-        write_scalar_new_object_properties2_unindexed(
-            state,
+        let row_offset = index - start_index;
+        let object_offset = row_offset
+            .checked_mul(3)
+            .expect("object offset fits in u32");
+        let meta = ScalarObjectHandle::Object(
+            first_object_id
+                .checked_add(object_offset)
+                .expect("reserved meta object id fits in u32"),
+        );
+        let points = ScalarObjectHandle::Array(
+            first_object_id
+                .checked_add(object_offset + 1)
+                .expect("reserved points array id fits in u32"),
+        );
+        let row = ScalarObjectHandle::Object(
+            first_object_id
+                .checked_add(object_offset + 2)
+                .expect("reserved row object id fits in u32"),
+        );
+        object_properties.push((
             meta,
             "lane",
             ScalarValue::Number(f64::from(index % lane_divisor)),
-            "label",
-            label_value,
-        );
+        ));
+        object_properties.push((meta, "label", label_value));
 
-        let points = allocate_scalar_array_with_values(
-            state,
-            vec![
-                ScalarValue::Number(index_value),
-                ScalarValue::Number(index_value * points_one_multiplier),
-                ScalarValue::Number(point_two_value),
-            ],
-        );
+        let points_storage_index = usize::try_from(match points {
+            ScalarObjectHandle::Array(points_id) => points_id,
+            _ => unreachable!("points handle is an array"),
+        })
+        .expect("points array id fits in usize");
+        state.array_lengths[points_storage_index] = Some(3);
+        state.array_storage[points_storage_index] = Some(vec![
+            ScalarValue::Number(index_value),
+            ScalarValue::Number(point_one_value),
+            ScalarValue::Number(point_two_value),
+        ]);
 
-        let row = allocate_scalar_object(state);
-        write_scalar_new_object_properties3_unindexed(
-            state,
+        object_properties.push((
             row,
             "active",
             ScalarValue::Boolean(index % active_divisor == 0),
-            "id",
-            ScalarValue::Number(index_value),
-            "meta",
-            ScalarValue::Object(meta),
-        );
-        write_scalar_new_object_properties2_unindexed(
-            state,
-            row,
-            "name",
-            name_value,
-            "points",
-            ScalarValue::Object(points),
-        );
-
-        last_meta = ScalarValue::Object(meta);
-        last_points = ScalarValue::Object(points);
-        last_row = ScalarValue::Object(row);
-        payload_values.push(last_row);
+        ));
+        object_properties.push((row, "id", ScalarValue::Number(index_value)));
+        object_properties.push((row, "meta", ScalarValue::Object(meta)));
+        object_properties.push((row, "name", name_value));
+        object_properties.push((row, "points", ScalarValue::Object(points)));
+        payload_values.push(ScalarValue::Object(row));
     }
+    let last_row_offset = (limit - start_index - 1)
+        .checked_mul(3)
+        .expect("last object offset fits in u32");
+    let last_meta = ScalarValue::Object(ScalarObjectHandle::Object(
+        first_object_id
+            .checked_add(last_row_offset)
+            .expect("reserved last meta object id fits in u32"),
+    ));
+    let last_points = ScalarValue::Object(ScalarObjectHandle::Array(
+        first_object_id
+            .checked_add(last_row_offset + 1)
+            .expect("reserved last points array id fits in u32"),
+    ));
+    let last_row = ScalarValue::Object(ScalarObjectHandle::Object(
+        first_object_id
+            .checked_add(last_row_offset + 2)
+            .expect("reserved last row object id fits in u32"),
+    ));
 
     let payload_storage_index = usize::try_from(payload_id).expect("array id fits in usize");
     if state.array_lengths.len() <= payload_storage_index {
@@ -14495,6 +14558,9 @@ fn try_execute_scalar_object_traversal_build_loop_candidate<'a>(
         || active_divisor > f64::from(u32::MAX)
         || active_compare != 0.0
         || !score_multiplier.is_finite()
+        || score_multiplier < 0.0
+        || score_multiplier.fract() != 0.0
+        || score_multiplier > f64::from(u32::MAX)
         || score_divisor <= 0.0
         || score_divisor.fract() != 0.0
         || score_divisor > f64::from(u32::MAX)
@@ -14514,44 +14580,70 @@ fn try_execute_scalar_object_traversal_build_loop_candidate<'a>(
     if iteration_count > 5_000_000 {
         return Ok(None);
     }
+    let score_multiplier = score_multiplier as u32;
+    if (limit - 1).checked_mul(score_multiplier).is_none() {
+        return Ok(None);
+    }
 
-    state.object_properties.reserve(iteration_count * 5);
+    let Some(property_count) = iteration_count.checked_mul(5) else {
+        return Ok(None);
+    };
+    let Some(object_count) = iteration_count.checked_mul(2) else {
+        return Ok(None);
+    };
+    let Ok(object_count) = u32::try_from(object_count) else {
+        return Ok(None);
+    };
+    let Some(next_object_id) = state.next_object_id.checked_add(object_count) else {
+        return Ok(None);
+    };
+    let first_object_id = state.next_object_id;
+    state.next_object_id = next_object_id;
+    state.object_properties.reserve(property_count);
+    state.object_property_indices_incomplete = true;
     let mut rows_values = Vec::with_capacity(iteration_count);
     let active_divisor = active_divisor as u32;
     let score_divisor = score_divisor as u32;
     let lane_divisor = lane_divisor as u32;
-    let mut last_nested = ScalarValue::Undefined;
-    let mut last_row = ScalarValue::Undefined;
     let mut fused_checksum = 0.0;
+    let should_fuse_checksum = program_suffix.is_some();
+    let object_properties = &mut state.object_properties;
 
     for index in 0..limit {
         let index_value = f64::from(index);
         let active_value = index % active_divisor == 0;
-        let score_value = (index_value * score_multiplier) % f64::from(score_divisor);
+        let score_value = f64::from((index * score_multiplier) % score_divisor);
         let lane_value = index % lane_divisor;
-        let nested = allocate_scalar_object(state);
-        write_scalar_new_object_properties2_unindexed(
-            state,
+        let object_offset = index.checked_mul(2).expect("object offset fits in u32");
+        let nested = ScalarObjectHandle::Object(
+            first_object_id
+                .checked_add(object_offset)
+                .expect("reserved object id fits in u32"),
+        );
+        let row = ScalarObjectHandle::Object(
+            first_object_id
+                .checked_add(object_offset + 1)
+                .expect("reserved object id fits in u32"),
+        );
+        object_properties.push((
             nested,
             active_property_name,
             ScalarValue::Boolean(active_value),
+        ));
+        object_properties.push((
+            nested,
             score_property_name,
             ScalarValue::Number(score_value),
-        );
-
-        let row = allocate_scalar_object(state);
-        write_scalar_new_object_properties3_unindexed(
-            state,
+        ));
+        object_properties.push((row, id_property_name, ScalarValue::Number(index_value)));
+        object_properties.push((
             row,
-            id_property_name,
-            ScalarValue::Number(index_value),
             lane_property_name,
             ScalarValue::Number(f64::from(lane_value)),
-            row_nested_property_name,
-            ScalarValue::Object(nested),
-        );
+        ));
+        object_properties.push((row, row_nested_property_name, ScalarValue::Object(nested)));
 
-        if program_suffix.is_some() {
+        if should_fuse_checksum {
             if active_value {
                 fused_checksum = fused_checksum + index_value + score_value;
             } else {
@@ -14561,10 +14653,22 @@ fn try_execute_scalar_object_traversal_build_loop_candidate<'a>(
                 return Ok(None);
             }
         }
-        last_nested = ScalarValue::Object(nested);
-        last_row = ScalarValue::Object(row);
-        rows_values.push(last_row);
+        rows_values.push(ScalarValue::Object(row));
     }
+    let last_index = limit - 1;
+    let last_object_offset = last_index
+        .checked_mul(2)
+        .expect("last object offset fits in u32");
+    let last_nested = ScalarValue::Object(ScalarObjectHandle::Object(
+        first_object_id
+            .checked_add(last_object_offset)
+            .expect("reserved nested object id fits in u32"),
+    ));
+    let last_row = ScalarValue::Object(ScalarObjectHandle::Object(
+        first_object_id
+            .checked_add(last_object_offset + 1)
+            .expect("reserved row object id fits in u32"),
+    ));
 
     let storage_index = usize::try_from(rows_id).expect("array id fits in usize");
     if state.array_lengths.len() <= storage_index {
@@ -14595,7 +14699,7 @@ fn try_execute_scalar_object_traversal_build_loop_candidate<'a>(
     registers[active_value_register as usize] =
         ScalarValue::Boolean((limit - 1) % active_divisor == 0);
     registers[score_register as usize] =
-        ScalarValue::Number((f64::from(limit - 1) * score_multiplier) % f64::from(score_divisor));
+        ScalarValue::Number(f64::from(((limit - 1) * score_multiplier) % score_divisor));
     registers[row_register as usize] = last_row;
     registers[id_row_register as usize] = last_row;
     registers[id_register as usize] = ScalarValue::Number(f64::from(limit - 1));
@@ -22204,6 +22308,7 @@ fn write_scalar_new_object_property<'a>(
     state.object_properties.push((object, property_name, value));
 }
 
+#[cfg(test)]
 fn write_scalar_new_object_properties2_unindexed<'a>(
     state: &mut ScalarExecutorState<'a>,
     object: ScalarObjectHandle,
@@ -22219,28 +22324,6 @@ fn write_scalar_new_object_properties2_unindexed<'a>(
     state
         .object_properties
         .push((object, second_name, second_value));
-}
-
-fn write_scalar_new_object_properties3_unindexed<'a>(
-    state: &mut ScalarExecutorState<'a>,
-    object: ScalarObjectHandle,
-    first_name: &'a str,
-    first_value: ScalarValue,
-    second_name: &'a str,
-    second_value: ScalarValue,
-    third_name: &'a str,
-    third_value: ScalarValue,
-) {
-    state.object_property_indices_incomplete = true;
-    state
-        .object_properties
-        .push((object, first_name, first_value));
-    state
-        .object_properties
-        .push((object, second_name, second_value));
-    state
-        .object_properties
-        .push((object, third_name, third_value));
 }
 
 fn write_scalar_named_object_getter_property<'a>(

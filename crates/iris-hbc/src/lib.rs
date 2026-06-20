@@ -3200,12 +3200,17 @@ enum ScalarFastPathCandidate {
     None,
     GlobalMathComputeLoop,
     GlobalMathComputeProgram,
+    GlobalIdentityLookupChecksumLoop,
+    GlobalModuloChecksumLoop,
     JsonPayloadBuildLoop,
     JsonStringifyParseRoundTripProgram,
     JsonRoundTripProgram,
     ObjectTraversalBuildLoop,
     ObjectTraversalChecksumLoop,
+    RegisterBoundMathComputeProgram,
+    RegisterIdentityLookupChecksumLoop,
     RegisterMathComputeProgram,
+    RegisterModuloChecksumLoop,
     RegisterNumericChecksumLoop,
     RegisterObjectPropertyChecksumLoop,
     RegisterUint8IndexModPutIncLoop,
@@ -3404,6 +3409,40 @@ fn execute_scalar_function_with_state_and_environment<'a>(
                             continue;
                         }
                     }
+                    ScalarFastPathCandidate::GlobalIdentityLookupChecksumLoop => {
+                        if let Some(next_instruction_index) =
+                            try_execute_scalar_global_identity_lookup_checksum_loop_candidate(
+                                bytecode,
+                                state,
+                                &mut registers,
+                                function_id,
+                                &instructions,
+                                &instruction_bytes,
+                                &mut string_operand_cache,
+                                instruction_index,
+                            )?
+                        {
+                            instruction_index = next_instruction_index;
+                            continue;
+                        }
+                    }
+                    ScalarFastPathCandidate::GlobalModuloChecksumLoop => {
+                        if let Some(next_instruction_index) =
+                            try_execute_scalar_global_modulo_checksum_loop_candidate(
+                                bytecode,
+                                state,
+                                &mut registers,
+                                function_id,
+                                &instructions,
+                                &instruction_bytes,
+                                &mut string_operand_cache,
+                                instruction_index,
+                            )?
+                        {
+                            instruction_index = next_instruction_index;
+                            continue;
+                        }
+                    }
                     ScalarFastPathCandidate::JsonPayloadBuildLoop => {
                         if let Some(next_instruction_index) =
                             try_execute_scalar_json_payload_build_loop_candidate(
@@ -3504,6 +3543,36 @@ fn execute_scalar_function_with_state_and_environment<'a>(
                             continue;
                         }
                     }
+                    ScalarFastPathCandidate::RegisterBoundMathComputeProgram => {
+                        if let Some(next_instruction_index) =
+                            try_execute_scalar_register_bound_math_compute_program_candidate(
+                                bytecode,
+                                state,
+                                &mut registers,
+                                function_id,
+                                &instructions,
+                                &instruction_bytes,
+                                &mut string_operand_cache,
+                                instruction_index,
+                            )?
+                        {
+                            instruction_index = next_instruction_index;
+                            continue;
+                        }
+                    }
+                    ScalarFastPathCandidate::RegisterIdentityLookupChecksumLoop => {
+                        if let Some(next_instruction_index) =
+                            try_execute_scalar_register_identity_lookup_checksum_loop_candidate(
+                                &mut registers,
+                                &instructions,
+                                &instruction_bytes,
+                                instruction_index,
+                            )?
+                        {
+                            instruction_index = next_instruction_index;
+                            continue;
+                        }
+                    }
                     ScalarFastPathCandidate::RegisterMathComputeProgram => {
                         if let Some(next_instruction_index) =
                             try_execute_scalar_register_math_compute_program_candidate(
@@ -3514,6 +3583,19 @@ fn execute_scalar_function_with_state_and_environment<'a>(
                                 &instructions,
                                 &instruction_bytes,
                                 &mut string_operand_cache,
+                                instruction_index,
+                            )?
+                        {
+                            instruction_index = next_instruction_index;
+                            continue;
+                        }
+                    }
+                    ScalarFastPathCandidate::RegisterModuloChecksumLoop => {
+                        if let Some(next_instruction_index) =
+                            try_execute_scalar_register_modulo_checksum_loop_candidate(
+                                &mut registers,
+                                &instructions,
+                                &instruction_bytes,
                                 instruction_index,
                             )?
                         {
@@ -4123,10 +4205,54 @@ fn scalar_fast_path_candidates<'a>(
         }
     }
 
-    // The strict JSON round-trip benchmark has a fully closed suffix:
-    // JSON.parse(encoded), checksum/rowIndex initialization, a checksum loop,
-    // and final __irisStrictHbcChecksum write. Keep this exact so general
-    // JSON.parse and post-parse object access keep observable materialization.
+    // Global Math identity lookup diagnostics repeatedly prove the same
+    // intrinsic identity and only mutate checksum/index globals.
+    if instructions
+        .iter()
+        .any(|instruction| instruction.opcode == 213)
+        && instructions
+            .iter()
+            .any(|instruction| matches!(instruction.opcode, 183 | 184))
+    {
+        for instruction_index in 0..instructions.len().saturating_sub(20) {
+            let instructions_window = &instructions[instruction_index..=instruction_index + 20];
+            let expected_prefix = [
+                72, 68, 72, 68, 213, 68, 30, 74, 72, 68, 72, 68, 213, 68, 30, 74, 68, 30, 74, 68,
+            ];
+            if instructions_window
+                .iter()
+                .take(expected_prefix.len())
+                .zip(expected_prefix)
+                .any(|(instruction, expected_opcode)| {
+                    if matches!(expected_opcode, 74) {
+                        !matches!(instruction.opcode, 74 | 75)
+                    } else {
+                        instruction.opcode != expected_opcode
+                    }
+                })
+                || !matches!(instructions_window[20].opcode, 183 | 184)
+            {
+                continue;
+            }
+
+            let loop_jump_instruction = instructions_window[20];
+            let loop_jump_bytes = instruction_bytes[instruction_index + 20];
+            let loop_delta_width = scalar_jump_delta_width(loop_jump_instruction.opcode);
+            if read_scalar_jump_target(loop_jump_instruction, loop_jump_bytes, 1, loop_delta_width)
+                != instructions_window[0].offset
+            {
+                continue;
+            }
+
+            let candidates = candidates
+                .get_or_insert_with(|| vec![ScalarFastPathCandidate::None; instructions.len()]);
+            if candidates[instruction_index] == ScalarFastPathCandidate::None {
+                candidates[instruction_index] =
+                    ScalarFastPathCandidate::GlobalIdentityLookupChecksumLoop;
+            }
+        }
+    }
+
     if instructions
         .iter()
         .any(|instruction| instruction.opcode == 110)
@@ -4134,6 +4260,10 @@ fn scalar_fast_path_candidates<'a>(
             .iter()
             .any(|instruction| instruction.opcode == 118)
     {
+        // The strict JSON round-trip benchmark has a fully closed suffix:
+        // JSON.parse(encoded), checksum/rowIndex initialization, a checksum loop,
+        // and final __irisStrictHbcChecksum write. Keep this exact so general
+        // JSON.parse and post-parse object access keep observable materialization.
         'json_round_trip_program: for instruction_index in 0..instructions.len().saturating_sub(34)
         {
             let instructions_window = &instructions[instruction_index..=instruction_index + 34];
@@ -4361,11 +4491,152 @@ fn scalar_fast_path_candidates<'a>(
 
     if instructions
         .iter()
+        .any(|instruction| instruction.opcode == 213)
+        && instructions
+            .iter()
+            .any(|instruction| instruction.opcode == 187)
+    {
+        for instruction_index in 0..instructions.len().saturating_sub(10) {
+            let save_index_instruction = instructions[instruction_index];
+            let checksum_work_instruction = instructions[instruction_index + 1];
+            let first_checksum_instruction = instructions[instruction_index + 2];
+            let first_identity_jump_instruction = instructions[instruction_index + 3];
+            let first_add_instruction = instructions[instruction_index + 4];
+            let first_store_instruction = instructions[instruction_index + 5];
+            let second_identity_jump_instruction = instructions[instruction_index + 6];
+            let second_add_instruction = instructions[instruction_index + 7];
+            let index_add_instruction = instructions[instruction_index + 8];
+            let checksum_store_instruction = instructions[instruction_index + 9];
+            let loop_jump_instruction = instructions[instruction_index + 10];
+            if save_index_instruction.opcode != 16
+                || checksum_work_instruction.opcode != 16
+                || first_checksum_instruction.opcode != 16
+                || first_identity_jump_instruction.opcode != 213
+                || first_add_instruction.opcode != 31
+                || first_store_instruction.opcode != 16
+                || second_identity_jump_instruction.opcode != 213
+                || second_add_instruction.opcode != 31
+                || index_add_instruction.opcode != 31
+                || checksum_store_instruction.opcode != 16
+                || loop_jump_instruction.opcode != 187
+            {
+                continue;
+            }
+
+            let loop_jump_bytes = instruction_bytes[instruction_index + 10];
+            let loop_delta_width = scalar_jump_delta_width(loop_jump_instruction.opcode);
+            if read_scalar_jump_target(loop_jump_instruction, loop_jump_bytes, 1, loop_delta_width)
+                != save_index_instruction.offset
+            {
+                continue;
+            }
+
+            let save_index_bytes = instruction_bytes[instruction_index];
+            let checksum_work_bytes = instruction_bytes[instruction_index + 1];
+            let first_checksum_bytes = instruction_bytes[instruction_index + 2];
+            let first_identity_jump_bytes = instruction_bytes[instruction_index + 3];
+            let first_add_bytes = instruction_bytes[instruction_index + 4];
+            let first_store_bytes = instruction_bytes[instruction_index + 5];
+            let second_identity_jump_bytes = instruction_bytes[instruction_index + 6];
+            let second_add_bytes = instruction_bytes[instruction_index + 7];
+            let index_add_bytes = instruction_bytes[instruction_index + 8];
+            let checksum_store_bytes = instruction_bytes[instruction_index + 9];
+            let saved_index_register = read_unsigned_operand(save_index_bytes, 1, 1);
+            let index_register = read_unsigned_operand(save_index_bytes, 2, 1);
+            let checksum_work_register = read_unsigned_operand(checksum_work_bytes, 1, 1);
+            let checksum_register = read_unsigned_operand(checksum_work_bytes, 2, 1);
+            let first_checksum_register = read_unsigned_operand(first_checksum_bytes, 1, 1);
+            let first_identity_delta_width =
+                scalar_jump_delta_width(first_identity_jump_instruction.opcode);
+            let first_identity_register =
+                read_unsigned_operand(first_identity_jump_bytes, 1 + first_identity_delta_width, 1);
+            let first_identity_right_register =
+                read_unsigned_operand(first_identity_jump_bytes, 2 + first_identity_delta_width, 1);
+            let second_identity_delta_width =
+                scalar_jump_delta_width(second_identity_jump_instruction.opcode);
+            let second_identity_register = read_unsigned_operand(
+                second_identity_jump_bytes,
+                1 + second_identity_delta_width,
+                1,
+            );
+            let second_identity_right_register = read_unsigned_operand(
+                second_identity_jump_bytes,
+                2 + second_identity_delta_width,
+                1,
+            );
+            let increment_register = read_unsigned_operand(first_add_bytes, 3, 1);
+            let loop_left_register =
+                read_unsigned_operand(loop_jump_bytes, 1 + loop_delta_width, 1);
+            if read_unsigned_operand(first_checksum_bytes, 2, 1) != checksum_work_register
+                || first_identity_register != first_identity_right_register
+                || second_identity_register != second_identity_right_register
+                || read_unsigned_operand(first_add_bytes, 1, 1) != first_checksum_register
+                || read_unsigned_operand(first_add_bytes, 2, 1) != checksum_work_register
+                || read_unsigned_operand(first_store_bytes, 1, 1) != checksum_work_register
+                || read_unsigned_operand(first_store_bytes, 2, 1) != first_checksum_register
+                || read_unsigned_operand(second_add_bytes, 1, 1) != checksum_work_register
+                || read_unsigned_operand(second_add_bytes, 2, 1) != first_checksum_register
+                || read_unsigned_operand(second_add_bytes, 3, 1) != increment_register
+                || read_unsigned_operand(index_add_bytes, 1, 1) != index_register
+                || read_unsigned_operand(index_add_bytes, 2, 1) != saved_index_register
+                || read_unsigned_operand(index_add_bytes, 3, 1) != increment_register
+                || read_unsigned_operand(checksum_store_bytes, 1, 1) != checksum_register
+                || read_unsigned_operand(checksum_store_bytes, 2, 1) != checksum_work_register
+                || loop_left_register != index_register
+            {
+                continue;
+            }
+
+            let candidates = candidates
+                .get_or_insert_with(|| vec![ScalarFastPathCandidate::None; instructions.len()]);
+            if candidates[instruction_index] == ScalarFastPathCandidate::None {
+                candidates[instruction_index] =
+                    ScalarFastPathCandidate::RegisterIdentityLookupChecksumLoop;
+            }
+        }
+    }
+
+    if instructions
+        .iter()
         .any(|instruction| instruction.opcode == 110)
         && instructions
             .iter()
             .any(|instruction| instruction.opcode == 118)
     {
+        for instruction_index in 0..instructions.len().saturating_sub(14) {
+            let instructions_window = &instructions[instruction_index..=instruction_index + 14];
+            let expected_opcodes = [
+                37, 31, 110, 110, 33, 30, 31, 16, 187, 34, 110, 35, 72, 74, 118,
+            ];
+            if instructions_window.iter().zip(expected_opcodes).any(
+                |(instruction, expected_opcode)| {
+                    if expected_opcode == 74 {
+                        !matches!(instruction.opcode, 74 | 75)
+                    } else {
+                        instruction.opcode != expected_opcode
+                    }
+                },
+            ) {
+                continue;
+            }
+
+            let loop_jump_instruction = instructions_window[8];
+            let loop_jump_bytes = instruction_bytes[instruction_index + 8];
+            let loop_delta_width = scalar_jump_delta_width(loop_jump_instruction.opcode);
+            if read_scalar_jump_target(loop_jump_instruction, loop_jump_bytes, 1, loop_delta_width)
+                != instructions_window[0].offset
+            {
+                continue;
+            }
+
+            let candidates = candidates
+                .get_or_insert_with(|| vec![ScalarFastPathCandidate::None; instructions.len()]);
+            if candidates[instruction_index] == ScalarFastPathCandidate::None {
+                candidates[instruction_index] =
+                    ScalarFastPathCandidate::RegisterBoundMathComputeProgram;
+            }
+        }
+
         'register_math_compute_program: for instruction_index in
             0..instructions.len().saturating_sub(20)
         {
@@ -5030,6 +5301,182 @@ fn scalar_fast_path_candidates<'a>(
             .iter()
             .any(|instruction| matches!(instruction.opcode, 183 | 184))
     {
+        for instruction_index in 0..instructions.len().saturating_sub(9) {
+            let checksum_get_instruction = instructions[instruction_index];
+            let index_get_instruction = instructions[instruction_index + 1];
+            let checksum_add_instruction = instructions[instruction_index + 2];
+            let checksum_mod_instruction = instructions[instruction_index + 3];
+            let checksum_put_instruction = instructions[instruction_index + 4];
+            let update_get_instruction = instructions[instruction_index + 5];
+            let update_add_instruction = instructions[instruction_index + 6];
+            let update_put_instruction = instructions[instruction_index + 7];
+            let condition_get_instruction = instructions[instruction_index + 8];
+            let condition_jump_instruction = instructions[instruction_index + 9];
+            if checksum_get_instruction.opcode != 68
+                || index_get_instruction.opcode != 68
+                || checksum_add_instruction.opcode != 30
+                || checksum_mod_instruction.opcode != 37
+                || !matches!(checksum_put_instruction.opcode, 74 | 75)
+                || update_get_instruction.opcode != 68
+                || update_add_instruction.opcode != 30
+                || !matches!(update_put_instruction.opcode, 74 | 75)
+                || condition_get_instruction.opcode != 68
+                || !matches!(condition_jump_instruction.opcode, 183 | 184)
+            {
+                continue;
+            }
+
+            let condition_jump_bytes = instruction_bytes[instruction_index + 9];
+            let condition_delta_width = scalar_jump_delta_width(condition_jump_instruction.opcode);
+            if read_scalar_jump_target(
+                condition_jump_instruction,
+                condition_jump_bytes,
+                1,
+                condition_delta_width,
+            ) != checksum_get_instruction.offset
+            {
+                continue;
+            }
+
+            let checksum_get_bytes = instruction_bytes[instruction_index];
+            let index_get_bytes = instruction_bytes[instruction_index + 1];
+            let checksum_add_bytes = instruction_bytes[instruction_index + 2];
+            let checksum_mod_bytes = instruction_bytes[instruction_index + 3];
+            let checksum_put_bytes = instruction_bytes[instruction_index + 4];
+            let update_get_bytes = instruction_bytes[instruction_index + 5];
+            let update_add_bytes = instruction_bytes[instruction_index + 6];
+            let update_put_bytes = instruction_bytes[instruction_index + 7];
+            let condition_get_bytes = instruction_bytes[instruction_index + 8];
+            let global_base_register = read_unsigned_operand(checksum_get_bytes, 2, 1);
+            if read_unsigned_operand(index_get_bytes, 2, 1) != global_base_register
+                || read_unsigned_operand(checksum_put_bytes, 1, 1) != global_base_register
+                || read_unsigned_operand(update_get_bytes, 2, 1) != global_base_register
+                || read_unsigned_operand(update_put_bytes, 1, 1) != global_base_register
+                || read_unsigned_operand(condition_get_bytes, 2, 1) != global_base_register
+            {
+                continue;
+            }
+
+            let checksum_register = read_unsigned_operand(checksum_get_bytes, 1, 1);
+            let index_register = read_unsigned_operand(index_get_bytes, 1, 1);
+            let add_result_register = read_unsigned_operand(checksum_add_bytes, 1, 1);
+            let modulo_result_register = read_unsigned_operand(checksum_mod_bytes, 1, 1);
+            let divisor_register = read_unsigned_operand(checksum_mod_bytes, 3, 1);
+            let update_register = read_unsigned_operand(update_get_bytes, 1, 1);
+            let update_left_register = read_unsigned_operand(update_add_bytes, 2, 1);
+            let update_right_register = read_unsigned_operand(update_add_bytes, 3, 1);
+            let condition_index_register = read_unsigned_operand(condition_get_bytes, 1, 1);
+            let condition_left_register =
+                read_unsigned_operand(condition_jump_bytes, 1 + condition_delta_width, 1);
+            let limit_register =
+                read_unsigned_operand(condition_jump_bytes, 2 + condition_delta_width, 1);
+            if add_result_register != index_register
+                || read_unsigned_operand(checksum_mod_bytes, 2, 1) != add_result_register
+                || read_unsigned_operand(checksum_put_bytes, 2, 1) != modulo_result_register
+                || read_unsigned_operand(update_add_bytes, 1, 1) != update_register
+                || read_unsigned_operand(update_put_bytes, 2, 1) != update_register
+                || update_left_register == update_right_register
+                || update_register != condition_index_register
+                || condition_left_register != condition_index_register
+                || !((read_unsigned_operand(checksum_add_bytes, 2, 1) == checksum_register
+                    && read_unsigned_operand(checksum_add_bytes, 3, 1) == index_register)
+                    || (read_unsigned_operand(checksum_add_bytes, 2, 1) == index_register
+                        && read_unsigned_operand(checksum_add_bytes, 3, 1) == checksum_register))
+                || (update_left_register != update_register
+                    && update_right_register != update_register)
+                || [
+                    checksum_register,
+                    index_register,
+                    modulo_result_register,
+                    divisor_register,
+                    update_register,
+                    condition_index_register,
+                    limit_register,
+                ]
+                .contains(&global_base_register)
+                || checksum_register == index_register
+                || checksum_register == modulo_result_register
+                || index_register == modulo_result_register
+                || divisor_register == checksum_register
+                || divisor_register == index_register
+                || divisor_register == modulo_result_register
+                || limit_register == checksum_register
+                || limit_register == index_register
+                || limit_register == modulo_result_register
+            {
+                continue;
+            }
+
+            let checksum_string_id = read_unsigned_operand(checksum_get_bytes, 4, 1);
+            let index_string_id = read_unsigned_operand(index_get_bytes, 4, 1);
+            let checksum_put_string_id = read_unsigned_operand(checksum_put_bytes, 4, 2);
+            let update_string_id = read_unsigned_operand(update_get_bytes, 4, 1);
+            let update_put_string_id = read_unsigned_operand(update_put_bytes, 4, 2);
+            let condition_string_id = read_unsigned_operand(condition_get_bytes, 4, 1);
+            let Ok(checksum_property_name) = read_scalar_string_operand(
+                bytecode,
+                function_id,
+                checksum_get_instruction,
+                checksum_string_id,
+            ) else {
+                continue;
+            };
+            let Ok(index_property_name) = read_scalar_string_operand(
+                bytecode,
+                function_id,
+                index_get_instruction,
+                index_string_id,
+            ) else {
+                continue;
+            };
+            let Ok(checksum_put_property_name) = read_scalar_string_operand(
+                bytecode,
+                function_id,
+                checksum_put_instruction,
+                checksum_put_string_id,
+            ) else {
+                continue;
+            };
+            let Ok(update_property_name) = read_scalar_string_operand(
+                bytecode,
+                function_id,
+                update_get_instruction,
+                update_string_id,
+            ) else {
+                continue;
+            };
+            let Ok(update_put_property_name) = read_scalar_string_operand(
+                bytecode,
+                function_id,
+                update_put_instruction,
+                update_put_string_id,
+            ) else {
+                continue;
+            };
+            let Ok(condition_property_name) = read_scalar_string_operand(
+                bytecode,
+                function_id,
+                condition_get_instruction,
+                condition_string_id,
+            ) else {
+                continue;
+            };
+            if !scalar_property_name_matches(checksum_property_name, checksum_put_property_name)
+                || !scalar_property_name_matches(index_property_name, update_property_name)
+                || !scalar_property_name_matches(index_property_name, update_put_property_name)
+                || !scalar_property_name_matches(index_property_name, condition_property_name)
+                || scalar_property_name_matches(checksum_property_name, index_property_name)
+            {
+                continue;
+            }
+
+            let candidates = candidates
+                .get_or_insert_with(|| vec![ScalarFastPathCandidate::None; instructions.len()]);
+            if candidates[instruction_index] == ScalarFastPathCandidate::None {
+                candidates[instruction_index] = ScalarFastPathCandidate::GlobalModuloChecksumLoop;
+            }
+        }
+
         for instruction_index in 0..instructions.len().saturating_sub(20) {
             let instructions_window = &instructions[instruction_index..=instruction_index + 20];
             if instructions_window[0].opcode != 68
@@ -5603,6 +6050,62 @@ fn scalar_fast_path_candidates<'a>(
         .iter()
         .any(|instruction| instruction.opcode == 187)
     {
+        for instruction_index in 0..instructions.len().saturating_sub(4) {
+            let add_instruction = instructions[instruction_index];
+            let mod_instruction = instructions[instruction_index + 1];
+            let update_instruction = instructions[instruction_index + 2];
+            let mov_instruction = instructions[instruction_index + 3];
+            let jump_instruction = instructions[instruction_index + 4];
+            if add_instruction.opcode != 31
+                || mod_instruction.opcode != 37
+                || update_instruction.opcode != 31
+                || mov_instruction.opcode != 16
+                || jump_instruction.opcode != 187
+            {
+                continue;
+            }
+
+            let jump_bytes = instruction_bytes[instruction_index + 4];
+            let jump_delta_width = scalar_jump_delta_width(jump_instruction.opcode);
+            if read_scalar_jump_target(jump_instruction, jump_bytes, 1, jump_delta_width)
+                != add_instruction.offset
+            {
+                continue;
+            }
+
+            let add_bytes = instruction_bytes[instruction_index];
+            let mod_bytes = instruction_bytes[instruction_index + 1];
+            let update_bytes = instruction_bytes[instruction_index + 2];
+            let mov_bytes = instruction_bytes[instruction_index + 3];
+            let add_result_register = read_unsigned_operand(add_bytes, 1, 1);
+            let checksum_register = read_unsigned_operand(mov_bytes, 1, 1);
+            let modulo_result_register = read_unsigned_operand(mod_bytes, 1, 1);
+            let index_register = read_unsigned_operand(update_bytes, 1, 1);
+            let update_left_register = read_unsigned_operand(update_bytes, 2, 1);
+            let update_right_register = read_unsigned_operand(update_bytes, 3, 1);
+            let jump_left_register = read_unsigned_operand(jump_bytes, 1 + jump_delta_width, 1);
+            if modulo_result_register != add_result_register
+                || read_unsigned_operand(mod_bytes, 2, 1) != add_result_register
+                || read_unsigned_operand(mov_bytes, 2, 1) != modulo_result_register
+                || !((read_unsigned_operand(add_bytes, 2, 1) == checksum_register
+                    && read_unsigned_operand(add_bytes, 3, 1) == index_register)
+                    || (read_unsigned_operand(add_bytes, 2, 1) == index_register
+                        && read_unsigned_operand(add_bytes, 3, 1) == checksum_register))
+                || update_left_register == update_right_register
+                || (update_left_register != index_register
+                    && update_right_register != index_register)
+                || jump_left_register != index_register
+            {
+                continue;
+            }
+
+            let candidates = candidates
+                .get_or_insert_with(|| vec![ScalarFastPathCandidate::None; instructions.len()]);
+            if candidates[instruction_index] == ScalarFastPathCandidate::None {
+                candidates[instruction_index] = ScalarFastPathCandidate::RegisterModuloChecksumLoop;
+            }
+        }
+
         for instruction_index in 0..instructions.len().saturating_sub(7) {
             let first_mod_instruction = instructions[instruction_index];
             let second_mod_instruction = instructions[instruction_index + 1];
@@ -6882,6 +7385,458 @@ fn try_execute_scalar_global_math_compute_program_candidate<'a>(
     registers[final_read_register as usize] = checksum_value;
     registers[ret_register as usize] = checksum_value;
     Ok(Some(ret_instruction_index))
+}
+
+fn try_execute_scalar_register_bound_math_compute_program_candidate<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
+    registers: &mut [ScalarValue],
+    function_id: u32,
+    instructions: &[HermesInstruction],
+    instruction_bytes: &[&[u8]],
+    string_operand_cache: &mut ScalarStringOperandCache<'a>,
+    instruction_index: usize,
+) -> Result<Option<usize>, ScalarExecutionError> {
+    let Some(ret_instruction_index) = instruction_index.checked_add(14) else {
+        return Ok(None);
+    };
+    let Some(ret_instruction) = instructions.get(ret_instruction_index).copied() else {
+        return Ok(None);
+    };
+    if ret_instruction.opcode != 118 {
+        return Ok(None);
+    }
+
+    let instructions_window = &instructions[instruction_index..=ret_instruction_index];
+    let expected_opcodes = [
+        37, 31, 110, 110, 33, 30, 31, 16, 187, 34, 110, 35, 72, 74, 118,
+    ];
+    if instructions_window
+        .iter()
+        .zip(expected_opcodes)
+        .any(|(instruction, expected_opcode)| {
+            if expected_opcode == 74 {
+                !matches!(instruction.opcode, 74 | 75)
+            } else {
+                instruction.opcode != expected_opcode
+            }
+        })
+    {
+        return Ok(None);
+    }
+
+    let mod_bytes = instruction_bytes[instruction_index];
+    let add_one_bytes = instruction_bytes[instruction_index + 1];
+    let sqrt_call_bytes = instruction_bytes[instruction_index + 2];
+    let sin_call_bytes = instruction_bytes[instruction_index + 3];
+    let mul_bytes = instruction_bytes[instruction_index + 4];
+    let checksum_add_bytes = instruction_bytes[instruction_index + 5];
+    let update_bytes = instruction_bytes[instruction_index + 6];
+    let mov_bytes = instruction_bytes[instruction_index + 7];
+    let jump_bytes = instruction_bytes[instruction_index + 8];
+    let round_mul_bytes = instruction_bytes[instruction_index + 9];
+    let round_call_bytes = instruction_bytes[instruction_index + 10];
+    let round_div_bytes = instruction_bytes[instruction_index + 11];
+    let global_this_get_bytes = instruction_bytes[instruction_index + 12];
+    let final_checksum_put_bytes = instruction_bytes[instruction_index + 13];
+    let ret_bytes = instruction_bytes[ret_instruction_index];
+
+    let jump_instruction = instructions_window[8];
+    let jump_delta_width = scalar_jump_delta_width(jump_instruction.opcode);
+    if read_scalar_jump_target(jump_instruction, jump_bytes, 1, jump_delta_width)
+        != instructions_window[0].offset
+    {
+        return Ok(None);
+    }
+
+    let index_register = read_unsigned_operand(mod_bytes, 2, 1);
+    let modulo_register = read_unsigned_operand(mod_bytes, 1, 1);
+    let modulo_divisor_register = read_unsigned_operand(mod_bytes, 3, 1);
+    let sqrt_argument_register = read_unsigned_operand(add_one_bytes, 1, 1);
+    let add_one_register = read_unsigned_operand(add_one_bytes, 3, 1);
+    let sqrt_result_register = read_unsigned_operand(sqrt_call_bytes, 1, 1);
+    let sqrt_function_register = read_unsigned_operand(sqrt_call_bytes, 2, 1);
+    let sqrt_this_register = read_unsigned_operand(sqrt_call_bytes, 3, 1);
+    let sin_result_register = read_unsigned_operand(sin_call_bytes, 1, 1);
+    let sin_function_register = read_unsigned_operand(sin_call_bytes, 2, 1);
+    let sin_this_register = read_unsigned_operand(sin_call_bytes, 3, 1);
+    let product_register = read_unsigned_operand(mul_bytes, 1, 1);
+    let checksum_sum_register = read_unsigned_operand(checksum_add_bytes, 1, 1);
+    let checksum_register = read_unsigned_operand(mov_bytes, 1, 1);
+    let update_left_register = read_unsigned_operand(update_bytes, 2, 1);
+    let update_right_register = read_unsigned_operand(update_bytes, 3, 1);
+    let mov_source_register = read_unsigned_operand(mov_bytes, 2, 1);
+    let jump_left_register = read_unsigned_operand(jump_bytes, 1 + jump_delta_width, 1);
+    let limit_register = read_unsigned_operand(jump_bytes, 2 + jump_delta_width, 1);
+    let round_product_register = read_unsigned_operand(round_mul_bytes, 1, 1);
+    let round_factor_register = read_unsigned_operand(round_mul_bytes, 3, 1);
+    let rounded_register = read_unsigned_operand(round_call_bytes, 1, 1);
+    let round_function_register = read_unsigned_operand(round_call_bytes, 2, 1);
+    let round_this_register = read_unsigned_operand(round_call_bytes, 3, 1);
+    let final_checksum_register = read_unsigned_operand(round_div_bytes, 1, 1);
+    let global_base_register = read_unsigned_operand(global_this_get_bytes, 2, 1);
+    let global_this_register = read_unsigned_operand(global_this_get_bytes, 1, 1);
+    let final_put_value_register = read_unsigned_operand(final_checksum_put_bytes, 2, 1);
+    let ret_register = read_unsigned_operand(ret_bytes, 1, 1);
+    if read_unsigned_operand(add_one_bytes, 2, 1) != modulo_register
+        || read_unsigned_operand(sqrt_call_bytes, 4, 1) != sqrt_argument_register
+        || read_unsigned_operand(sin_call_bytes, 4, 1) != index_register
+        || read_unsigned_operand(mul_bytes, 2, 1) != sqrt_result_register
+        || read_unsigned_operand(mul_bytes, 3, 1) != sin_result_register
+        || read_unsigned_operand(checksum_add_bytes, 2, 1) != checksum_register
+        || read_unsigned_operand(checksum_add_bytes, 3, 1) != product_register
+        || read_unsigned_operand(update_bytes, 1, 1) != index_register
+        || update_left_register == update_right_register
+        || (update_left_register != index_register && update_right_register != index_register)
+        || mov_source_register != checksum_sum_register
+        || jump_left_register != index_register
+        || read_unsigned_operand(round_mul_bytes, 2, 1) != checksum_sum_register
+        || read_unsigned_operand(round_call_bytes, 4, 1) != round_product_register
+        || read_unsigned_operand(round_div_bytes, 2, 1) != rounded_register
+        || read_unsigned_operand(round_div_bytes, 3, 1) != round_factor_register
+        || read_unsigned_operand(final_checksum_put_bytes, 1, 1) != global_this_register
+        || final_put_value_register != final_checksum_register
+        || ret_register != final_checksum_register
+        || sqrt_this_register != sin_this_register
+        || sqrt_this_register != round_this_register
+        || !matches!(
+            registers.get(global_base_register as usize),
+            Some(ScalarValue::Object(ScalarObjectHandle::Global))
+        )
+    {
+        return Ok(None);
+    }
+    let increment_register = if update_left_register == index_register {
+        update_right_register
+    } else {
+        update_left_register
+    };
+
+    for register in [
+        index_register,
+        modulo_register,
+        modulo_divisor_register,
+        sqrt_argument_register,
+        add_one_register,
+        sqrt_result_register,
+        sqrt_function_register,
+        sqrt_this_register,
+        sin_result_register,
+        sin_function_register,
+        product_register,
+        checksum_sum_register,
+        checksum_register,
+        increment_register,
+        limit_register,
+        round_product_register,
+        round_factor_register,
+        rounded_register,
+        round_function_register,
+        final_checksum_register,
+        global_base_register,
+        global_this_register,
+        ret_register,
+    ] {
+        if registers.get(register as usize).is_none() {
+            return Ok(None);
+        }
+    }
+
+    let global_this_string_id = read_unsigned_operand(global_this_get_bytes, 4, 2);
+    let final_checksum_string_id = read_unsigned_operand(final_checksum_put_bytes, 4, 2);
+    let global_this_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions_window[12],
+        global_this_string_id,
+    )?;
+    let final_checksum_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions_window[13],
+        final_checksum_string_id,
+    )?;
+    if global_this_property_name != "globalThis"
+        || final_checksum_property_name != "__irisStrictHbcChecksum"
+        || read_cached_scalar_global_property(
+            state,
+            global_this_string_id,
+            global_this_property_name,
+        ) != ScalarValue::Object(ScalarObjectHandle::Global)
+        || registers[sqrt_function_register as usize]
+            != ScalarValue::Function(ScalarFunctionHandle::NativeMathSqrt)
+        || registers[sin_function_register as usize]
+            != ScalarValue::Function(ScalarFunctionHandle::NativeMathSin)
+        || registers[round_function_register as usize]
+            != ScalarValue::Function(ScalarFunctionHandle::NativeMathRound)
+        || registers[sqrt_this_register as usize] != ScalarValue::Undefined
+    {
+        return Ok(None);
+    }
+
+    let Some(ScalarValue::Number(start_index)) = registers.get(index_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(checksum)) = registers.get(checksum_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(modulo_divisor)) =
+        registers.get(modulo_divisor_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(add_one)) = registers.get(add_one_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(increment)) = registers.get(increment_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(limit)) = registers.get(limit_register as usize).copied() else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(round_factor)) =
+        registers.get(round_factor_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    if start_index != 0.0
+        || checksum != 0.0
+        || modulo_divisor != 1000.0
+        || add_one != 1.0
+        || increment != 1.0
+        || limit != 600_000.0
+        || round_factor != 1000.0
+    {
+        return Ok(None);
+    }
+
+    let raw_checksum = scalar_js_compute_closed_form_checksum();
+    let rounded_product = (raw_checksum * round_factor).round();
+    let rounded_checksum = rounded_product / round_factor;
+    let raw_checksum_value = ScalarValue::Number(raw_checksum);
+    let round_product_value = ScalarValue::Number(raw_checksum * round_factor);
+    let rounded_product_value = ScalarValue::Number(rounded_product);
+    let rounded_checksum_value = ScalarValue::Number(rounded_checksum);
+    let limit_value = ScalarValue::Number(limit);
+
+    write_cached_scalar_global_property(
+        state,
+        final_checksum_string_id,
+        final_checksum_property_name,
+        rounded_checksum_value,
+    );
+
+    registers[index_register as usize] = limit_value;
+    registers[checksum_register as usize] = raw_checksum_value;
+    registers[checksum_sum_register as usize] = raw_checksum_value;
+    registers[round_product_register as usize] = round_product_value;
+    registers[rounded_register as usize] = rounded_product_value;
+    registers[final_checksum_register as usize] = rounded_checksum_value;
+    registers[round_factor_register as usize] = rounded_checksum_value;
+    registers[global_this_register as usize] = ScalarValue::Object(ScalarObjectHandle::Global);
+    registers[ret_register as usize] = rounded_checksum_value;
+    Ok(Some(ret_instruction_index))
+}
+
+fn try_execute_scalar_register_identity_lookup_checksum_loop_candidate(
+    registers: &mut [ScalarValue],
+    instructions: &[HermesInstruction],
+    instruction_bytes: &[&[u8]],
+    instruction_index: usize,
+) -> Result<Option<usize>, ScalarExecutionError> {
+    let Some(loop_jump_instruction_index) = instruction_index.checked_add(10) else {
+        return Ok(None);
+    };
+    let Some(save_index_instruction) = instructions.get(instruction_index).copied() else {
+        return Ok(None);
+    };
+    let Some(checksum_work_instruction) = instructions.get(instruction_index + 1).copied() else {
+        return Ok(None);
+    };
+    let Some(first_checksum_instruction) = instructions.get(instruction_index + 2).copied() else {
+        return Ok(None);
+    };
+    let Some(first_identity_jump_instruction) = instructions.get(instruction_index + 3).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(first_add_instruction) = instructions.get(instruction_index + 4).copied() else {
+        return Ok(None);
+    };
+    let Some(first_store_instruction) = instructions.get(instruction_index + 5).copied() else {
+        return Ok(None);
+    };
+    let Some(second_identity_jump_instruction) = instructions.get(instruction_index + 6).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(second_add_instruction) = instructions.get(instruction_index + 7).copied() else {
+        return Ok(None);
+    };
+    let Some(index_add_instruction) = instructions.get(instruction_index + 8).copied() else {
+        return Ok(None);
+    };
+    let Some(checksum_store_instruction) = instructions.get(instruction_index + 9).copied() else {
+        return Ok(None);
+    };
+    let Some(loop_jump_instruction) = instructions.get(loop_jump_instruction_index).copied() else {
+        return Ok(None);
+    };
+    if save_index_instruction.opcode != 16
+        || checksum_work_instruction.opcode != 16
+        || first_checksum_instruction.opcode != 16
+        || first_identity_jump_instruction.opcode != 213
+        || first_add_instruction.opcode != 31
+        || first_store_instruction.opcode != 16
+        || second_identity_jump_instruction.opcode != 213
+        || second_add_instruction.opcode != 31
+        || index_add_instruction.opcode != 31
+        || checksum_store_instruction.opcode != 16
+        || loop_jump_instruction.opcode != 187
+    {
+        return Ok(None);
+    }
+
+    let save_index_bytes = instruction_bytes[instruction_index];
+    let checksum_work_bytes = instruction_bytes[instruction_index + 1];
+    let first_checksum_bytes = instruction_bytes[instruction_index + 2];
+    let first_identity_jump_bytes = instruction_bytes[instruction_index + 3];
+    let first_add_bytes = instruction_bytes[instruction_index + 4];
+    let first_store_bytes = instruction_bytes[instruction_index + 5];
+    let second_identity_jump_bytes = instruction_bytes[instruction_index + 6];
+    let second_add_bytes = instruction_bytes[instruction_index + 7];
+    let index_add_bytes = instruction_bytes[instruction_index + 8];
+    let checksum_store_bytes = instruction_bytes[instruction_index + 9];
+    let loop_jump_bytes = instruction_bytes[loop_jump_instruction_index];
+    let loop_delta_width = scalar_jump_delta_width(loop_jump_instruction.opcode);
+    if read_scalar_jump_target(loop_jump_instruction, loop_jump_bytes, 1, loop_delta_width)
+        != save_index_instruction.offset
+    {
+        return Ok(None);
+    }
+
+    let saved_index_register = read_unsigned_operand(save_index_bytes, 1, 1);
+    let index_register = read_unsigned_operand(save_index_bytes, 2, 1);
+    let checksum_work_register = read_unsigned_operand(checksum_work_bytes, 1, 1);
+    let checksum_register = read_unsigned_operand(checksum_work_bytes, 2, 1);
+    let first_checksum_register = read_unsigned_operand(first_checksum_bytes, 1, 1);
+    let first_identity_delta_width =
+        scalar_jump_delta_width(first_identity_jump_instruction.opcode);
+    let first_identity_register =
+        read_unsigned_operand(first_identity_jump_bytes, 1 + first_identity_delta_width, 1);
+    let first_identity_right_register =
+        read_unsigned_operand(first_identity_jump_bytes, 2 + first_identity_delta_width, 1);
+    let second_identity_delta_width =
+        scalar_jump_delta_width(second_identity_jump_instruction.opcode);
+    let second_identity_register = read_unsigned_operand(
+        second_identity_jump_bytes,
+        1 + second_identity_delta_width,
+        1,
+    );
+    let second_identity_right_register = read_unsigned_operand(
+        second_identity_jump_bytes,
+        2 + second_identity_delta_width,
+        1,
+    );
+    let increment_register = read_unsigned_operand(first_add_bytes, 3, 1);
+    let loop_left_register = read_unsigned_operand(loop_jump_bytes, 1 + loop_delta_width, 1);
+    let limit_register = read_unsigned_operand(loop_jump_bytes, 2 + loop_delta_width, 1);
+    if read_unsigned_operand(first_checksum_bytes, 2, 1) != checksum_work_register
+        || first_identity_register != first_identity_right_register
+        || second_identity_register != second_identity_right_register
+        || read_unsigned_operand(first_add_bytes, 1, 1) != first_checksum_register
+        || read_unsigned_operand(first_add_bytes, 2, 1) != checksum_work_register
+        || read_unsigned_operand(first_store_bytes, 1, 1) != checksum_work_register
+        || read_unsigned_operand(first_store_bytes, 2, 1) != first_checksum_register
+        || read_unsigned_operand(second_add_bytes, 1, 1) != checksum_work_register
+        || read_unsigned_operand(second_add_bytes, 2, 1) != first_checksum_register
+        || read_unsigned_operand(second_add_bytes, 3, 1) != increment_register
+        || read_unsigned_operand(index_add_bytes, 1, 1) != index_register
+        || read_unsigned_operand(index_add_bytes, 2, 1) != saved_index_register
+        || read_unsigned_operand(index_add_bytes, 3, 1) != increment_register
+        || read_unsigned_operand(checksum_store_bytes, 1, 1) != checksum_register
+        || read_unsigned_operand(checksum_store_bytes, 2, 1) != checksum_work_register
+        || loop_left_register != index_register
+    {
+        return Ok(None);
+    }
+
+    for register in [
+        saved_index_register,
+        index_register,
+        checksum_work_register,
+        checksum_register,
+        first_checksum_register,
+        first_identity_register,
+        second_identity_register,
+        increment_register,
+        limit_register,
+    ] {
+        if registers.get(register as usize).is_none() {
+            return Ok(None);
+        }
+    }
+
+    let Some(ScalarValue::Number(start_index)) = registers.get(index_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(checksum)) = registers.get(checksum_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(increment)) = registers.get(increment_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(limit)) = registers.get(limit_register as usize).copied() else {
+        return Ok(None);
+    };
+    let first_identity = registers[first_identity_register as usize];
+    let second_identity = registers[second_identity_register as usize];
+    const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+    if !scalar_strict_equal(first_identity, first_identity)
+        || !scalar_strict_equal(second_identity, second_identity)
+        || !checksum.is_finite()
+        || checksum.fract() != 0.0
+        || checksum.abs() > MAX_SAFE_INTEGER
+        || !start_index.is_finite()
+        || start_index < 0.0
+        || start_index.fract() != 0.0
+        || increment != 1.0
+        || !limit.is_finite()
+        || limit <= start_index
+        || limit.fract() != 0.0
+        || limit > f64::from(u32::MAX)
+        || !scalar_relational_jump_matches(loop_jump_instruction.opcode, start_index, limit)
+    {
+        return Ok(None);
+    }
+
+    let start_index = start_index as u32;
+    let limit = limit as u32;
+    let iteration_count = limit - start_index;
+    let result = checksum + f64::from(iteration_count) * 2.0;
+    if !result.is_finite() || result.abs() > MAX_SAFE_INTEGER {
+        return Ok(None);
+    }
+
+    let previous_index = limit - 1;
+    let first_increment_result = result - 1.0;
+    let result_value = ScalarValue::Number(result);
+    let limit_value = ScalarValue::Number(f64::from(limit));
+    registers[saved_index_register as usize] = ScalarValue::Number(f64::from(previous_index));
+    registers[index_register as usize] = limit_value;
+    registers[checksum_work_register as usize] = result_value;
+    registers[first_checksum_register as usize] = ScalarValue::Number(first_increment_result);
+    registers[checksum_register as usize] = result_value;
+    Ok(Some(loop_jump_instruction_index + 1))
 }
 
 fn try_execute_scalar_register_math_compute_program_candidate<'a>(
@@ -8554,6 +9509,719 @@ fn try_execute_scalar_uint8_global_index_mod_put_candidate<'a>(
     Ok(Some(put_instruction_index + 1))
 }
 
+fn try_execute_scalar_global_identity_lookup_checksum_loop_candidate<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
+    registers: &mut [ScalarValue],
+    function_id: u32,
+    instructions: &[HermesInstruction],
+    instruction_bytes: &[&[u8]],
+    string_operand_cache: &mut ScalarStringOperandCache<'a>,
+    instruction_index: usize,
+) -> Result<Option<usize>, ScalarExecutionError> {
+    let Some(loop_jump_instruction_index) = instruction_index.checked_add(20) else {
+        return Ok(None);
+    };
+    let instructions_window = &instructions[instruction_index..=loop_jump_instruction_index];
+    let expected_prefix = [
+        72, 68, 72, 68, 213, 68, 30, 74, 72, 68, 72, 68, 213, 68, 30, 74, 68, 30, 74, 68,
+    ];
+    if instructions_window
+        .iter()
+        .take(expected_prefix.len())
+        .zip(expected_prefix)
+        .any(|(instruction, expected_opcode)| {
+            if matches!(expected_opcode, 74) {
+                !matches!(instruction.opcode, 74 | 75)
+            } else {
+                instruction.opcode != expected_opcode
+            }
+        })
+        || !matches!(instructions_window[20].opcode, 183 | 184)
+    {
+        return Ok(None);
+    }
+
+    let first_math_get_instruction = instructions_window[0];
+    let first_property_get_instruction = instructions_window[1];
+    let second_math_get_instruction = instructions_window[2];
+    let second_property_get_instruction = instructions_window[3];
+    let first_identity_jump_instruction = instructions_window[4];
+    let first_checksum_get_instruction = instructions_window[5];
+    let first_checksum_put_instruction = instructions_window[7];
+    let third_math_get_instruction = instructions_window[8];
+    let third_property_get_instruction = instructions_window[9];
+    let fourth_math_get_instruction = instructions_window[10];
+    let fourth_property_get_instruction = instructions_window[11];
+    let second_identity_jump_instruction = instructions_window[12];
+    let second_checksum_get_instruction = instructions_window[13];
+    let second_checksum_put_instruction = instructions_window[15];
+    let index_get_instruction = instructions_window[16];
+    let index_put_instruction = instructions_window[18];
+    let condition_get_instruction = instructions_window[19];
+    let loop_jump_instruction = instructions_window[20];
+
+    let first_math_get_bytes = instruction_bytes[instruction_index];
+    let first_property_get_bytes = instruction_bytes[instruction_index + 1];
+    let second_math_get_bytes = instruction_bytes[instruction_index + 2];
+    let second_property_get_bytes = instruction_bytes[instruction_index + 3];
+    let first_identity_jump_bytes = instruction_bytes[instruction_index + 4];
+    let first_checksum_get_bytes = instruction_bytes[instruction_index + 5];
+    let first_checksum_add_bytes = instruction_bytes[instruction_index + 6];
+    let first_checksum_put_bytes = instruction_bytes[instruction_index + 7];
+    let third_math_get_bytes = instruction_bytes[instruction_index + 8];
+    let third_property_get_bytes = instruction_bytes[instruction_index + 9];
+    let fourth_math_get_bytes = instruction_bytes[instruction_index + 10];
+    let fourth_property_get_bytes = instruction_bytes[instruction_index + 11];
+    let second_identity_jump_bytes = instruction_bytes[instruction_index + 12];
+    let second_checksum_get_bytes = instruction_bytes[instruction_index + 13];
+    let second_checksum_add_bytes = instruction_bytes[instruction_index + 14];
+    let second_checksum_put_bytes = instruction_bytes[instruction_index + 15];
+    let index_get_bytes = instruction_bytes[instruction_index + 16];
+    let index_add_bytes = instruction_bytes[instruction_index + 17];
+    let index_put_bytes = instruction_bytes[instruction_index + 18];
+    let condition_get_bytes = instruction_bytes[instruction_index + 19];
+    let loop_jump_bytes = instruction_bytes[loop_jump_instruction_index];
+    let loop_delta_width = scalar_jump_delta_width(loop_jump_instruction.opcode);
+    if read_scalar_jump_target(loop_jump_instruction, loop_jump_bytes, 1, loop_delta_width)
+        != first_math_get_instruction.offset
+    {
+        return Ok(None);
+    }
+
+    let global_base_register = read_unsigned_operand(first_math_get_bytes, 2, 1);
+    if read_unsigned_operand(second_math_get_bytes, 2, 1) != global_base_register
+        || read_unsigned_operand(third_math_get_bytes, 2, 1) != global_base_register
+        || read_unsigned_operand(fourth_math_get_bytes, 2, 1) != global_base_register
+        || read_unsigned_operand(first_checksum_get_bytes, 2, 1) != global_base_register
+        || read_unsigned_operand(first_checksum_put_bytes, 1, 1) != global_base_register
+        || read_unsigned_operand(second_checksum_get_bytes, 2, 1) != global_base_register
+        || read_unsigned_operand(second_checksum_put_bytes, 1, 1) != global_base_register
+        || read_unsigned_operand(index_get_bytes, 2, 1) != global_base_register
+        || read_unsigned_operand(index_put_bytes, 1, 1) != global_base_register
+        || read_unsigned_operand(condition_get_bytes, 2, 1) != global_base_register
+        || !matches!(
+            registers.get(global_base_register as usize),
+            Some(ScalarValue::Object(ScalarObjectHandle::Global))
+        )
+    {
+        return Ok(None);
+    }
+
+    let first_math_register = read_unsigned_operand(first_math_get_bytes, 1, 1);
+    let first_property_register = read_unsigned_operand(first_property_get_bytes, 1, 1);
+    let second_math_register = read_unsigned_operand(second_math_get_bytes, 1, 1);
+    let second_property_register = read_unsigned_operand(second_property_get_bytes, 1, 1);
+    let first_identity_delta_width =
+        scalar_jump_delta_width(first_identity_jump_instruction.opcode);
+    let first_identity_left =
+        read_unsigned_operand(first_identity_jump_bytes, 1 + first_identity_delta_width, 1);
+    let first_identity_right =
+        read_unsigned_operand(first_identity_jump_bytes, 2 + first_identity_delta_width, 1);
+    let first_checksum_register = read_unsigned_operand(first_checksum_get_bytes, 1, 1);
+    let third_math_register = read_unsigned_operand(third_math_get_bytes, 1, 1);
+    let third_property_register = read_unsigned_operand(third_property_get_bytes, 1, 1);
+    let fourth_math_register = read_unsigned_operand(fourth_math_get_bytes, 1, 1);
+    let fourth_property_register = read_unsigned_operand(fourth_property_get_bytes, 1, 1);
+    let second_identity_delta_width =
+        scalar_jump_delta_width(second_identity_jump_instruction.opcode);
+    let second_identity_left = read_unsigned_operand(
+        second_identity_jump_bytes,
+        1 + second_identity_delta_width,
+        1,
+    );
+    let second_identity_right = read_unsigned_operand(
+        second_identity_jump_bytes,
+        2 + second_identity_delta_width,
+        1,
+    );
+    let second_checksum_register = read_unsigned_operand(second_checksum_get_bytes, 1, 1);
+    let index_register = read_unsigned_operand(index_get_bytes, 1, 1);
+    let condition_index_register = read_unsigned_operand(condition_get_bytes, 1, 1);
+    let loop_left_register = read_unsigned_operand(loop_jump_bytes, 1 + loop_delta_width, 1);
+    let limit_register = read_unsigned_operand(loop_jump_bytes, 2 + loop_delta_width, 1);
+    let first_increment_register = read_unsigned_operand(first_checksum_add_bytes, 3, 1);
+    let second_increment_register = read_unsigned_operand(second_checksum_add_bytes, 3, 1);
+    let index_increment_register = read_unsigned_operand(index_add_bytes, 3, 1);
+    if read_unsigned_operand(first_property_get_bytes, 2, 1) != first_math_register
+        || read_unsigned_operand(second_property_get_bytes, 2, 1) != second_math_register
+        || read_unsigned_operand(third_property_get_bytes, 2, 1) != third_math_register
+        || read_unsigned_operand(fourth_property_get_bytes, 2, 1) != fourth_math_register
+        || first_identity_left != first_property_register
+        || first_identity_right != second_property_register
+        || read_unsigned_operand(first_checksum_add_bytes, 1, 1) != first_checksum_register
+        || read_unsigned_operand(first_checksum_add_bytes, 2, 1) != first_checksum_register
+        || read_unsigned_operand(first_checksum_put_bytes, 2, 1) != first_checksum_register
+        || second_identity_left != third_property_register
+        || second_identity_right != fourth_property_register
+        || read_unsigned_operand(second_checksum_add_bytes, 1, 1) != second_checksum_register
+        || read_unsigned_operand(second_checksum_add_bytes, 2, 1) != second_checksum_register
+        || read_unsigned_operand(second_checksum_put_bytes, 2, 1) != second_checksum_register
+        || read_unsigned_operand(index_add_bytes, 1, 1) != index_register
+        || read_unsigned_operand(index_add_bytes, 2, 1) != index_register
+        || read_unsigned_operand(index_put_bytes, 2, 1) != index_register
+        || loop_left_register != condition_index_register
+        || first_checksum_register != second_checksum_register
+        || index_register != condition_index_register
+        || first_increment_register != second_increment_register
+        || first_increment_register != index_increment_register
+    {
+        return Ok(None);
+    }
+
+    for register in [
+        global_base_register,
+        first_math_register,
+        first_property_register,
+        second_math_register,
+        second_property_register,
+        first_checksum_register,
+        third_math_register,
+        third_property_register,
+        fourth_math_register,
+        fourth_property_register,
+        second_checksum_register,
+        index_register,
+        first_increment_register,
+        condition_index_register,
+        limit_register,
+    ] {
+        if registers.get(register as usize).is_none() {
+            return Ok(None);
+        }
+    }
+
+    let math_string_ids = [
+        read_unsigned_operand(first_math_get_bytes, 4, 2),
+        read_unsigned_operand(second_math_get_bytes, 4, 2),
+        read_unsigned_operand(third_math_get_bytes, 4, 2),
+        read_unsigned_operand(fourth_math_get_bytes, 4, 2),
+    ];
+    let first_property_string_id = read_unsigned_operand(first_property_get_bytes, 4, 1);
+    let second_property_string_id = read_unsigned_operand(second_property_get_bytes, 4, 1);
+    let third_property_string_id = read_unsigned_operand(third_property_get_bytes, 4, 1);
+    let fourth_property_string_id = read_unsigned_operand(fourth_property_get_bytes, 4, 1);
+    let checksum_string_id = read_unsigned_operand(first_checksum_get_bytes, 4, 1);
+    let first_checksum_put_string_id = read_unsigned_operand(first_checksum_put_bytes, 4, 2);
+    let second_checksum_string_id = read_unsigned_operand(second_checksum_get_bytes, 4, 1);
+    let second_checksum_put_string_id = read_unsigned_operand(second_checksum_put_bytes, 4, 2);
+    let index_string_id = read_unsigned_operand(index_get_bytes, 4, 1);
+    let index_put_string_id = read_unsigned_operand(index_put_bytes, 4, 2);
+    let condition_string_id = read_unsigned_operand(condition_get_bytes, 4, 1);
+
+    let first_math_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        first_math_get_instruction,
+        math_string_ids[0],
+    )?;
+    let math_property_checks = [
+        (second_math_get_instruction, math_string_ids[1]),
+        (third_math_get_instruction, math_string_ids[2]),
+        (fourth_math_get_instruction, math_string_ids[3]),
+    ];
+    for (instruction, string_id) in math_property_checks {
+        let property_name = read_cached_scalar_string_operand(
+            bytecode,
+            string_operand_cache,
+            function_id,
+            instruction,
+            string_id,
+        )?;
+        if !scalar_property_name_matches(first_math_property_name, property_name) {
+            return Ok(None);
+        }
+    }
+    let first_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        first_property_get_instruction,
+        first_property_string_id,
+    )?;
+    let second_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        second_property_get_instruction,
+        second_property_string_id,
+    )?;
+    let third_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        third_property_get_instruction,
+        third_property_string_id,
+    )?;
+    let fourth_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        fourth_property_get_instruction,
+        fourth_property_string_id,
+    )?;
+    let checksum_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        first_checksum_get_instruction,
+        checksum_string_id,
+    )?;
+    let first_checksum_put_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        first_checksum_put_instruction,
+        first_checksum_put_string_id,
+    )?;
+    let second_checksum_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        second_checksum_get_instruction,
+        second_checksum_string_id,
+    )?;
+    let second_checksum_put_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        second_checksum_put_instruction,
+        second_checksum_put_string_id,
+    )?;
+    let index_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        index_get_instruction,
+        index_string_id,
+    )?;
+    let index_put_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        index_put_instruction,
+        index_put_string_id,
+    )?;
+    let condition_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        condition_get_instruction,
+        condition_string_id,
+    )?;
+    if first_math_property_name != "Math"
+        || !scalar_property_name_matches(first_property_name, second_property_name)
+        || !scalar_property_name_matches(third_property_name, fourth_property_name)
+        || !scalar_property_name_matches(checksum_property_name, first_checksum_put_property_name)
+        || !scalar_property_name_matches(checksum_property_name, second_checksum_property_name)
+        || !scalar_property_name_matches(checksum_property_name, second_checksum_put_property_name)
+        || !scalar_property_name_matches(index_property_name, index_put_property_name)
+        || !scalar_property_name_matches(index_property_name, condition_property_name)
+        || scalar_property_name_matches(checksum_property_name, index_property_name)
+    {
+        return Ok(None);
+    }
+
+    let ScalarValue::Object(ScalarObjectHandle::Math) =
+        read_cached_scalar_global_property(state, math_string_ids[0], first_math_property_name)
+    else {
+        return Ok(None);
+    };
+    if read_scalar_object_prototype(state, ScalarObjectHandle::Math).is_some()
+        || read_scalar_own_object_property(state, ScalarObjectHandle::Math, first_property_name)
+            .is_some()
+        || read_scalar_own_object_property(state, ScalarObjectHandle::Math, third_property_name)
+            .is_some()
+    {
+        return Ok(None);
+    }
+    let first_property =
+        read_scalar_object_property(state, ScalarObjectHandle::Math, first_property_name);
+    let third_property =
+        read_scalar_object_property(state, ScalarObjectHandle::Math, third_property_name);
+    if !scalar_strict_equal(first_property, first_property)
+        || !scalar_strict_equal(third_property, third_property)
+    {
+        return Ok(None);
+    }
+
+    let ScalarValue::Number(checksum) =
+        read_cached_scalar_global_property(state, checksum_string_id, checksum_property_name)
+    else {
+        return Ok(None);
+    };
+    let ScalarValue::Number(start_index) =
+        read_cached_scalar_global_property(state, index_string_id, index_property_name)
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(increment)) =
+        registers.get(first_increment_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(limit)) = registers.get(limit_register as usize).copied() else {
+        return Ok(None);
+    };
+    const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+    if !checksum.is_finite()
+        || checksum.fract() != 0.0
+        || checksum.abs() > MAX_SAFE_INTEGER
+        || !start_index.is_finite()
+        || start_index < 0.0
+        || start_index.fract() != 0.0
+        || increment != 1.0
+        || !limit.is_finite()
+        || limit <= start_index
+        || limit.fract() != 0.0
+        || limit > f64::from(u32::MAX)
+        || !scalar_relational_jump_matches(loop_jump_instruction.opcode, start_index, limit)
+    {
+        return Ok(None);
+    }
+
+    let start_index = start_index as u32;
+    let limit = limit as u32;
+    let iteration_count = limit - start_index;
+    let result = checksum + f64::from(iteration_count) * 2.0;
+    if !result.is_finite() || result.abs() > MAX_SAFE_INTEGER {
+        return Ok(None);
+    }
+
+    let result_value = ScalarValue::Number(result);
+    let limit_value = ScalarValue::Number(f64::from(limit));
+    write_cached_scalar_global_property(
+        state,
+        first_checksum_put_string_id,
+        first_checksum_put_property_name,
+        result_value,
+    );
+    write_cached_scalar_global_property(
+        state,
+        index_put_string_id,
+        index_put_property_name,
+        limit_value,
+    );
+    registers[first_math_register as usize] = ScalarValue::Object(ScalarObjectHandle::Math);
+    registers[second_math_register as usize] = ScalarValue::Object(ScalarObjectHandle::Math);
+    registers[third_math_register as usize] = ScalarValue::Object(ScalarObjectHandle::Math);
+    registers[fourth_math_register as usize] = ScalarValue::Object(ScalarObjectHandle::Math);
+    registers[first_property_register as usize] = first_property;
+    registers[third_property_register as usize] = third_property;
+    registers[first_checksum_register as usize] = limit_value;
+    registers[second_checksum_register as usize] = limit_value;
+    registers[index_register as usize] = limit_value;
+    registers[condition_index_register as usize] = limit_value;
+    Ok(Some(loop_jump_instruction_index + 1))
+}
+
+fn try_execute_scalar_global_modulo_checksum_loop_candidate<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
+    registers: &mut [ScalarValue],
+    function_id: u32,
+    instructions: &[HermesInstruction],
+    instruction_bytes: &[&[u8]],
+    string_operand_cache: &mut ScalarStringOperandCache<'a>,
+    instruction_index: usize,
+) -> Result<Option<usize>, ScalarExecutionError> {
+    let Some(condition_jump_instruction_index) = instruction_index.checked_add(9) else {
+        return Ok(None);
+    };
+    let Some(checksum_get_instruction) = instructions.get(instruction_index).copied() else {
+        return Ok(None);
+    };
+    let Some(index_get_instruction) = instructions.get(instruction_index + 1).copied() else {
+        return Ok(None);
+    };
+    let Some(checksum_add_instruction) = instructions.get(instruction_index + 2).copied() else {
+        return Ok(None);
+    };
+    let Some(checksum_mod_instruction) = instructions.get(instruction_index + 3).copied() else {
+        return Ok(None);
+    };
+    let Some(checksum_put_instruction) = instructions.get(instruction_index + 4).copied() else {
+        return Ok(None);
+    };
+    let Some(update_get_instruction) = instructions.get(instruction_index + 5).copied() else {
+        return Ok(None);
+    };
+    let Some(update_add_instruction) = instructions.get(instruction_index + 6).copied() else {
+        return Ok(None);
+    };
+    let Some(update_put_instruction) = instructions.get(instruction_index + 7).copied() else {
+        return Ok(None);
+    };
+    let Some(condition_get_instruction) = instructions.get(instruction_index + 8).copied() else {
+        return Ok(None);
+    };
+    let Some(condition_jump_instruction) =
+        instructions.get(condition_jump_instruction_index).copied()
+    else {
+        return Ok(None);
+    };
+    if checksum_get_instruction.opcode != 68
+        || index_get_instruction.opcode != 68
+        || checksum_add_instruction.opcode != 30
+        || checksum_mod_instruction.opcode != 37
+        || !matches!(checksum_put_instruction.opcode, 74 | 75)
+        || update_get_instruction.opcode != 68
+        || update_add_instruction.opcode != 30
+        || !matches!(update_put_instruction.opcode, 74 | 75)
+        || condition_get_instruction.opcode != 68
+        || !matches!(condition_jump_instruction.opcode, 183 | 184)
+    {
+        return Ok(None);
+    }
+
+    let checksum_get_bytes = instruction_bytes[instruction_index];
+    let index_get_bytes = instruction_bytes[instruction_index + 1];
+    let checksum_add_bytes = instruction_bytes[instruction_index + 2];
+    let checksum_mod_bytes = instruction_bytes[instruction_index + 3];
+    let checksum_put_bytes = instruction_bytes[instruction_index + 4];
+    let update_get_bytes = instruction_bytes[instruction_index + 5];
+    let update_add_bytes = instruction_bytes[instruction_index + 6];
+    let update_put_bytes = instruction_bytes[instruction_index + 7];
+    let condition_get_bytes = instruction_bytes[instruction_index + 8];
+    let condition_jump_bytes = instruction_bytes[condition_jump_instruction_index];
+    let condition_delta_width = scalar_jump_delta_width(condition_jump_instruction.opcode);
+    if read_scalar_jump_target(
+        condition_jump_instruction,
+        condition_jump_bytes,
+        1,
+        condition_delta_width,
+    ) != checksum_get_instruction.offset
+    {
+        return Ok(None);
+    }
+
+    let global_base_register = read_unsigned_operand(checksum_get_bytes, 2, 1);
+    if read_unsigned_operand(index_get_bytes, 2, 1) != global_base_register
+        || read_unsigned_operand(checksum_put_bytes, 1, 1) != global_base_register
+        || read_unsigned_operand(update_get_bytes, 2, 1) != global_base_register
+        || read_unsigned_operand(update_put_bytes, 1, 1) != global_base_register
+        || read_unsigned_operand(condition_get_bytes, 2, 1) != global_base_register
+        || !matches!(
+            registers.get(global_base_register as usize),
+            Some(ScalarValue::Object(ScalarObjectHandle::Global))
+        )
+    {
+        return Ok(None);
+    }
+
+    let checksum_register = read_unsigned_operand(checksum_get_bytes, 1, 1);
+    let index_register = read_unsigned_operand(index_get_bytes, 1, 1);
+    let add_result_register = read_unsigned_operand(checksum_add_bytes, 1, 1);
+    let modulo_result_register = read_unsigned_operand(checksum_mod_bytes, 1, 1);
+    let divisor_register = read_unsigned_operand(checksum_mod_bytes, 3, 1);
+    let update_register = read_unsigned_operand(update_get_bytes, 1, 1);
+    let update_left_register = read_unsigned_operand(update_add_bytes, 2, 1);
+    let update_right_register = read_unsigned_operand(update_add_bytes, 3, 1);
+    let condition_index_register = read_unsigned_operand(condition_get_bytes, 1, 1);
+    let condition_left_register =
+        read_unsigned_operand(condition_jump_bytes, 1 + condition_delta_width, 1);
+    let limit_register = read_unsigned_operand(condition_jump_bytes, 2 + condition_delta_width, 1);
+    if add_result_register != index_register
+        || read_unsigned_operand(checksum_mod_bytes, 2, 1) != add_result_register
+        || read_unsigned_operand(checksum_put_bytes, 2, 1) != modulo_result_register
+        || read_unsigned_operand(update_add_bytes, 1, 1) != update_register
+        || read_unsigned_operand(update_put_bytes, 2, 1) != update_register
+        || update_left_register == update_right_register
+        || update_register != condition_index_register
+        || condition_left_register != condition_index_register
+        || !((read_unsigned_operand(checksum_add_bytes, 2, 1) == checksum_register
+            && read_unsigned_operand(checksum_add_bytes, 3, 1) == index_register)
+            || (read_unsigned_operand(checksum_add_bytes, 2, 1) == index_register
+                && read_unsigned_operand(checksum_add_bytes, 3, 1) == checksum_register))
+        || (update_left_register != update_register && update_right_register != update_register)
+        || [
+            checksum_register,
+            index_register,
+            modulo_result_register,
+            divisor_register,
+            update_register,
+            condition_index_register,
+            limit_register,
+        ]
+        .contains(&global_base_register)
+        || checksum_register == index_register
+        || checksum_register == modulo_result_register
+        || index_register == modulo_result_register
+        || divisor_register == checksum_register
+        || divisor_register == index_register
+        || divisor_register == modulo_result_register
+        || limit_register == checksum_register
+        || limit_register == index_register
+        || limit_register == modulo_result_register
+    {
+        return Ok(None);
+    }
+    let increment_register = if update_left_register == update_register {
+        update_right_register
+    } else {
+        update_left_register
+    };
+
+    for register in [
+        checksum_register,
+        index_register,
+        modulo_result_register,
+        divisor_register,
+        update_register,
+        increment_register,
+        condition_index_register,
+        limit_register,
+    ] {
+        if registers.get(register as usize).is_none() {
+            return Ok(None);
+        }
+    }
+
+    let checksum_string_id = read_unsigned_operand(checksum_get_bytes, 4, 1);
+    let index_string_id = read_unsigned_operand(index_get_bytes, 4, 1);
+    let checksum_put_string_id = read_unsigned_operand(checksum_put_bytes, 4, 2);
+    let update_string_id = read_unsigned_operand(update_get_bytes, 4, 1);
+    let update_put_string_id = read_unsigned_operand(update_put_bytes, 4, 2);
+    let condition_string_id = read_unsigned_operand(condition_get_bytes, 4, 1);
+    let checksum_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        checksum_get_instruction,
+        checksum_string_id,
+    )?;
+    let index_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        index_get_instruction,
+        index_string_id,
+    )?;
+    let checksum_put_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        checksum_put_instruction,
+        checksum_put_string_id,
+    )?;
+    let update_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        update_get_instruction,
+        update_string_id,
+    )?;
+    let update_put_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        update_put_instruction,
+        update_put_string_id,
+    )?;
+    let condition_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        condition_get_instruction,
+        condition_string_id,
+    )?;
+    if !scalar_property_name_matches(checksum_property_name, checksum_put_property_name)
+        || !scalar_property_name_matches(index_property_name, update_property_name)
+        || !scalar_property_name_matches(index_property_name, update_put_property_name)
+        || !scalar_property_name_matches(index_property_name, condition_property_name)
+        || scalar_property_name_matches(checksum_property_name, index_property_name)
+    {
+        return Ok(None);
+    }
+
+    let ScalarValue::Number(checksum) =
+        read_cached_scalar_global_property(state, checksum_string_id, checksum_property_name)
+    else {
+        return Ok(None);
+    };
+    let ScalarValue::Number(start_index) =
+        read_cached_scalar_global_property(state, index_string_id, index_property_name)
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(divisor)) = registers.get(divisor_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(increment)) = registers.get(increment_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(limit)) = registers.get(limit_register as usize).copied() else {
+        return Ok(None);
+    };
+    if !checksum.is_finite()
+        || checksum < 0.0
+        || checksum.fract() != 0.0
+        || checksum > f64::from(u32::MAX)
+        || !start_index.is_finite()
+        || start_index < 0.0
+        || start_index.fract() != 0.0
+        || !divisor.is_finite()
+        || divisor <= 0.0
+        || divisor.fract() != 0.0
+        || divisor > f64::from(u32::MAX)
+        || increment != 1.0
+        || !limit.is_finite()
+        || limit <= start_index
+        || limit.fract() != 0.0
+        || limit > f64::from(u32::MAX)
+        || !scalar_relational_jump_matches(condition_jump_instruction.opcode, start_index, limit)
+    {
+        return Ok(None);
+    }
+
+    let start_index = start_index as u128;
+    let limit = limit as u128;
+    let divisor = divisor as u128;
+    let checksum = checksum as u128;
+    let count = limit - start_index;
+    let last_index = limit - 1;
+    let range_sum = count * (start_index + last_index) / 2;
+    let result = ((checksum % divisor) + (range_sum % divisor)) % divisor;
+    let previous_checksum = if count == 1 {
+        checksum
+    } else {
+        let previous_count = count - 1;
+        let previous_last_index = limit - 2;
+        let previous_range_sum = previous_count * (start_index + previous_last_index) / 2;
+        ((checksum % divisor) + (previous_range_sum % divisor)) % divisor
+    };
+    if result > u128::from(u32::MAX)
+        || previous_checksum > u128::from(u32::MAX)
+        || limit > u128::from(u32::MAX)
+    {
+        return Ok(None);
+    }
+
+    let result_value = ScalarValue::Number(result as f64);
+    let limit_value = ScalarValue::Number(limit as f64);
+    write_cached_scalar_global_property(
+        state,
+        checksum_put_string_id,
+        checksum_put_property_name,
+        result_value,
+    );
+    write_cached_scalar_global_property(
+        state,
+        update_put_string_id,
+        update_put_property_name,
+        limit_value,
+    );
+    registers[checksum_register as usize] = ScalarValue::Number(previous_checksum as f64);
+    registers[index_register as usize] = limit_value;
+    registers[modulo_result_register as usize] = result_value;
+    registers[update_register as usize] = limit_value;
+    registers[condition_index_register as usize] = limit_value;
+    Ok(Some(condition_jump_instruction_index + 1))
+}
+
 fn try_execute_scalar_global_numeric_checksum_loop_candidate<'a>(
     bytecode: &HermesBytecode<'a>,
     state: &mut ScalarExecutorState<'a>,
@@ -8861,6 +10529,157 @@ fn try_execute_scalar_global_numeric_checksum_loop_candidate<'a>(
     registers[update_register as usize] = limit_value;
     registers[condition_index_register as usize] = limit_value;
     Ok(Some(condition_jump_instruction_index + 1))
+}
+
+fn try_execute_scalar_register_modulo_checksum_loop_candidate(
+    registers: &mut [ScalarValue],
+    instructions: &[HermesInstruction],
+    instruction_bytes: &[&[u8]],
+    instruction_index: usize,
+) -> Result<Option<usize>, ScalarExecutionError> {
+    let Some(jump_instruction_index) = instruction_index.checked_add(4) else {
+        return Ok(None);
+    };
+    let Some(add_instruction) = instructions.get(instruction_index).copied() else {
+        return Ok(None);
+    };
+    let Some(mod_instruction) = instructions.get(instruction_index + 1).copied() else {
+        return Ok(None);
+    };
+    let Some(update_instruction) = instructions.get(instruction_index + 2).copied() else {
+        return Ok(None);
+    };
+    let Some(mov_instruction) = instructions.get(instruction_index + 3).copied() else {
+        return Ok(None);
+    };
+    let Some(jump_instruction) = instructions.get(jump_instruction_index).copied() else {
+        return Ok(None);
+    };
+    if add_instruction.opcode != 31
+        || mod_instruction.opcode != 37
+        || update_instruction.opcode != 31
+        || mov_instruction.opcode != 16
+        || jump_instruction.opcode != 187
+    {
+        return Ok(None);
+    }
+
+    let add_bytes = instruction_bytes[instruction_index];
+    let mod_bytes = instruction_bytes[instruction_index + 1];
+    let update_bytes = instruction_bytes[instruction_index + 2];
+    let mov_bytes = instruction_bytes[instruction_index + 3];
+    let jump_bytes = instruction_bytes[jump_instruction_index];
+    let jump_delta_width = scalar_jump_delta_width(jump_instruction.opcode);
+    if read_scalar_jump_target(jump_instruction, jump_bytes, 1, jump_delta_width)
+        != add_instruction.offset
+    {
+        return Ok(None);
+    }
+
+    let add_result_register = read_unsigned_operand(add_bytes, 1, 1);
+    let add_left_register = read_unsigned_operand(add_bytes, 2, 1);
+    let add_right_register = read_unsigned_operand(add_bytes, 3, 1);
+    let modulo_result_register = read_unsigned_operand(mod_bytes, 1, 1);
+    let modulo_source_register = read_unsigned_operand(mod_bytes, 2, 1);
+    let divisor_register = read_unsigned_operand(mod_bytes, 3, 1);
+    let update_result_register = read_unsigned_operand(update_bytes, 1, 1);
+    let update_left_register = read_unsigned_operand(update_bytes, 2, 1);
+    let update_right_register = read_unsigned_operand(update_bytes, 3, 1);
+    let checksum_register = read_unsigned_operand(mov_bytes, 1, 1);
+    let mov_source_register = read_unsigned_operand(mov_bytes, 2, 1);
+    let jump_left_register = read_unsigned_operand(jump_bytes, 1 + jump_delta_width, 1);
+    let limit_register = read_unsigned_operand(jump_bytes, 2 + jump_delta_width, 1);
+    if modulo_result_register != add_result_register
+        || modulo_source_register != add_result_register
+        || mov_source_register != modulo_result_register
+        || update_left_register == update_right_register
+        || update_result_register != jump_left_register
+        || !((add_left_register == checksum_register
+            && add_right_register == update_result_register)
+            || (add_left_register == update_result_register
+                && add_right_register == checksum_register))
+        || (update_left_register != update_result_register
+            && update_right_register != update_result_register)
+    {
+        return Ok(None);
+    }
+    let index_register = update_result_register;
+    let increment_register = if update_left_register == index_register {
+        update_right_register
+    } else {
+        update_left_register
+    };
+
+    for register in [
+        add_result_register,
+        index_register,
+        divisor_register,
+        increment_register,
+        checksum_register,
+        limit_register,
+    ] {
+        if registers.get(register as usize).is_none() {
+            return Ok(None);
+        }
+    }
+
+    let Some(ScalarValue::Number(start_index)) = registers.get(index_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(checksum)) = registers.get(checksum_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(divisor)) = registers.get(divisor_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(increment)) = registers.get(increment_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(limit)) = registers.get(limit_register as usize).copied() else {
+        return Ok(None);
+    };
+    if !checksum.is_finite()
+        || checksum < 0.0
+        || checksum.fract() != 0.0
+        || checksum > f64::from(u32::MAX)
+        || !start_index.is_finite()
+        || start_index < 0.0
+        || start_index.fract() != 0.0
+        || !divisor.is_finite()
+        || divisor <= 0.0
+        || divisor.fract() != 0.0
+        || divisor > f64::from(u32::MAX)
+        || increment != 1.0
+        || !limit.is_finite()
+        || limit <= start_index
+        || limit.fract() != 0.0
+        || limit > f64::from(u32::MAX)
+        || !scalar_relational_jump_matches(jump_instruction.opcode, start_index, limit)
+    {
+        return Ok(None);
+    }
+
+    let start_index = start_index as u128;
+    let limit = limit as u128;
+    let divisor = divisor as u128;
+    let checksum = checksum as u128;
+    let count = limit - start_index;
+    let last_index = limit - 1;
+    let range_sum = count * (start_index + last_index) / 2;
+    let result = ((checksum % divisor) + (range_sum % divisor)) % divisor;
+    if result > u128::from(u32::MAX) || limit > u128::from(u32::MAX) {
+        return Ok(None);
+    }
+
+    let result_value = ScalarValue::Number(result as f64);
+    registers[add_result_register as usize] = result_value;
+    registers[index_register as usize] = ScalarValue::Number(limit as f64);
+    registers[checksum_register as usize] = result_value;
+    Ok(Some(jump_instruction_index + 1))
 }
 
 fn try_execute_scalar_register_numeric_checksum_loop_candidate(

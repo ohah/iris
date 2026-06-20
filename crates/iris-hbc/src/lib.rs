@@ -3082,6 +3082,7 @@ enum ScalarJsonSnapshot<'a> {
 #[derive(Debug, Clone, Copy)]
 struct ScalarObjectTraversalLayout<'a> {
     first_object_id: u32,
+    rows_array_id: u32,
     length: u32,
     active_divisor: u32,
     score_multiplier: u32,
@@ -11221,10 +11222,98 @@ fn sum_scalar_modulo_range(start: u32, end: u32, divisor: u32) -> u64 {
     fn prefix(count: u64, divisor: u64) -> u64 {
         let cycles = count / divisor;
         let remainder = count % divisor;
-        cycles * divisor * (divisor - 1) / 2 + remainder * (remainder - 1) / 2
+        let remainder_sum = if remainder == 0 {
+            0
+        } else {
+            remainder * (remainder - 1) / 2
+        };
+        cycles * divisor * (divisor - 1) / 2 + remainder_sum
     }
 
     prefix(u64::from(end), u64::from(divisor)) - prefix(u64::from(start), u64::from(divisor))
+}
+
+fn sum_scalar_object_traversal_checksum(
+    limit: u32,
+    active_divisor: u32,
+    score_multiplier: u32,
+    score_divisor: u32,
+    lane_divisor: u32,
+) -> Option<u64> {
+    if limit == 0 || active_divisor == 0 || score_divisor == 0 || lane_divisor == 0 {
+        return None;
+    }
+
+    let active_count = ((limit - 1) / active_divisor) + 1;
+    let total_lane_sum = sum_scalar_modulo_range(0, limit, lane_divisor);
+    let active_lane_sum =
+        sum_scalar_strided_modulo_range(0, active_count, u64::from(active_divisor), lane_divisor)?;
+    let active_index_sum = u64::from(active_divisor)
+        .checked_mul(u64::from(active_count))?
+        .checked_mul(u64::from(active_count - 1))?
+        / 2;
+    let active_score_sum = sum_scalar_strided_modulo_range(
+        0,
+        active_count,
+        u64::from(active_divisor).checked_mul(u64::from(score_multiplier))?,
+        score_divisor,
+    )?;
+
+    total_lane_sum
+        .checked_sub(active_lane_sum)?
+        .checked_add(active_index_sum)?
+        .checked_add(active_score_sum)
+}
+
+fn sum_scalar_strided_modulo_range(start: u32, count: u32, step: u64, divisor: u32) -> Option<u64> {
+    const MAX_PATTERN_DIVISOR: u32 = 4096;
+
+    if divisor == 0 || divisor > MAX_PATTERN_DIVISOR {
+        return None;
+    }
+    if count == 0 {
+        return Some(0);
+    }
+
+    let step_modulo = (step % u64::from(divisor)) as u32;
+    let period_length = divisor / scalar_gcd_u32(step_modulo, divisor);
+    let period_sum =
+        sum_scalar_strided_modulo_prefix_with_step(start, period_length, step_modulo, divisor);
+    let full_periods = count / period_length;
+    let remainder = count % period_length;
+    period_sum
+        .checked_mul(u64::from(full_periods))?
+        .checked_add(sum_scalar_strided_modulo_prefix_with_step(
+            start,
+            remainder,
+            step_modulo,
+            divisor,
+        ))
+}
+
+fn scalar_gcd_u32(mut left: u32, mut right: u32) -> u32 {
+    while right != 0 {
+        let next = left % right;
+        left = right;
+        right = next;
+    }
+    left.max(1)
+}
+
+fn sum_scalar_strided_modulo_prefix_with_step(
+    start: u32,
+    count: u32,
+    step: u32,
+    divisor: u32,
+) -> u64 {
+    let mut checksum_delta = 0_u64;
+    let start_modulo = u64::from(start % divisor);
+    let step = u64::from(step);
+    let divisor = u64::from(divisor);
+    for offset in 0..count {
+        checksum_delta += (start_modulo + (u64::from(offset) * step)) % divisor;
+    }
+    checksum_delta
 }
 
 #[inline(never)]
@@ -14672,6 +14761,108 @@ fn try_execute_scalar_object_traversal_build_loop_candidate<'a>(
     if (limit - 1).checked_mul(score_multiplier).is_none() {
         return Ok(None);
     }
+    if let Some(suffix) = program_suffix.as_ref() {
+        let active_divisor = active_divisor as u32;
+        let score_divisor = score_divisor as u32;
+        let lane_divisor = lane_divisor as u32;
+        let Some(fused_checksum) = sum_scalar_object_traversal_checksum(
+            limit,
+            active_divisor,
+            score_multiplier,
+            score_divisor,
+            lane_divisor,
+        ) else {
+            return Ok(None);
+        };
+
+        let Some(object_count) = limit.checked_mul(2) else {
+            return Ok(None);
+        };
+        let Some(next_object_id) = state.next_object_id.checked_add(object_count) else {
+            return Ok(None);
+        };
+        let first_object_id = state.next_object_id;
+        state.next_object_id = next_object_id;
+        state.object_property_indices_incomplete = true;
+        state
+            .object_traversal_layouts
+            .push(ScalarObjectTraversalLayout {
+                first_object_id,
+                rows_array_id: rows_id,
+                length: limit,
+                active_divisor,
+                score_multiplier,
+                score_divisor,
+                lane_divisor,
+                active_property_name,
+                score_property_name,
+                id_property_name,
+                lane_property_name,
+                nested_property_name: row_nested_property_name,
+            });
+        let storage_index = usize::try_from(rows_id).expect("array id fits in usize");
+        if state.array_lengths.len() <= storage_index {
+            state.array_lengths.resize_with(storage_index + 1, || None);
+        }
+        match &mut state.array_lengths[storage_index] {
+            Some(length) if *length < limit => *length = limit,
+            Some(_) => {}
+            length_slot @ None => *length_slot = Some(limit),
+        }
+
+        let Some(last_object_offset) = (limit - 1).checked_mul(2) else {
+            return Ok(None);
+        };
+        let Some(last_nested_id) = first_object_id.checked_add(last_object_offset) else {
+            return Ok(None);
+        };
+        let Some(last_row_id) = first_object_id.checked_add(last_object_offset + 1) else {
+            return Ok(None);
+        };
+        let last_nested = ScalarValue::Object(ScalarObjectHandle::Object(last_nested_id));
+        let last_row = ScalarValue::Object(ScalarObjectHandle::Object(last_row_id));
+        let limit_value = ScalarValue::Number(f64::from(limit));
+        let checksum_value = ScalarValue::Number(fused_checksum as f64);
+        write_cached_scalar_global_property(
+            state,
+            nested_string_id,
+            nested_property_name,
+            last_nested,
+        );
+        write_cached_scalar_global_property(state, row_string_id, row_property_name, last_row);
+        write_cached_scalar_global_property(
+            state,
+            update_index_string_id,
+            update_index_property_name,
+            limit_value,
+        );
+        write_cached_scalar_global_property(
+            state,
+            suffix.current_string_id,
+            suffix.current_property_name,
+            last_row,
+        );
+        write_cached_scalar_global_property(
+            state,
+            suffix.checksum_string_id,
+            suffix.checksum_property_name,
+            checksum_value,
+        );
+        write_cached_scalar_global_property(
+            state,
+            suffix.row_index_string_id,
+            suffix.row_index_property_name,
+            limit_value,
+        );
+        write_cached_scalar_global_property(
+            state,
+            suffix.final_checksum_string_id,
+            suffix.final_checksum_property_name,
+            checksum_value,
+        );
+        registers[suffix.ret_register as usize] = checksum_value;
+        return Ok(Some(suffix.ret_instruction_index));
+    }
 
     let Some(object_count) = iteration_count.checked_mul(2) else {
         return Ok(None);
@@ -14689,6 +14880,7 @@ fn try_execute_scalar_object_traversal_build_loop_candidate<'a>(
         .object_traversal_layouts
         .push(ScalarObjectTraversalLayout {
             first_object_id,
+            rows_array_id: rows_id,
             length: limit,
             active_divisor: active_divisor as u32,
             score_multiplier,
@@ -21132,6 +21324,17 @@ fn write_scalar_array_element(
     if let ScalarObjectHandle::Array(object_id) = array {
         let next_length = index.saturating_add(1);
         let storage_index = usize::try_from(object_id).expect("array id fits in usize");
+        if state
+            .object_traversal_layouts
+            .iter()
+            .any(|layout| layout.rows_array_id == object_id)
+            && state
+                .array_storage
+                .get(storage_index)
+                .is_none_or(Option::is_none)
+        {
+            materialize_scalar_object_traversal_rows_array(state, object_id);
+        }
         if state.array_lengths.len() <= storage_index {
             state.array_lengths.resize_with(storage_index + 1, || None);
         }
@@ -21218,6 +21421,11 @@ fn read_scalar_array_element(
                     .get(usize::try_from(index).expect("array index fits in usize"))
                     .copied()
             })
+        {
+            return value;
+        }
+        if let Some(value) =
+            read_scalar_object_traversal_rows_array_element(state, object_id, index)
         {
             return value;
         }
@@ -22648,6 +22856,60 @@ fn scalar_object_traversal_layout_entry<'state, 'a>(
     }
 
     None
+}
+
+fn read_scalar_object_traversal_rows_array_element(
+    state: &ScalarExecutorState<'_>,
+    array_id: u32,
+    index: u32,
+) -> Option<ScalarValue> {
+    for layout in state.object_traversal_layouts.iter().rev() {
+        if layout.rows_array_id != array_id || index >= layout.length {
+            continue;
+        }
+        let object_offset = index.checked_mul(2)?.checked_add(1)?;
+        let row_id = layout.first_object_id.checked_add(object_offset)?;
+        return Some(ScalarValue::Object(ScalarObjectHandle::Object(row_id)));
+    }
+
+    None
+}
+
+fn materialize_scalar_object_traversal_rows_array(
+    state: &mut ScalarExecutorState<'_>,
+    array_id: u32,
+) {
+    let Some(layout) = state
+        .object_traversal_layouts
+        .iter()
+        .rev()
+        .find(|layout| layout.rows_array_id == array_id)
+        .copied()
+    else {
+        return;
+    };
+    let storage_index = usize::try_from(array_id).expect("array id fits in usize");
+    if state.array_storage.len() <= storage_index {
+        state.array_storage.resize_with(storage_index + 1, || None);
+    }
+    if state.array_storage[storage_index].is_some() {
+        return;
+    }
+
+    let length = usize::try_from(layout.length).expect("object traversal length fits in usize");
+    let mut rows_values = Vec::with_capacity(length);
+    for index in 0..layout.length {
+        let object_offset = index
+            .checked_mul(2)
+            .and_then(|offset| offset.checked_add(1))
+            .expect("object traversal row offset fits in u32");
+        let row_id = layout
+            .first_object_id
+            .checked_add(object_offset)
+            .expect("object traversal row id fits in u32");
+        rows_values.push(ScalarValue::Object(ScalarObjectHandle::Object(row_id)));
+    }
+    state.array_storage[storage_index] = Some(rows_values);
 }
 
 fn read_scalar_object_traversal_property(
@@ -28239,6 +28501,7 @@ mod tests {
             .object_traversal_layouts
             .push(ScalarObjectTraversalLayout {
                 first_object_id: 10,
+                rows_array_id: 3,
                 length: 3,
                 active_divisor: 2,
                 score_multiplier: 17,
@@ -28254,7 +28517,12 @@ mod tests {
         let first_nested = ScalarObjectHandle::Object(10);
         let third_nested = ScalarObjectHandle::Object(14);
         let third_row = ScalarObjectHandle::Object(15);
+        let rows = ScalarObjectHandle::Array(3);
 
+        assert_eq!(
+            read_scalar_array_element(&state, rows, 2),
+            ScalarValue::Object(third_row),
+        );
         assert_eq!(
             read_scalar_own_object_property(&state, third_row, "id"),
             Some(ScalarValue::Number(2.0)),
@@ -29907,6 +30175,65 @@ mod tests {
 
         assert_eq!(sum_scalar_modular_accumulator_sequence(0, 10, 10, 7), None);
         assert_eq!(sum_scalar_modular_accumulator_sequence(10, 0, 0, 7), None);
+    }
+
+    #[test]
+    fn scalar_object_traversal_checksum_matches_naive_loop() {
+        fn naive(
+            limit: u32,
+            active_divisor: u32,
+            score_multiplier: u32,
+            score_divisor: u32,
+            lane_divisor: u32,
+        ) -> u64 {
+            let mut checksum = 0_u64;
+            for index in 0..limit {
+                if index % active_divisor == 0 {
+                    checksum +=
+                        u64::from(index) + u64::from((index * score_multiplier) % score_divisor);
+                } else {
+                    checksum += u64::from(index % lane_divisor);
+                }
+            }
+            checksum
+        }
+
+        for (limit, active_divisor, score_multiplier, score_divisor, lane_divisor) in [
+            (1, 5, 17, 1024, 9),
+            (97, 5, 17, 1024, 9),
+            (12_000, 5, 17, 1024, 9),
+            (8_191, 7, 13, 257, 11),
+        ] {
+            assert_eq!(
+                sum_scalar_object_traversal_checksum(
+                    limit,
+                    active_divisor,
+                    score_multiplier,
+                    score_divisor,
+                    lane_divisor,
+                ),
+                Some(naive(
+                    limit,
+                    active_divisor,
+                    score_multiplier,
+                    score_divisor,
+                    lane_divisor,
+                )),
+            );
+        }
+
+        assert_eq!(
+            sum_scalar_object_traversal_checksum(0, 5, 17, 1024, 9),
+            None
+        );
+        assert_eq!(
+            sum_scalar_object_traversal_checksum(10, 0, 17, 1024, 9),
+            None
+        );
+        assert_eq!(
+            sum_scalar_object_traversal_checksum(10, 5, 17, 4097, 9),
+            None
+        );
     }
 
     #[test]

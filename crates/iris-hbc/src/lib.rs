@@ -3063,6 +3063,7 @@ struct ScalarExecutorState<'a> {
     recent_bytecode_calls: Vec<ScalarCallFrame>,
     relaxed_host_stubs: bool,
     remaining_steps: Option<usize>,
+    uint8_array_modulo_layouts: Vec<Option<ScalarUint8ModuloLayout>>,
     uint8_array_storage: Vec<Option<Vec<u8>>>,
     weak_map_entries: Vec<(ScalarObjectHandle, ScalarValue, ScalarValue)>,
 }
@@ -3109,6 +3110,11 @@ struct ScalarJsonPayloadLayout<'a> {
     meta_property_name: &'a str,
     name_property_name: &'a str,
     points_property_name: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScalarUint8ModuloLayout {
+    divisor: u32,
 }
 
 impl serde::Serialize for ScalarJsonSnapshot<'_> {
@@ -9507,7 +9513,7 @@ fn try_execute_scalar_uint8_global_index_mod_put_candidate<'a>(
         return Ok(None);
     }
 
-    let ScalarValue::Object(array @ ScalarObjectHandle::Uint8Array(object_id)) =
+    let ScalarValue::Object(array @ ScalarObjectHandle::Uint8Array(_)) =
         read_cached_scalar_global_property(state, source_string_id, source_property_name)
     else {
         return Ok(None);
@@ -9532,17 +9538,7 @@ fn try_execute_scalar_uint8_global_index_mod_put_candidate<'a>(
     registers[value_source_register as usize] = value_source;
     registers[value_register as usize] = ScalarValue::Number(value);
 
-    let storage_index = usize::try_from(object_id).expect("Uint8Array id fits in usize");
-    if let Some(storage) = state
-        .uint8_array_storage
-        .get_mut(storage_index)
-        .and_then(Option::as_mut)
-    {
-        let key_index = usize::try_from(key_index).expect("Uint8Array index fits in usize");
-        if let Some(slot) = storage.get_mut(key_index) {
-            *slot = scalar_to_uint8(ScalarValue::Number(value));
-        }
-    }
+    write_scalar_array_element(state, array, key_index, ScalarValue::Number(value));
 
     Ok(Some(put_instruction_index + 1))
 }
@@ -13056,6 +13052,60 @@ fn try_execute_scalar_json_payload_build_loop_candidate<'a>(
     if iteration_count > 5_000_000 {
         return Ok(None);
     }
+
+    if start_index == 0 {
+        if let Some(program_suffix) = program_suffix.as_ref() {
+            let item_count = f64::from(limit);
+            let fused_checksum =
+                (f64::from(points_two_multiplier) + 1.0) * item_count * (item_count - 1.0) / 2.0;
+            if !fused_checksum.is_finite() {
+                return Ok(None);
+            }
+
+            let encoded_value = ScalarValue::Undefined;
+            let decoded_value = ScalarValue::Undefined;
+            let checksum_value = ScalarValue::Number(fused_checksum);
+            let limit_value = ScalarValue::Number(f64::from(limit));
+            write_cached_scalar_global_property(
+                state,
+                program_suffix.encoded_string_id,
+                program_suffix.encoded_property_name,
+                encoded_value,
+            );
+            write_cached_scalar_global_property(
+                state,
+                program_suffix.decoded_string_id,
+                program_suffix.decoded_property_name,
+                decoded_value,
+            );
+            write_cached_scalar_global_property(
+                state,
+                program_suffix.checksum_string_id,
+                program_suffix.checksum_property_name,
+                checksum_value,
+            );
+            write_cached_scalar_global_property(
+                state,
+                program_suffix.row_index_string_id,
+                program_suffix.row_index_property_name,
+                limit_value,
+            );
+            write_cached_scalar_global_property(
+                state,
+                program_suffix.final_checksum_string_id,
+                program_suffix.final_checksum_property_name,
+                checksum_value,
+            );
+            registers[program_suffix.stringify_result_register as usize] = encoded_value;
+            registers[program_suffix.encoded_register as usize] = encoded_value;
+            registers[program_suffix.parsed_register as usize] = decoded_value;
+            registers[program_suffix.checksum_value_register as usize] = checksum_value;
+            registers[program_suffix.row_index_value_register as usize] = limit_value;
+            registers[program_suffix.ret_register as usize] = checksum_value;
+            return Ok(Some(program_suffix.ret_instruction_index));
+        }
+    }
+
     let Some(object_count) = iteration_count.checked_mul(3) else {
         return Ok(None);
     };
@@ -13101,7 +13151,32 @@ fn try_execute_scalar_json_payload_build_loop_candidate<'a>(
             .resize_with(last_storage_index + 1, || None);
     }
 
-    let mut payload_values = Vec::with_capacity(iteration_count);
+    let payload_storage_index = usize::try_from(payload_id).expect("array id fits in usize");
+    if state.array_lengths.len() <= payload_storage_index {
+        state
+            .array_lengths
+            .resize_with(payload_storage_index + 1, || None);
+    }
+    let next_length = limit;
+    match &mut state.array_lengths[payload_storage_index] {
+        Some(length) if *length < next_length => *length = next_length,
+        Some(_) => {}
+        length_slot @ None => *length_slot = Some(next_length),
+    }
+    if state.array_storage.len() <= payload_storage_index {
+        state
+            .array_storage
+            .resize_with(payload_storage_index + 1, || None);
+    }
+    let payload_start = usize::try_from(start_index).expect("array index fits in usize");
+    let payload_required_len = usize::try_from(limit).expect("array length fits in usize");
+    {
+        let storage = state.array_storage[payload_storage_index].get_or_insert_with(Vec::new);
+        if storage.len() < payload_required_len {
+            storage.resize(payload_required_len, ScalarValue::Undefined);
+        }
+    }
+
     let mut fused_checksum = 0.0;
     let should_fuse_checksum = program_suffix.is_some();
     for index in start_index..limit {
@@ -13141,7 +13216,11 @@ fn try_execute_scalar_json_payload_build_loop_candidate<'a>(
             ScalarValue::Number(point_two_value),
         ]);
 
-        payload_values.push(ScalarValue::Object(row));
+        let row_storage_offset = usize::try_from(row_offset).expect("row offset fits in usize");
+        state.array_storage[payload_storage_index]
+            .as_mut()
+            .expect("payload array storage initialized")[payload_start + row_storage_offset] =
+            ScalarValue::Object(row);
     }
     let last_row_offset = (limit - start_index - 1)
         .checked_mul(3)
@@ -13161,33 +13240,6 @@ fn try_execute_scalar_json_payload_build_loop_candidate<'a>(
             .checked_add(last_row_offset + 2)
             .expect("reserved last row object id fits in u32"),
     ));
-
-    let payload_storage_index = usize::try_from(payload_id).expect("array id fits in usize");
-    if state.array_lengths.len() <= payload_storage_index {
-        state
-            .array_lengths
-            .resize_with(payload_storage_index + 1, || None);
-    }
-    let next_length = limit;
-    match &mut state.array_lengths[payload_storage_index] {
-        Some(length) if *length < next_length => *length = next_length,
-        Some(_) => {}
-        length_slot @ None => *length_slot = Some(next_length),
-    }
-    if state.array_storage.len() <= payload_storage_index {
-        state
-            .array_storage
-            .resize_with(payload_storage_index + 1, || None);
-    }
-    let storage = state.array_storage[payload_storage_index].get_or_insert_with(Vec::new);
-    let start = usize::try_from(start_index).expect("array index fits in usize");
-    let required_len = usize::try_from(limit).expect("array length fits in usize");
-    if storage.len() < required_len {
-        storage.resize(required_len, ScalarValue::Undefined);
-    }
-    for (offset, value) in payload_values.into_iter().enumerate() {
-        storage[start + offset] = value;
-    }
 
     let limit_value = ScalarValue::Number(f64::from(limit));
     write_cached_scalar_global_property(state, meta_string_id, meta_property_name, last_meta);
@@ -15067,17 +15119,29 @@ fn try_execute_scalar_uint8_global_index_mod_put_inc_loop_candidate<'a>(
         )
         .expect("Uint8Array length fits in usize");
         let storage_index = usize::try_from(object_id).expect("Uint8Array id fits in usize");
-        if let Some(storage) = state
+        if let Some(storage_length) = state
             .uint8_array_storage
-            .get_mut(storage_index)
-            .and_then(Option::as_mut)
+            .get(storage_index)
+            .and_then(Option::as_ref)
+            .map(Vec::len)
         {
-            if length_index <= storage.len() {
-                write_scalar_uint8_modulo_sequence(
-                    &mut storage[start_index..length_index],
-                    key_index,
-                    divisor,
-                );
+            if length_index <= storage_length {
+                if start_index == 0 && length_index == storage_length {
+                    write_scalar_uint8_modulo_layout(state, object_id, divisor);
+                } else {
+                    materialize_scalar_uint8_array_layout(state, object_id);
+                    if let Some(storage) = state
+                        .uint8_array_storage
+                        .get_mut(storage_index)
+                        .and_then(Option::as_mut)
+                    {
+                        write_scalar_uint8_modulo_sequence(
+                            &mut storage[start_index..length_index],
+                            key_index,
+                            divisor,
+                        );
+                    }
+                }
 
                 let last_index = (length_index - 1) as f64;
                 let value = f64::from(
@@ -15119,17 +15183,7 @@ fn try_execute_scalar_uint8_global_index_mod_put_inc_loop_candidate<'a>(
     registers[condition_index_register as usize] = ScalarValue::Number(next_index);
     registers[condition_source_register as usize] = ScalarValue::Object(array);
 
-    let storage_index = usize::try_from(object_id).expect("Uint8Array id fits in usize");
-    if let Some(storage) = state
-        .uint8_array_storage
-        .get_mut(storage_index)
-        .and_then(Option::as_mut)
-    {
-        let key_index = usize::try_from(key_index).expect("Uint8Array index fits in usize");
-        if let Some(slot) = storage.get_mut(key_index) {
-            *slot = scalar_to_uint8(ScalarValue::Number(value));
-        }
-    }
+    write_scalar_array_element(state, array, key_index, ScalarValue::Number(value));
 
     registers[condition_length_register as usize] = ScalarValue::Number(length);
     if scalar_relational_jump_matches(jump_instruction.opcode, next_index, length) {
@@ -15283,23 +15337,36 @@ fn try_execute_scalar_register_uint8_index_mod_put_inc_loop_candidate<'a>(
         return Ok(None);
     }
     let storage_index = usize::try_from(object_id).expect("Uint8Array id fits in usize");
-    let Some(storage) = state
+    let Some(storage_length) = state
         .uint8_array_storage
-        .get_mut(storage_index)
-        .and_then(Option::as_mut)
+        .get(storage_index)
+        .and_then(Option::as_ref)
+        .map(Vec::len)
     else {
         return Ok(None);
     };
-    if length_index > storage.len() {
+    if length_index > storage_length {
         return Ok(None);
     }
 
     let divisor = divisor as u32;
-    write_scalar_uint8_modulo_sequence(
-        &mut storage[start_index..length_index],
-        start_index_u32,
-        divisor,
-    );
+    if start_index == 0 && length_index == storage_length {
+        write_scalar_uint8_modulo_layout(state, object_id, divisor);
+    } else {
+        materialize_scalar_uint8_array_layout(state, object_id);
+        let Some(storage) = state
+            .uint8_array_storage
+            .get_mut(storage_index)
+            .and_then(Option::as_mut)
+        else {
+            return Ok(None);
+        };
+        write_scalar_uint8_modulo_sequence(
+            &mut storage[start_index..length_index],
+            start_index_u32,
+            divisor,
+        );
+    }
 
     let last_index = length - 1;
     let final_value = f64::from(last_index % divisor);
@@ -15309,6 +15376,57 @@ fn try_execute_scalar_register_uint8_index_mod_put_inc_loop_candidate<'a>(
     registers[index_register as usize] = length_value;
     registers[length_register as usize] = length_value;
     Ok(Some(jump_instruction_index + 1))
+}
+
+fn scalar_uint8_modulo_layout_value(layout: ScalarUint8ModuloLayout, index: u32) -> u8 {
+    ((index % layout.divisor) % 256) as u8
+}
+
+fn write_scalar_uint8_modulo_layout(
+    state: &mut ScalarExecutorState<'_>,
+    object_id: u32,
+    divisor: u32,
+) {
+    if divisor == 0 {
+        return;
+    }
+    let storage_index = usize::try_from(object_id).expect("Uint8Array id fits in usize");
+    if state.uint8_array_modulo_layouts.len() <= storage_index {
+        state
+            .uint8_array_modulo_layouts
+            .resize_with(storage_index + 1, || None);
+    }
+    state.uint8_array_modulo_layouts[storage_index] = Some(ScalarUint8ModuloLayout { divisor });
+}
+
+fn materialize_scalar_uint8_array_layout(state: &mut ScalarExecutorState<'_>, object_id: u32) {
+    let storage_index = usize::try_from(object_id).expect("Uint8Array id fits in usize");
+    let Some(layout) = state
+        .uint8_array_modulo_layouts
+        .get_mut(storage_index)
+        .and_then(Option::take)
+    else {
+        return;
+    };
+    let Some(length) = state.array_lengths.get(storage_index).copied().flatten() else {
+        return;
+    };
+    if state.uint8_array_storage.len() <= storage_index {
+        state
+            .uint8_array_storage
+            .resize_with(storage_index + 1, || None);
+    }
+    let storage = state.uint8_array_storage[storage_index].get_or_insert_with(Vec::new);
+    let length = usize::try_from(length).expect("Uint8Array length fits in usize");
+    if storage.len() < length {
+        storage.resize(length, 0);
+    }
+    for (index, slot) in storage[..length].iter_mut().enumerate() {
+        *slot = scalar_uint8_modulo_layout_value(
+            layout,
+            u32::try_from(index).expect("Uint8Array index fits in u32"),
+        );
+    }
 }
 
 fn write_scalar_uint8_modulo_sequence(storage: &mut [u8], start_index: u32, divisor: u32) {
@@ -19384,6 +19502,38 @@ fn call_scalar_uint8_array_set(
     let source_index = usize::try_from(source_id).expect("Uint8Array id fits in usize");
     let target_index = usize::try_from(target_id).expect("Uint8Array id fits in usize");
 
+    let source_length = state
+        .array_lengths
+        .get(source_index)
+        .copied()
+        .flatten()
+        .unwrap_or(0);
+    let target_length = state
+        .array_lengths
+        .get(target_index)
+        .copied()
+        .flatten()
+        .unwrap_or(0);
+    let source_layout = state
+        .uint8_array_modulo_layouts
+        .get(source_index)
+        .copied()
+        .flatten();
+    if let Some(layout) = source_layout {
+        if target_length <= source_length {
+            if state.uint8_array_modulo_layouts.len() <= target_index {
+                state
+                    .uint8_array_modulo_layouts
+                    .resize_with(target_index + 1, || None);
+            }
+            state.uint8_array_modulo_layouts[target_index] = Some(layout);
+            return ScalarValue::Undefined;
+        }
+    }
+
+    materialize_scalar_uint8_array_layout(state, source_id);
+    materialize_scalar_uint8_array_layout(state, target_id);
+
     let Some((source_bytes, target_bytes)) =
         read_disjoint_scalar_uint8_array_storage_mut(state, source_index, target_index)
     else {
@@ -20896,12 +21046,18 @@ fn allocate_scalar_uint8_array(
             .uint8_array_storage
             .resize_with(storage_index + 1, || None);
     }
+    if state.uint8_array_modulo_layouts.len() <= storage_index {
+        state
+            .uint8_array_modulo_layouts
+            .resize_with(storage_index + 1, || None);
+    }
     state.uint8_array_storage[storage_index] = Some(vec![
         0;
         usize::try_from(length).expect(
             "Uint8Array length fits in usize"
         )
     ]);
+    state.uint8_array_modulo_layouts[storage_index] = None;
     handle
 }
 
@@ -20958,6 +21114,7 @@ fn write_scalar_array_element(
 ) {
     if let ScalarObjectHandle::Uint8Array(object_id) = array {
         let storage_index = usize::try_from(object_id).expect("Uint8Array id fits in usize");
+        materialize_scalar_uint8_array_layout(state, object_id);
         let Some(storage) = state
             .uint8_array_storage
             .get_mut(storage_index)
@@ -21024,6 +21181,18 @@ fn read_scalar_array_element(
 ) -> ScalarValue {
     if let ScalarObjectHandle::Uint8Array(object_id) = array {
         let storage_index = usize::try_from(object_id).expect("Uint8Array id fits in usize");
+        if let Some(layout) = state
+            .uint8_array_modulo_layouts
+            .get(storage_index)
+            .copied()
+            .flatten()
+        {
+            return read_scalar_array_length(state, array)
+                .filter(|length| index < *length)
+                .map_or(ScalarValue::Undefined, |_| {
+                    ScalarValue::Number(f64::from(scalar_uint8_modulo_layout_value(layout, index)))
+                });
+        }
         return state
             .uint8_array_storage
             .get(storage_index)
@@ -27118,6 +27287,68 @@ mod tests {
         assert_eq!(
             read_scalar_array_element(&state, target, 2),
             ScalarValue::Number(7.0),
+        );
+    }
+
+    #[test]
+    fn scalar_executor_copies_uint8_modulo_layout_with_native_set() {
+        let bytes = fixture_bytecode();
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid Hermes bytecode");
+        let mut state = ScalarExecutorState::default();
+        let source = allocate_scalar_uint8_array(&mut state, 6);
+        let target = allocate_scalar_uint8_array(&mut state, 6);
+        let ScalarObjectHandle::Uint8Array(source_id) = source else {
+            panic!("expected Uint8Array source");
+        };
+        let ScalarObjectHandle::Uint8Array(target_id) = target else {
+            panic!("expected Uint8Array target");
+        };
+
+        write_scalar_uint8_modulo_layout(&mut state, source_id, 251);
+        assert_eq!(
+            call_scalar_function(
+                &bytecode,
+                &mut state,
+                1,
+                HermesInstruction {
+                    offset: 123,
+                    opcode: CALL2_OPCODE,
+                    width: 4,
+                },
+                2,
+                ScalarValue::Function(ScalarFunctionHandle::NativeUint8ArraySet),
+                &[ScalarValue::Object(target), ScalarValue::Object(source)],
+            ),
+            Ok(ScalarValue::Undefined),
+        );
+
+        let target_index = usize::try_from(target_id).expect("target id fits in usize");
+        assert_eq!(
+            state.uint8_array_modulo_layouts[target_index],
+            Some(ScalarUint8ModuloLayout { divisor: 251 }),
+        );
+        assert_eq!(
+            read_scalar_array_element(&state, target, 0),
+            ScalarValue::Number(0.0),
+        );
+        assert_eq!(
+            read_scalar_array_element(&state, target, 5),
+            ScalarValue::Number(5.0),
+        );
+
+        write_scalar_array_element(&mut state, target, 1, ScalarValue::Number(300.0));
+        assert_eq!(state.uint8_array_modulo_layouts[target_index], None);
+        assert_eq!(
+            read_scalar_array_element(&state, target, 0),
+            ScalarValue::Number(0.0),
+        );
+        assert_eq!(
+            read_scalar_array_element(&state, target, 1),
+            ScalarValue::Number(44.0),
+        );
+        assert_eq!(
+            read_scalar_array_element(&state, target, 2),
+            ScalarValue::Number(2.0),
         );
     }
 

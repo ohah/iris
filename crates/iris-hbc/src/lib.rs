@@ -2864,10 +2864,37 @@ pub fn benchmark_global_scalar_function_with_inner_iterations(
     measured_iterations: u32,
     sample_inner_iterations: u32,
 ) -> Result<ScalarBenchmarkReport, ScalarExecutionError> {
+    benchmark_global_scalar_function_with_inner_iterations_and_fast_paths(
+        bytes,
+        warmup_iterations,
+        measured_iterations,
+        sample_inner_iterations,
+        true,
+    )
+}
+
+/// Benchmarks the global function with optional scalar fast paths.
+///
+/// Disabling fast paths keeps the prepared-function decoding boundary but
+/// forces execution through the general scalar interpreter. This is useful for
+/// locating real interpreter bottlenecks after exact strict HBC program
+/// shortcuts have reached timer-noise territory.
+///
+/// # Errors
+///
+/// Returns [`ScalarExecutionError`] if the bytecode is invalid or if any
+/// execution reaches an opcode outside the scalar subset.
+pub fn benchmark_global_scalar_function_with_inner_iterations_and_fast_paths(
+    bytes: &[u8],
+    warmup_iterations: u32,
+    measured_iterations: u32,
+    sample_inner_iterations: u32,
+    enable_fast_paths: bool,
+) -> Result<ScalarBenchmarkReport, ScalarExecutionError> {
     let sample_inner_iterations = sample_inner_iterations.max(1);
     let bytecode = HermesBytecode::parse(bytes)?;
     let function_id = bytecode.header().global_code_index;
-    let prepared_function = prepare_scalar_function(&bytecode, function_id, true)?;
+    let prepared_function = prepare_scalar_function(&bytecode, function_id, enable_fast_paths)?;
     let mut exact_program_state = ScalarExecutorState {
         remaining_steps: None,
         ..ScalarExecutorState::default()

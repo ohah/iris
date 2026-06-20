@@ -14835,18 +14835,8 @@ fn call_scalar_uint8_array_set(
     let source_index = usize::try_from(source_id).expect("Uint8Array id fits in usize");
     let target_index = usize::try_from(target_id).expect("Uint8Array id fits in usize");
 
-    let Some(source_bytes) = state
-        .uint8_array_storage
-        .get(source_index)
-        .and_then(Option::as_ref)
-        .cloned()
-    else {
-        return ScalarValue::Undefined;
-    };
-    let Some(target_bytes) = state
-        .uint8_array_storage
-        .get_mut(target_index)
-        .and_then(Option::as_mut)
+    let Some((source_bytes, target_bytes)) =
+        read_disjoint_scalar_uint8_array_storage_mut(state, source_index, target_index)
     else {
         return ScalarValue::Undefined;
     };
@@ -14856,6 +14846,28 @@ fn call_scalar_uint8_array_set(
     }
 
     ScalarValue::Undefined
+}
+
+fn read_disjoint_scalar_uint8_array_storage_mut<'state, 'bytecode>(
+    state: &'state mut ScalarExecutorState<'bytecode>,
+    source_index: usize,
+    target_index: usize,
+) -> Option<(&'state [u8], &'state mut Vec<u8>)> {
+    if source_index == target_index {
+        return None;
+    }
+
+    if source_index < target_index {
+        let (left, right) = state.uint8_array_storage.split_at_mut(target_index);
+        let source_bytes = left.get(source_index)?.as_ref()?;
+        let target_bytes = right.first_mut()?.as_mut()?;
+        return Some((source_bytes.as_slice(), target_bytes));
+    }
+
+    let (left, right) = state.uint8_array_storage.split_at_mut(source_index);
+    let target_bytes = left.get_mut(target_index)?.as_mut()?;
+    let source_bytes = right.first()?.as_ref()?;
+    Some((source_bytes.as_slice(), target_bytes))
 }
 
 fn call_scalar_object_create(

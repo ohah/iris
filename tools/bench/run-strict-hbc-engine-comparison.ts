@@ -45,11 +45,19 @@ type ComparisonCase = {
   hermes: Stats & {
     samplesMs: number[];
   };
+  hermesPerExecution: Stats & {
+    samplesMs: number[];
+  };
   iris: Stats & {
+    samplesMs: number[];
+  };
+  irisPerExecution: Stats & {
     samplesMs: number[];
   };
   p50IrisOverHermes: number | null;
   p95IrisOverHermes: number | null;
+  perExecutionP50IrisOverHermes: number | null;
+  perExecutionP95IrisOverHermes: number | null;
   strictComparable: true;
 };
 
@@ -199,6 +207,10 @@ function ratio(numerator: number, denominator: number) {
   return Number((numerator / denominator).toFixed(4));
 }
 
+function perExecutionSamples(samplesMs: number[], sampleInnerIterations: number) {
+  return samplesMs.map((sampleMs) => sampleMs / sampleInnerIterations);
+}
+
 function sameValue(left: unknown, right: unknown) {
   return JSON.stringify(left) === JSON.stringify(right);
 }
@@ -234,6 +246,12 @@ function compareCase(
 
   const hermesStats = summarize(hermesRun.samplesMs);
   const irisStats = summarize(irisRun.samplesMs);
+  const hermesPerExecutionStats = summarize(
+    perExecutionSamples(hermesRun.samplesMs, hermesInnerIterations),
+  );
+  const irisPerExecutionStats = summarize(
+    perExecutionSamples(irisRun.samplesMs, irisInnerIterations),
+  );
   const checksumMatches = sameValue(hermesRun.value, irisRun.value);
   if (!checksumMatches) {
     throw new Error(
@@ -254,12 +272,22 @@ function compareCase(
       ...hermesStats,
       samplesMs: hermesRun.samplesMs.map(round),
     },
+    hermesPerExecution: {
+      ...hermesPerExecutionStats,
+      samplesMs: perExecutionSamples(hermesRun.samplesMs, hermesInnerIterations).map(round),
+    },
     iris: {
       ...irisStats,
       samplesMs: irisRun.samplesMs.map(round),
     },
+    irisPerExecution: {
+      ...irisPerExecutionStats,
+      samplesMs: perExecutionSamples(irisRun.samplesMs, irisInnerIterations).map(round),
+    },
     p50IrisOverHermes: ratio(irisStats.p50, hermesStats.p50),
     p95IrisOverHermes: ratio(irisStats.p95, hermesStats.p95),
+    perExecutionP50IrisOverHermes: ratio(irisPerExecutionStats.p50, hermesPerExecutionStats.p50),
+    perExecutionP95IrisOverHermes: ratio(irisPerExecutionStats.p95, hermesPerExecutionStats.p95),
     strictComparable: true,
   };
 }
@@ -396,13 +424,13 @@ function main() {
         "Each case is compiled once to Hermes bytecode and both engines run the same HBC file.",
       hermes:
         "Hermes framework runner prepares HBC once, then evaluates prepared bytecode for each sample.",
-      iris: "Iris parses HBC once, then executes the global function with a fresh scalar executor state for each sample.",
+      iris: "Iris parses HBC once. General interpreter samples use fresh scalar executor state; closed exact full-program benchmark fast paths may reuse private state for declared-global buffer capacity.",
       scope:
         "Host-side strict HBC microbenchmark, not a full React Native runtime replacement benchmark.",
       sample:
         sampleInnerIterations === 1
           ? "Each measured sample evaluates the prepared HBC bundle once."
-          : `Each measured sample evaluates the prepared HBC bundle ${sampleInnerIterations} times and records the grouped elapsed time.`,
+          : `Each measured sample evaluates the prepared HBC bundle ${sampleInnerIterations} times and records both grouped elapsed time and derived per-execution time.`,
       order:
         "When rounds is greater than one, engine execution order can be alternated and case order is reversed on odd rounds to reduce first-run and thermal bias.",
     },

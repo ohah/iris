@@ -19,9 +19,13 @@ type StrictHbcCase = {
     matches: boolean;
   };
   hermes: Stats;
+  hermesPerExecution?: Stats;
   iris: Stats;
+  irisPerExecution?: Stats;
   p50IrisOverHermes: number | null;
   p95IrisOverHermes: number | null;
+  perExecutionP50IrisOverHermes?: number | null;
+  perExecutionP95IrisOverHermes?: number | null;
 };
 
 type StrictHbcReport = {
@@ -30,6 +34,7 @@ type StrictHbcReport = {
   createdAt: string;
   warmupIterations: number;
   measuredIterations: number;
+  sampleInnerIterations?: number;
   rounds: number;
   engineOrder: string;
   totalMeasuredIterations: number;
@@ -51,10 +56,16 @@ type CaseRun = {
   checksum: StrictHbcCase["checksum"];
   hermesP50: number;
   hermesP95: number;
+  hermesPerExecutionP50: number;
+  hermesPerExecutionP95: number;
   irisP50: number;
   irisP95: number;
+  irisPerExecutionP50: number;
+  irisPerExecutionP95: number;
   p50IrisOverHermes: number | null;
   p95IrisOverHermes: number | null;
+  perExecutionP50IrisOverHermes: number | null;
+  perExecutionP95IrisOverHermes: number | null;
 };
 
 type CaseSummary = {
@@ -64,10 +75,16 @@ type CaseSummary = {
   unstableReasons: string[];
   hermesP50: MetricSummary;
   hermesP95: MetricSummary;
+  hermesPerExecutionP50: MetricSummary;
+  hermesPerExecutionP95: MetricSummary;
   irisP50: MetricSummary;
   irisP95: MetricSummary;
+  irisPerExecutionP50: MetricSummary;
+  irisPerExecutionP95: MetricSummary;
   p50IrisOverHermes: MetricSummary;
   p95IrisOverHermes: MetricSummary;
+  perExecutionP50IrisOverHermes: MetricSummary;
+  perExecutionP95IrisOverHermes: MetricSummary;
   runs: CaseRun[];
 };
 
@@ -236,12 +253,36 @@ function summarizeCase(
     unstableReasons,
     hermesP50: summarizeMetric(runs.map((runEntry) => runEntry.hermesP50)),
     hermesP95: summarizeMetric(runs.map((runEntry) => runEntry.hermesP95)),
+    hermesPerExecutionP50: summarizeMetric(runs.map((runEntry) => runEntry.hermesPerExecutionP50)),
+    hermesPerExecutionP95: summarizeMetric(runs.map((runEntry) => runEntry.hermesPerExecutionP95)),
     irisP50,
     irisP95: summarizeMetric(runs.map((runEntry) => runEntry.irisP95)),
+    irisPerExecutionP50: summarizeMetric(runs.map((runEntry) => runEntry.irisPerExecutionP50)),
+    irisPerExecutionP95: summarizeMetric(runs.map((runEntry) => runEntry.irisPerExecutionP95)),
     p50IrisOverHermes: summarizeMetric(runs.map((runEntry) => runEntry.p50IrisOverHermes)),
     p95IrisOverHermes: summarizeMetric(runs.map((runEntry) => runEntry.p95IrisOverHermes)),
+    perExecutionP50IrisOverHermes: summarizeMetric(
+      runs.map((runEntry) => runEntry.perExecutionP50IrisOverHermes),
+    ),
+    perExecutionP95IrisOverHermes: summarizeMetric(
+      runs.map((runEntry) => runEntry.perExecutionP95IrisOverHermes),
+    ),
     runs,
   };
+}
+
+function perExecutionMetric(
+  entry: StrictHbcCase,
+  engine: "hermes" | "iris",
+  percentile: "p50" | "p95",
+  sampleInnerIterations: number,
+) {
+  const perExecutionStats = engine === "hermes" ? entry.hermesPerExecution : entry.irisPerExecution;
+  if (perExecutionStats != null) {
+    return perExecutionStats[percentile];
+  }
+
+  return entry[engine][percentile] / sampleInnerIterations;
 }
 
 function summarizeCases(
@@ -263,15 +304,22 @@ function summarizeCases(
       if (entry == null) {
         throw new Error(`${relativePath(artifact.path)} is missing case ${id}.`);
       }
+      const sampleInnerIterations = artifact.report.sampleInnerIterations ?? 1;
       runs.push({
         artifactPath: relativePath(artifact.path),
         checksum: entry.checksum,
         hermesP50: entry.hermes.p50,
         hermesP95: entry.hermes.p95,
+        hermesPerExecutionP50: perExecutionMetric(entry, "hermes", "p50", sampleInnerIterations),
+        hermesPerExecutionP95: perExecutionMetric(entry, "hermes", "p95", sampleInnerIterations),
         irisP50: entry.iris.p50,
         irisP95: entry.iris.p95,
+        irisPerExecutionP50: perExecutionMetric(entry, "iris", "p50", sampleInnerIterations),
+        irisPerExecutionP95: perExecutionMetric(entry, "iris", "p95", sampleInnerIterations),
         p50IrisOverHermes: entry.p50IrisOverHermes,
         p95IrisOverHermes: entry.p95IrisOverHermes,
+        perExecutionP50IrisOverHermes: entry.perExecutionP50IrisOverHermes ?? null,
+        perExecutionP95IrisOverHermes: entry.perExecutionP95IrisOverHermes ?? null,
       });
     }
     summaries.push(summarizeCase(id, runs, maxSpreadPercent, maxAbsoluteSpreadMs));
@@ -280,10 +328,15 @@ function summarizeCases(
   return summaries;
 }
 
+function formatMs(value: number | null) {
+  return value == null ? "n/a" : `${value.toFixed(6)}ms`;
+}
+
 function printSummary(cases: CaseSummary[]) {
   const rows = cases.map((entry) => ({
     case: entry.id,
-    irisP50Median: entry.irisP50.median?.toFixed(3) ?? "n/a",
+    irisSampleP50Median: formatMs(entry.irisP50.median),
+    irisExecP50Median: formatMs(entry.irisPerExecutionP50.median),
     irisP50Spread:
       entry.irisP50.relativeSpreadPercent == null
         ? "n/a"
@@ -291,7 +344,7 @@ function printSummary(cases: CaseSummary[]) {
     irisP50AbsSpread:
       entry.irisP50.absoluteSpreadMs == null
         ? "n/a"
-        : `${entry.irisP50.absoluteSpreadMs.toFixed(3)}ms`,
+        : `${entry.irisP50.absoluteSpreadMs.toFixed(6)}ms`,
     ratioMedian:
       entry.p50IrisOverHermes.median == null
         ? "n/a"

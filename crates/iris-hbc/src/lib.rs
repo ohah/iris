@@ -10733,14 +10733,11 @@ fn try_execute_scalar_uint8_global_index_mod_put_inc_loop_candidate<'a>(
             .and_then(Option::as_mut)
         {
             if length_index <= storage.len() {
-                let mut modulo = key_index % divisor;
-                for slot in &mut storage[start_index..length_index] {
-                    *slot = (modulo % 256) as u8;
-                    modulo = modulo.wrapping_add(1);
-                    if modulo == divisor {
-                        modulo = 0;
-                    }
-                }
+                write_scalar_uint8_modulo_sequence(
+                    &mut storage[start_index..length_index],
+                    key_index,
+                    divisor,
+                );
 
                 let last_index = (length_index - 1) as f64;
                 let value = f64::from(
@@ -10799,6 +10796,39 @@ fn try_execute_scalar_uint8_global_index_mod_put_inc_loop_candidate<'a>(
         Ok(Some(instruction_index))
     } else {
         Ok(Some(jump_instruction_index + 1))
+    }
+}
+
+fn write_scalar_uint8_modulo_sequence(storage: &mut [u8], start_index: u32, divisor: u32) {
+    if storage.is_empty() || divisor == 0 {
+        return;
+    }
+
+    const MAX_PATTERN_DIVISOR: u32 = 4096;
+    if divisor <= MAX_PATTERN_DIVISOR {
+        let pattern_length = usize::try_from(divisor).expect("Uint8Array divisor fits in usize");
+        let mut pattern = Vec::with_capacity(pattern_length);
+        let mut modulo = start_index % divisor;
+        for _ in 0..pattern_length {
+            pattern.push((modulo % 256) as u8);
+            modulo = modulo.wrapping_add(1);
+            if modulo == divisor {
+                modulo = 0;
+            }
+        }
+        for chunk in storage.chunks_mut(pattern_length) {
+            chunk.copy_from_slice(&pattern[..chunk.len()]);
+        }
+        return;
+    }
+
+    let mut modulo = start_index % divisor;
+    for slot in storage {
+        *slot = (modulo % 256) as u8;
+        modulo = modulo.wrapping_add(1);
+        if modulo == divisor {
+            modulo = 0;
+        }
     }
 }
 

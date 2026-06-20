@@ -6144,10 +6144,33 @@ fn try_execute_scalar_global_math_compute_loop_candidate<'a>(
     let modulo_divisor = modulo_divisor as u32;
     let mut index = start_index as u32;
     let limit = limit as u32;
-    while index < limit {
-        let index_number = f64::from(index);
-        checksum += ((index_number % f64::from(modulo_divisor)) + 1.0).sqrt() * index_number.sin();
-        index = index.saturating_add(1);
+    let sqrt_lookup = if modulo_divisor <= 4096 {
+        Some(
+            (0..modulo_divisor)
+                .map(|value| (f64::from(value) + 1.0).sqrt())
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        None
+    };
+    if let Some(sqrt_lookup) = sqrt_lookup {
+        let mut sqrt_index =
+            usize::try_from(index % modulo_divisor).expect("sqrt lookup index fits in usize");
+        while index < limit {
+            checksum += sqrt_lookup[sqrt_index] * f64::from(index).sin();
+            index = index.saturating_add(1);
+            sqrt_index += 1;
+            if sqrt_index == sqrt_lookup.len() {
+                sqrt_index = 0;
+            }
+        }
+    } else {
+        while index < limit {
+            let index_number = f64::from(index);
+            checksum +=
+                ((index_number % f64::from(modulo_divisor)) + 1.0).sqrt() * index_number.sin();
+            index = index.saturating_add(1);
+        }
     }
     if !checksum.is_finite() {
         return Ok(None);

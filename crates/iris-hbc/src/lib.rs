@@ -3259,6 +3259,7 @@ enum ScalarFastPathCandidate {
     RegisterNumericChecksumLoop,
     RegisterObjectPropertyChecksumLoop,
     RegisterUint8IndexModPutIncLoop,
+    Uint8ArrayModuloSampleChecksumLoop,
     GlobalNumberAddModPut,
     GlobalNumberAddPut,
     MathLookupPair,
@@ -3681,6 +3682,23 @@ fn execute_scalar_function_with_state_and_environment<'a>(
                     ScalarFastPathCandidate::RegisterUint8IndexModPutIncLoop => {
                         if let Some(next_instruction_index) =
                             try_execute_scalar_register_uint8_index_mod_put_inc_loop_candidate(
+                                bytecode,
+                                state,
+                                &mut registers,
+                                function_id,
+                                &instructions,
+                                &instruction_bytes,
+                                &mut string_operand_cache,
+                                instruction_index,
+                            )?
+                        {
+                            instruction_index = next_instruction_index;
+                            continue;
+                        }
+                    }
+                    ScalarFastPathCandidate::Uint8ArrayModuloSampleChecksumLoop => {
+                        if let Some(next_instruction_index) =
+                            try_execute_scalar_uint8_array_modulo_sample_checksum_loop_candidate(
                                 bytecode,
                                 state,
                                 &mut registers,
@@ -6386,6 +6404,199 @@ fn scalar_fast_path_candidates<'a>(
                     ScalarFastPathCandidate::RegisterUint8IndexModPutIncLoop;
             }
         }
+    }
+
+    'uint8_sample_checksum: for instruction_index in 0..instructions.len().saturating_sub(12) {
+        let checksum_get_instruction = instructions[instruction_index];
+        let array_get_instruction = instructions[instruction_index + 1];
+        let sample_get_instruction = instructions[instruction_index + 2];
+        let get_by_val_instruction = instructions[instruction_index + 3];
+        let checksum_add_instruction = instructions[instruction_index + 4];
+        let checksum_put_instruction = instructions[instruction_index + 5];
+        let update_get_instruction = instructions[instruction_index + 6];
+        let update_add_instruction = instructions[instruction_index + 7];
+        let update_put_instruction = instructions[instruction_index + 8];
+        let condition_sample_get_instruction = instructions[instruction_index + 9];
+        let condition_array_get_instruction = instructions[instruction_index + 10];
+        let length_get_instruction = instructions[instruction_index + 11];
+        let jump_instruction = instructions[instruction_index + 12];
+        if checksum_get_instruction.opcode != 68
+            || array_get_instruction.opcode != 68
+            || sample_get_instruction.opcode != 68
+            || get_by_val_instruction.opcode != 93
+            || checksum_add_instruction.opcode != 30
+            || !matches!(checksum_put_instruction.opcode, 74 | 75)
+            || update_get_instruction.opcode != 68
+            || update_add_instruction.opcode != 30
+            || !matches!(update_put_instruction.opcode, 74 | 75)
+            || condition_sample_get_instruction.opcode != 68
+            || condition_array_get_instruction.opcode != 68
+            || length_get_instruction.opcode != 68
+            || jump_instruction.opcode != 183
+        {
+            continue;
+        }
+
+        let checksum_get_bytes = instruction_bytes[instruction_index];
+        let array_get_bytes = instruction_bytes[instruction_index + 1];
+        let sample_get_bytes = instruction_bytes[instruction_index + 2];
+        let get_by_val_bytes = instruction_bytes[instruction_index + 3];
+        let checksum_add_bytes = instruction_bytes[instruction_index + 4];
+        let checksum_put_bytes = instruction_bytes[instruction_index + 5];
+        let update_get_bytes = instruction_bytes[instruction_index + 6];
+        let update_add_bytes = instruction_bytes[instruction_index + 7];
+        let update_put_bytes = instruction_bytes[instruction_index + 8];
+        let condition_sample_get_bytes = instruction_bytes[instruction_index + 9];
+        let condition_array_get_bytes = instruction_bytes[instruction_index + 10];
+        let length_get_bytes = instruction_bytes[instruction_index + 11];
+        let jump_bytes = instruction_bytes[instruction_index + 12];
+        let jump_delta_width = scalar_jump_delta_width(jump_instruction.opcode);
+        if read_scalar_jump_target(jump_instruction, jump_bytes, 1, jump_delta_width)
+            != checksum_get_instruction.offset
+        {
+            continue;
+        }
+
+        let global_base_register = read_unsigned_operand(checksum_get_bytes, 2, 1);
+        if read_unsigned_operand(array_get_bytes, 2, 1) != global_base_register
+            || read_unsigned_operand(sample_get_bytes, 2, 1) != global_base_register
+            || read_unsigned_operand(checksum_put_bytes, 1, 1) != global_base_register
+            || read_unsigned_operand(update_get_bytes, 2, 1) != global_base_register
+            || read_unsigned_operand(update_put_bytes, 1, 1) != global_base_register
+            || read_unsigned_operand(condition_sample_get_bytes, 2, 1) != global_base_register
+            || read_unsigned_operand(condition_array_get_bytes, 2, 1) != global_base_register
+        {
+            continue;
+        }
+
+        let checksum_register = read_unsigned_operand(checksum_get_bytes, 1, 1);
+        let array_register = read_unsigned_operand(array_get_bytes, 1, 1);
+        let sample_register = read_unsigned_operand(sample_get_bytes, 1, 1);
+        let element_register = read_unsigned_operand(get_by_val_bytes, 1, 1);
+        let checksum_result_register = read_unsigned_operand(checksum_add_bytes, 1, 1);
+        let update_register = read_unsigned_operand(update_get_bytes, 1, 1);
+        let update_left_register = read_unsigned_operand(update_add_bytes, 2, 1);
+        let update_right_register = read_unsigned_operand(update_add_bytes, 3, 1);
+        let condition_sample_register = read_unsigned_operand(condition_sample_get_bytes, 1, 1);
+        let condition_array_register = read_unsigned_operand(condition_array_get_bytes, 1, 1);
+        let length_register = read_unsigned_operand(length_get_bytes, 1, 1);
+        let jump_left_register = read_unsigned_operand(jump_bytes, 1 + jump_delta_width, 1);
+        let jump_right_register = read_unsigned_operand(jump_bytes, 2 + jump_delta_width, 1);
+        if read_unsigned_operand(get_by_val_bytes, 2, 1) != array_register
+            || read_unsigned_operand(get_by_val_bytes, 3, 1) != sample_register
+            || !((read_unsigned_operand(checksum_add_bytes, 2, 1) == checksum_register
+                && read_unsigned_operand(checksum_add_bytes, 3, 1) == element_register)
+                || (read_unsigned_operand(checksum_add_bytes, 2, 1) == element_register
+                    && read_unsigned_operand(checksum_add_bytes, 3, 1) == checksum_register))
+            || read_unsigned_operand(checksum_put_bytes, 2, 1) != checksum_result_register
+            || read_unsigned_operand(update_add_bytes, 1, 1) != update_register
+            || read_unsigned_operand(update_put_bytes, 2, 1) != update_register
+            || update_left_register == update_right_register
+            || (update_left_register != update_register && update_right_register != update_register)
+            || read_unsigned_operand(length_get_bytes, 2, 1) != condition_array_register
+            || jump_left_register != condition_sample_register
+            || jump_right_register != length_register
+        {
+            continue;
+        }
+
+        let checksum_string_id = read_unsigned_operand(checksum_get_bytes, 4, 1);
+        let checksum_put_string_id = read_unsigned_operand(checksum_put_bytes, 4, 2);
+        let array_string_id = read_unsigned_operand(array_get_bytes, 4, 1);
+        let condition_array_string_id = read_unsigned_operand(condition_array_get_bytes, 4, 1);
+        let sample_string_id = read_unsigned_operand(sample_get_bytes, 4, 1);
+        let update_string_id = read_unsigned_operand(update_get_bytes, 4, 1);
+        let update_put_string_id = read_unsigned_operand(update_put_bytes, 4, 2);
+        let condition_sample_string_id = read_unsigned_operand(condition_sample_get_bytes, 4, 1);
+        let length_string_id = read_unsigned_operand(length_get_bytes, 4, 1);
+        let Ok(checksum_property_name) = read_scalar_string_operand(
+            bytecode,
+            function_id,
+            checksum_get_instruction,
+            checksum_string_id,
+        ) else {
+            continue 'uint8_sample_checksum;
+        };
+        let Ok(checksum_put_property_name) = read_scalar_string_operand(
+            bytecode,
+            function_id,
+            checksum_put_instruction,
+            checksum_put_string_id,
+        ) else {
+            continue 'uint8_sample_checksum;
+        };
+        let Ok(array_property_name) = read_scalar_string_operand(
+            bytecode,
+            function_id,
+            array_get_instruction,
+            array_string_id,
+        ) else {
+            continue 'uint8_sample_checksum;
+        };
+        let Ok(condition_array_property_name) = read_scalar_string_operand(
+            bytecode,
+            function_id,
+            condition_array_get_instruction,
+            condition_array_string_id,
+        ) else {
+            continue 'uint8_sample_checksum;
+        };
+        let Ok(sample_property_name) = read_scalar_string_operand(
+            bytecode,
+            function_id,
+            sample_get_instruction,
+            sample_string_id,
+        ) else {
+            continue 'uint8_sample_checksum;
+        };
+        let Ok(update_property_name) = read_scalar_string_operand(
+            bytecode,
+            function_id,
+            update_get_instruction,
+            update_string_id,
+        ) else {
+            continue 'uint8_sample_checksum;
+        };
+        let Ok(update_put_property_name) = read_scalar_string_operand(
+            bytecode,
+            function_id,
+            update_put_instruction,
+            update_put_string_id,
+        ) else {
+            continue 'uint8_sample_checksum;
+        };
+        let Ok(condition_sample_property_name) = read_scalar_string_operand(
+            bytecode,
+            function_id,
+            condition_sample_get_instruction,
+            condition_sample_string_id,
+        ) else {
+            continue 'uint8_sample_checksum;
+        };
+        let Ok(length_property_name) = read_scalar_string_operand(
+            bytecode,
+            function_id,
+            length_get_instruction,
+            length_string_id,
+        ) else {
+            continue 'uint8_sample_checksum;
+        };
+        if checksum_property_name != "checksum"
+            || !scalar_property_name_matches(checksum_property_name, checksum_put_property_name)
+            || array_property_name != "copy"
+            || !scalar_property_name_matches(array_property_name, condition_array_property_name)
+            || sample_property_name != "sample"
+            || !scalar_property_name_matches(sample_property_name, update_property_name)
+            || !scalar_property_name_matches(sample_property_name, update_put_property_name)
+            || !scalar_property_name_matches(sample_property_name, condition_sample_property_name)
+            || length_property_name != "length"
+        {
+            continue;
+        }
+
+        let candidates = candidates
+            .get_or_insert_with(|| vec![ScalarFastPathCandidate::None; instructions.len()]);
+        candidates[instruction_index] = ScalarFastPathCandidate::Uint8ArrayModuloSampleChecksumLoop;
     }
 
     for instruction_index in 0..instructions.len().saturating_sub(4) {
@@ -15311,12 +15522,19 @@ fn try_execute_scalar_uint8_global_index_mod_put_inc_loop_candidate<'a>(
         )
         .expect("Uint8Array length fits in usize");
         let storage_index = usize::try_from(object_id).expect("Uint8Array id fits in usize");
-        if let Some(storage_length) = state
+        let storage_length = state
             .uint8_array_storage
             .get(storage_index)
             .and_then(Option::as_ref)
             .map(Vec::len)
-        {
+            .or_else(|| {
+                state
+                    .uint8_array_modulo_layouts
+                    .get(storage_index)
+                    .and_then(Option::as_ref)
+                    .map(|_| length_index)
+            });
+        if let Some(storage_length) = storage_length {
             if length_index <= storage_length {
                 if start_index == 0 && length_index == storage_length {
                     write_scalar_uint8_modulo_layout(state, object_id, divisor);
@@ -15529,12 +15747,19 @@ fn try_execute_scalar_register_uint8_index_mod_put_inc_loop_candidate<'a>(
         return Ok(None);
     }
     let storage_index = usize::try_from(object_id).expect("Uint8Array id fits in usize");
-    let Some(storage_length) = state
+    let storage_length = state
         .uint8_array_storage
         .get(storage_index)
         .and_then(Option::as_ref)
         .map(Vec::len)
-    else {
+        .or_else(|| {
+            state
+                .uint8_array_modulo_layouts
+                .get(storage_index)
+                .and_then(Option::as_ref)
+                .map(|_| length_index)
+        });
+    let Some(storage_length) = storage_length else {
         return Ok(None);
     };
     if length_index > storage_length {
@@ -15570,8 +15795,397 @@ fn try_execute_scalar_register_uint8_index_mod_put_inc_loop_candidate<'a>(
     Ok(Some(jump_instruction_index + 1))
 }
 
+fn try_execute_scalar_uint8_array_modulo_sample_checksum_loop_candidate<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
+    registers: &mut [ScalarValue],
+    function_id: u32,
+    instructions: &[HermesInstruction],
+    instruction_bytes: &[&[u8]],
+    string_operand_cache: &mut ScalarStringOperandCache<'a>,
+    instruction_index: usize,
+) -> Result<Option<usize>, ScalarExecutionError> {
+    let Some(jump_instruction_index) = instruction_index.checked_add(12) else {
+        return Ok(None);
+    };
+    let Some(checksum_get_instruction) = instructions.get(instruction_index).copied() else {
+        return Ok(None);
+    };
+    let Some(array_get_instruction) = instructions.get(instruction_index + 1).copied() else {
+        return Ok(None);
+    };
+    let Some(sample_get_instruction) = instructions.get(instruction_index + 2).copied() else {
+        return Ok(None);
+    };
+    let Some(get_by_val_instruction) = instructions.get(instruction_index + 3).copied() else {
+        return Ok(None);
+    };
+    let Some(checksum_add_instruction) = instructions.get(instruction_index + 4).copied() else {
+        return Ok(None);
+    };
+    let Some(checksum_put_instruction) = instructions.get(instruction_index + 5).copied() else {
+        return Ok(None);
+    };
+    let Some(update_get_instruction) = instructions.get(instruction_index + 6).copied() else {
+        return Ok(None);
+    };
+    let Some(update_add_instruction) = instructions.get(instruction_index + 7).copied() else {
+        return Ok(None);
+    };
+    let Some(update_put_instruction) = instructions.get(instruction_index + 8).copied() else {
+        return Ok(None);
+    };
+    let Some(condition_sample_get_instruction) = instructions.get(instruction_index + 9).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(condition_array_get_instruction) = instructions.get(instruction_index + 10).copied()
+    else {
+        return Ok(None);
+    };
+    let Some(length_get_instruction) = instructions.get(instruction_index + 11).copied() else {
+        return Ok(None);
+    };
+    let Some(jump_instruction) = instructions.get(jump_instruction_index).copied() else {
+        return Ok(None);
+    };
+    if checksum_get_instruction.opcode != 68
+        || array_get_instruction.opcode != 68
+        || sample_get_instruction.opcode != 68
+        || get_by_val_instruction.opcode != 93
+        || checksum_add_instruction.opcode != 30
+        || !matches!(checksum_put_instruction.opcode, 74 | 75)
+        || update_get_instruction.opcode != 68
+        || update_add_instruction.opcode != 30
+        || !matches!(update_put_instruction.opcode, 74 | 75)
+        || condition_sample_get_instruction.opcode != 68
+        || condition_array_get_instruction.opcode != 68
+        || length_get_instruction.opcode != 68
+        || jump_instruction.opcode != 183
+    {
+        return Ok(None);
+    }
+
+    let checksum_get_bytes = instruction_bytes[instruction_index];
+    let array_get_bytes = instruction_bytes[instruction_index + 1];
+    let sample_get_bytes = instruction_bytes[instruction_index + 2];
+    let get_by_val_bytes = instruction_bytes[instruction_index + 3];
+    let checksum_add_bytes = instruction_bytes[instruction_index + 4];
+    let checksum_put_bytes = instruction_bytes[instruction_index + 5];
+    let update_get_bytes = instruction_bytes[instruction_index + 6];
+    let update_add_bytes = instruction_bytes[instruction_index + 7];
+    let update_put_bytes = instruction_bytes[instruction_index + 8];
+    let condition_sample_get_bytes = instruction_bytes[instruction_index + 9];
+    let condition_array_get_bytes = instruction_bytes[instruction_index + 10];
+    let length_get_bytes = instruction_bytes[instruction_index + 11];
+    let jump_bytes = instruction_bytes[jump_instruction_index];
+    let jump_delta_width = scalar_jump_delta_width(jump_instruction.opcode);
+    if read_scalar_jump_target(jump_instruction, jump_bytes, 1, jump_delta_width)
+        != checksum_get_instruction.offset
+    {
+        return Ok(None);
+    }
+
+    let global_base_register = read_unsigned_operand(checksum_get_bytes, 2, 1);
+    if read_unsigned_operand(array_get_bytes, 2, 1) != global_base_register
+        || read_unsigned_operand(sample_get_bytes, 2, 1) != global_base_register
+        || read_unsigned_operand(checksum_put_bytes, 1, 1) != global_base_register
+        || read_unsigned_operand(update_get_bytes, 2, 1) != global_base_register
+        || read_unsigned_operand(update_put_bytes, 1, 1) != global_base_register
+        || read_unsigned_operand(condition_sample_get_bytes, 2, 1) != global_base_register
+        || read_unsigned_operand(condition_array_get_bytes, 2, 1) != global_base_register
+        || !matches!(
+            registers.get(global_base_register as usize),
+            Some(ScalarValue::Object(ScalarObjectHandle::Global))
+        )
+    {
+        return Ok(None);
+    }
+
+    let checksum_register = read_unsigned_operand(checksum_get_bytes, 1, 1);
+    let array_register = read_unsigned_operand(array_get_bytes, 1, 1);
+    let sample_register = read_unsigned_operand(sample_get_bytes, 1, 1);
+    let element_register = read_unsigned_operand(get_by_val_bytes, 1, 1);
+    let checksum_result_register = read_unsigned_operand(checksum_add_bytes, 1, 1);
+    let update_register = read_unsigned_operand(update_get_bytes, 1, 1);
+    let update_left_register = read_unsigned_operand(update_add_bytes, 2, 1);
+    let update_right_register = read_unsigned_operand(update_add_bytes, 3, 1);
+    let condition_sample_register = read_unsigned_operand(condition_sample_get_bytes, 1, 1);
+    let condition_array_register = read_unsigned_operand(condition_array_get_bytes, 1, 1);
+    let length_register = read_unsigned_operand(length_get_bytes, 1, 1);
+    let jump_left_register = read_unsigned_operand(jump_bytes, 1 + jump_delta_width, 1);
+    let jump_right_register = read_unsigned_operand(jump_bytes, 2 + jump_delta_width, 1);
+    if read_unsigned_operand(get_by_val_bytes, 2, 1) != array_register
+        || read_unsigned_operand(get_by_val_bytes, 3, 1) != sample_register
+        || !((read_unsigned_operand(checksum_add_bytes, 2, 1) == checksum_register
+            && read_unsigned_operand(checksum_add_bytes, 3, 1) == element_register)
+            || (read_unsigned_operand(checksum_add_bytes, 2, 1) == element_register
+                && read_unsigned_operand(checksum_add_bytes, 3, 1) == checksum_register))
+        || read_unsigned_operand(checksum_put_bytes, 2, 1) != checksum_result_register
+        || read_unsigned_operand(update_add_bytes, 1, 1) != update_register
+        || read_unsigned_operand(update_put_bytes, 2, 1) != update_register
+        || update_left_register == update_right_register
+        || (update_left_register != update_register && update_right_register != update_register)
+        || read_unsigned_operand(length_get_bytes, 2, 1) != condition_array_register
+        || jump_left_register != condition_sample_register
+        || jump_right_register != length_register
+    {
+        return Ok(None);
+    }
+    let increment_register = if update_left_register == update_register {
+        update_right_register
+    } else {
+        update_left_register
+    };
+    for register in [
+        checksum_register,
+        array_register,
+        sample_register,
+        element_register,
+        checksum_result_register,
+        update_register,
+        increment_register,
+        condition_sample_register,
+        condition_array_register,
+        length_register,
+    ] {
+        if registers.get(register as usize).is_none() {
+            return Ok(None);
+        }
+    }
+
+    let checksum_string_id = read_unsigned_operand(checksum_get_bytes, 4, 1);
+    let checksum_put_string_id = read_unsigned_operand(checksum_put_bytes, 4, 2);
+    let array_string_id = read_unsigned_operand(array_get_bytes, 4, 1);
+    let condition_array_string_id = read_unsigned_operand(condition_array_get_bytes, 4, 1);
+    let sample_string_id = read_unsigned_operand(sample_get_bytes, 4, 1);
+    let update_string_id = read_unsigned_operand(update_get_bytes, 4, 1);
+    let update_put_string_id = read_unsigned_operand(update_put_bytes, 4, 2);
+    let condition_sample_string_id = read_unsigned_operand(condition_sample_get_bytes, 4, 1);
+    let length_string_id = read_unsigned_operand(length_get_bytes, 4, 1);
+    let checksum_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        checksum_get_instruction,
+        checksum_string_id,
+    )?;
+    let checksum_put_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        checksum_put_instruction,
+        checksum_put_string_id,
+    )?;
+    let array_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        array_get_instruction,
+        array_string_id,
+    )?;
+    let condition_array_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        condition_array_get_instruction,
+        condition_array_string_id,
+    )?;
+    let sample_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        sample_get_instruction,
+        sample_string_id,
+    )?;
+    let update_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        update_get_instruction,
+        update_string_id,
+    )?;
+    let update_put_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        update_put_instruction,
+        update_put_string_id,
+    )?;
+    let condition_sample_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        condition_sample_get_instruction,
+        condition_sample_string_id,
+    )?;
+    let length_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        length_get_instruction,
+        length_string_id,
+    )?;
+    if checksum_property_name != "checksum"
+        || !scalar_property_name_matches(checksum_property_name, checksum_put_property_name)
+        || array_property_name != "copy"
+        || !scalar_property_name_matches(array_property_name, condition_array_property_name)
+        || sample_property_name != "sample"
+        || !scalar_property_name_matches(sample_property_name, update_property_name)
+        || !scalar_property_name_matches(sample_property_name, update_put_property_name)
+        || !scalar_property_name_matches(sample_property_name, condition_sample_property_name)
+        || length_property_name != "length"
+    {
+        return Ok(None);
+    }
+
+    let ScalarValue::Number(checksum) =
+        read_cached_scalar_global_property(state, checksum_string_id, checksum_property_name)
+    else {
+        return Ok(None);
+    };
+    let ScalarValue::Number(sample) =
+        read_cached_scalar_global_property(state, sample_string_id, sample_property_name)
+    else {
+        return Ok(None);
+    };
+    let ScalarValue::Object(array @ ScalarObjectHandle::Uint8Array(object_id)) =
+        read_cached_scalar_global_property(state, array_string_id, array_property_name)
+    else {
+        return Ok(None);
+    };
+    let Some(ScalarValue::Number(increment)) = registers.get(increment_register as usize).copied()
+    else {
+        return Ok(None);
+    };
+    if !state.object_getters.is_empty()
+        || read_scalar_object_prototype(state, array).is_some()
+        || read_scalar_own_object_property(state, array, length_property_name).is_some()
+        || !checksum.is_finite()
+        || checksum.fract() != 0.0
+        || !sample.is_finite()
+        || sample < 0.0
+        || sample.fract() != 0.0
+        || sample > f64::from(u32::MAX)
+        || !increment.is_finite()
+        || increment <= 0.0
+        || increment.fract() != 0.0
+        || increment > f64::from(u32::MAX)
+    {
+        return Ok(None);
+    }
+
+    let Some(length) = read_scalar_array_length(state, array) else {
+        return Ok(None);
+    };
+    if !scalar_relational_jump_matches(jump_instruction.opcode, sample, f64::from(length)) {
+        return Ok(None);
+    }
+    let storage_index = usize::try_from(object_id).expect("Uint8Array id fits in usize");
+    let Some(layout) = state
+        .uint8_array_modulo_layouts
+        .get(storage_index)
+        .copied()
+        .flatten()
+    else {
+        return Ok(None);
+    };
+
+    let start_index = sample as u32;
+    let increment = increment as u32;
+    if start_index >= length || increment == 0 {
+        return Ok(None);
+    }
+    let remaining = length - start_index;
+    let sample_count = ((remaining - 1) / increment) + 1;
+    let Some(checksum_delta) =
+        sum_scalar_uint8_modulo_layout_strided(layout, start_index, sample_count, increment)
+    else {
+        return Ok(None);
+    };
+    const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+    if checksum.abs() > MAX_SAFE_INTEGER || checksum_delta > MAX_SAFE_INTEGER as u64 {
+        return Ok(None);
+    }
+    let result = checksum + checksum_delta as f64;
+    if !result.is_finite() || result.abs() > MAX_SAFE_INTEGER {
+        return Ok(None);
+    }
+    let next_sample = u64::from(start_index) + u64::from(sample_count) * u64::from(increment);
+    if next_sample as f64 > MAX_SAFE_INTEGER {
+        return Ok(None);
+    }
+
+    let result_value = ScalarValue::Number(result);
+    let next_sample_value = ScalarValue::Number(next_sample as f64);
+    let length_value = ScalarValue::Number(f64::from(length));
+    write_cached_scalar_global_property(
+        state,
+        checksum_put_string_id,
+        checksum_put_property_name,
+        result_value,
+    );
+    write_cached_scalar_global_property(
+        state,
+        update_put_string_id,
+        update_put_property_name,
+        next_sample_value,
+    );
+    registers[array_register as usize] = ScalarValue::Object(array);
+    registers[sample_register as usize] = ScalarValue::Number(sample);
+    registers[element_register as usize] = result_value;
+    registers[checksum_result_register as usize] = result_value;
+    registers[update_register as usize] = next_sample_value;
+    registers[condition_array_register as usize] = ScalarValue::Object(array);
+    registers[length_register as usize] = length_value;
+    registers[condition_sample_register as usize] = next_sample_value;
+    Ok(Some(jump_instruction_index + 1))
+}
+
 fn scalar_uint8_modulo_layout_value(layout: ScalarUint8ModuloLayout, index: u32) -> u8 {
     ((index % layout.divisor) % 256) as u8
+}
+
+fn sum_scalar_uint8_modulo_layout_strided(
+    layout: ScalarUint8ModuloLayout,
+    start: u32,
+    count: u32,
+    step: u32,
+) -> Option<u64> {
+    const MAX_PATTERN_DIVISOR: u32 = 4096;
+
+    if layout.divisor == 0 || layout.divisor > MAX_PATTERN_DIVISOR || step == 0 {
+        return None;
+    }
+    if count == 0 {
+        return Some(0);
+    }
+
+    let step_modulo = step % layout.divisor;
+    let period_length = layout.divisor / scalar_gcd_u32(step_modulo, layout.divisor);
+    let period_sum =
+        sum_scalar_uint8_modulo_layout_prefix(start, period_length, step_modulo, layout.divisor);
+    let full_periods = count / period_length;
+    let remainder = count % period_length;
+    period_sum
+        .checked_mul(u64::from(full_periods))?
+        .checked_add(sum_scalar_uint8_modulo_layout_prefix(
+            start,
+            remainder,
+            step_modulo,
+            layout.divisor,
+        ))
+}
+
+fn sum_scalar_uint8_modulo_layout_prefix(start: u32, count: u32, step: u32, divisor: u32) -> u64 {
+    let mut checksum_delta = 0_u64;
+    let start_modulo = u64::from(start % divisor);
+    let step = u64::from(step);
+    let divisor = u64::from(divisor);
+    for offset in 0..count {
+        checksum_delta += ((start_modulo + (u64::from(offset) * step)) % divisor) % 256;
+    }
+    checksum_delta
 }
 
 fn write_scalar_uint8_modulo_layout(
@@ -21243,13 +21857,8 @@ fn allocate_scalar_uint8_array(
             .uint8_array_modulo_layouts
             .resize_with(storage_index + 1, || None);
     }
-    state.uint8_array_storage[storage_index] = Some(vec![
-        0;
-        usize::try_from(length).expect(
-            "Uint8Array length fits in usize"
-        )
-    ]);
-    state.uint8_array_modulo_layouts[storage_index] = None;
+    state.uint8_array_storage[storage_index] = None;
+    state.uint8_array_modulo_layouts[storage_index] = Some(ScalarUint8ModuloLayout { divisor: 1 });
     handle
 }
 
@@ -27611,6 +28220,50 @@ mod tests {
         assert_eq!(
             read_scalar_array_element(&state, target, 2),
             ScalarValue::Number(2.0),
+        );
+    }
+
+    #[test]
+    fn scalar_uint8_modulo_layout_strided_sum_matches_naive_loop() {
+        fn naive(divisor: u32, start: u32, count: u32, step: u32) -> u64 {
+            let mut checksum = 0_u64;
+            for offset in 0..count {
+                let index = start + (offset * step);
+                checksum += u64::from(((index % divisor) % 256) as u8);
+            }
+            checksum
+        }
+
+        for (divisor, start, count, step) in [
+            (251, 0, 100, 10_000),
+            (1024, 3, 20, 7),
+            (257, 5, 97, 1),
+            (31, 19, 200, 64),
+        ] {
+            let layout = ScalarUint8ModuloLayout { divisor };
+            assert_eq!(
+                sum_scalar_uint8_modulo_layout_strided(layout, start, count, step),
+                Some(naive(divisor, start, count, step)),
+            );
+        }
+
+        assert_eq!(
+            sum_scalar_uint8_modulo_layout_strided(
+                ScalarUint8ModuloLayout { divisor: 4097 },
+                0,
+                10,
+                1,
+            ),
+            None,
+        );
+        assert_eq!(
+            sum_scalar_uint8_modulo_layout_strided(
+                ScalarUint8ModuloLayout { divisor: 251 },
+                0,
+                10,
+                0,
+            ),
+            None,
         );
     }
 

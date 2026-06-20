@@ -25024,10 +25024,11 @@ fn read_cached_scalar_global_property<'a>(
     let slot = scalar_string_operand_cache_slot(string_id);
     if let Some((cached_id, index)) = state.global_property_operand_cache[slot] {
         if cached_id == string_id {
-            if let Some((stored_name, value)) = state.global_properties.get(index) {
-                if scalar_property_name_matches(stored_name, property_name) {
-                    return *value;
-                }
+            // A Hermes string id fixes the property name within this bytecode,
+            // and global property slots are updated in place rather than
+            // deleted or reordered.
+            if let Some((_, value)) = state.global_properties.get(index) {
+                return *value;
             }
         }
     }

@@ -15,6 +15,7 @@ type EngineRun = {
   engine: "hermes" | "iris";
   casePath: string;
   value: boolean | number | string | null;
+  fastPathsEnabled?: boolean;
   warmupIterations: number;
   measuredIterations: number;
   sampleInnerIterations?: number;
@@ -58,6 +59,7 @@ type ComparisonCase = {
   p95IrisOverHermes: number | null;
   perExecutionP50IrisOverHermes: number | null;
   perExecutionP95IrisOverHermes: number | null;
+  irisFastPathsEnabled: boolean;
   strictComparable: true;
 };
 
@@ -84,6 +86,14 @@ function readNumberArg(name: string, fallback: number, allowZero = false) {
     throw new Error(`${name} must be ${allowZero ? "a non-negative" : "a positive"} integer.`);
   }
   return value;
+}
+
+function readIrisFastPathMode() {
+  const mode = readArg("--iris-fast-paths") ?? "on";
+  if (mode !== "on" && mode !== "off") {
+    throw new Error("--iris-fast-paths must be one of on or off.");
+  }
+  return mode;
 }
 
 function relativePath(path: string) {
@@ -253,6 +263,7 @@ function compareCase(
     perExecutionSamples(irisRun.samplesMs, irisInnerIterations),
   );
   const checksumMatches = sameValue(hermesRun.value, irisRun.value);
+  const irisFastPathsEnabled = irisRun.fastPathsEnabled ?? true;
   if (!checksumMatches) {
     throw new Error(
       `${caseId(sourcePath)} checksum mismatch: hermes=${JSON.stringify(hermesRun.value)} iris=${JSON.stringify(irisRun.value)}`,
@@ -288,6 +299,7 @@ function compareCase(
     p95IrisOverHermes: ratio(irisStats.p95, hermesStats.p95),
     perExecutionP50IrisOverHermes: ratio(irisPerExecutionStats.p50, hermesPerExecutionStats.p50),
     perExecutionP95IrisOverHermes: ratio(irisPerExecutionStats.p95, hermesPerExecutionStats.p95),
+    irisFastPathsEnabled,
     strictComparable: true,
   };
 }
@@ -349,6 +361,7 @@ function main() {
   const sampleInnerIterations = readNumberArg("--sample-inner-iterations", 1);
   const rounds = readNumberArg("--rounds", 1);
   const engineOrder = readEngineOrder(rounds);
+  const irisFastPathMode = readIrisFastPathMode();
   const outputPath = resolve(root, readArg("--output") ?? defaultOutputPath);
   const hbcDir = resolve(root, readArg("--hbc-dir") ?? defaultHbcDir);
   const hermesc = resolve(root, readArg("--hermesc") ?? defaultHermesc);
@@ -391,14 +404,16 @@ function main() {
       for (const engine of engineOrderForRound(engineOrder, roundIndex)) {
         const runner =
           engine === "hermes" ? hermesRunner : resolve(root, "target/release/hbc-bench");
-        compiledCase.runs[engine].push(
-          captureJson<EngineRun>(runner, [
-            `--warmup=${warmupIterations}`,
-            `--iterations=${measuredIterations}`,
-            `--sample-inner-iterations=${sampleInnerIterations}`,
-            compiledCase.hbcPath,
-          ]),
-        );
+        const runnerArgs = [
+          `--warmup=${warmupIterations}`,
+          `--iterations=${measuredIterations}`,
+          `--sample-inner-iterations=${sampleInnerIterations}`,
+        ];
+        if (engine === "iris" && irisFastPathMode === "off") {
+          runnerArgs.push("--disable-fast-paths");
+        }
+        runnerArgs.push(compiledCase.hbcPath);
+        compiledCase.runs[engine].push(captureJson<EngineRun>(runner, runnerArgs));
       }
     }
   }
@@ -425,6 +440,10 @@ function main() {
       hermes:
         "Hermes framework runner prepares HBC once, then evaluates prepared bytecode for each sample.",
       iris: "Iris parses HBC once. General interpreter samples use fresh scalar executor state; closed exact full-program benchmark fast paths may reuse private state for declared-global buffer capacity.",
+      irisFastPaths:
+        irisFastPathMode === "on"
+          ? "Iris scalar fast paths are enabled."
+          : "Iris scalar fast paths are disabled, so the prepared-function benchmark runs through the general scalar interpreter.",
       scope:
         "Host-side strict HBC microbenchmark, not a full React Native runtime replacement benchmark.",
       sample:
@@ -437,6 +456,7 @@ function main() {
     warmupIterations,
     measuredIterations,
     sampleInnerIterations,
+    irisFastPaths: irisFastPathMode,
     rounds,
     engineOrder,
     totalMeasuredIterations: measuredIterations * rounds,

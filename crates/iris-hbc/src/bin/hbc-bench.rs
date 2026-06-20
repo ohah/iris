@@ -25,6 +25,7 @@ fn run_from_args(args: Vec<String>) -> Result<String, String> {
     let mut warmup_iterations = 3;
     let mut measured_iterations = 20;
     let mut sample_inner_iterations = 1;
+    let mut fast_paths_enabled = true;
 
     for arg in args.iter().skip(1) {
         if let Some(value) = arg.strip_prefix("--warmup=") {
@@ -34,6 +35,8 @@ fn run_from_args(args: Vec<String>) -> Result<String, String> {
         } else if let Some(value) = arg.strip_prefix("--sample-inner-iterations=") {
             sample_inner_iterations =
                 parse_positive_u32("--sample-inner-iterations", value, false)?;
+        } else if arg == "--disable-fast-paths" {
+            fast_paths_enabled = false;
         } else if arg.starts_with("--") {
             return Err(format!("unknown option: {arg}\n{}", usage(program)));
         } else if path.replace(arg.clone()).is_some() {
@@ -47,19 +50,21 @@ fn run_from_args(args: Vec<String>) -> Result<String, String> {
 
     let bytes = fs::read(&path)
         .map_err(|error| format!("failed to read Hermes bytecode bundle: {error}"))?;
-    let report = iris_hbc::benchmark_global_scalar_function_with_inner_iterations(
+    let report = iris_hbc::benchmark_global_scalar_function_with_inner_iterations_and_fast_paths(
         &bytes,
         warmup_iterations,
         measured_iterations,
         sample_inner_iterations,
+        fast_paths_enabled,
     )
     .map_err(|error| format!("failed to benchmark Hermes bytecode scalar subset: {error}"))?;
 
     Ok(format!(
-        "{{\"engine\":\"iris\",\"casePath\":\"{}\",\"value\":{},\"declaredGlobals\":{},\"warmupIterations\":{},\"measuredIterations\":{},\"sampleInnerIterations\":{},\"samplesMs\":[{}]}}",
+        "{{\"engine\":\"iris\",\"casePath\":\"{}\",\"value\":{},\"declaredGlobals\":{},\"fastPathsEnabled\":{},\"warmupIterations\":{},\"measuredIterations\":{},\"sampleInnerIterations\":{},\"samplesMs\":[{}]}}",
         json_escape(&path),
         scalar_value_json(report.value),
         report.declared_global_count,
+        fast_paths_enabled,
         report.warmup_iterations,
         report.measured_iterations,
         report.sample_inner_iterations,
@@ -74,7 +79,7 @@ fn run_from_args(args: Vec<String>) -> Result<String, String> {
 
 fn usage(program: &str) -> String {
     format!(
-        "usage: {program} [--warmup=N] [--iterations=N] [--sample-inner-iterations=N] <bundle.hbc>"
+        "usage: {program} [--warmup=N] [--iterations=N] [--sample-inner-iterations=N] [--disable-fast-paths] <bundle.hbc>"
     )
 }
 

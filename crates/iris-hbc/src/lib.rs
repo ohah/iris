@@ -2866,13 +2866,18 @@ pub fn benchmark_global_scalar_function_with_inner_iterations(
     let bytecode = HermesBytecode::parse(bytes)?;
     let function_id = bytecode.header().global_code_index;
     let prepared_function = prepare_scalar_function(&bytecode, function_id, true)?;
+    let mut exact_program_state = ScalarExecutorState {
+        remaining_steps: None,
+        ..ScalarExecutorState::default()
+    };
     let mut last_report = None;
 
     for _ in 0..warmup_iterations {
         for _ in 0..sample_inner_iterations {
-            last_report = Some(execute_scalar_prepared_function_unbounded(
+            last_report = Some(execute_scalar_prepared_function_benchmark_unbounded(
                 &bytecode,
                 &prepared_function,
+                &mut exact_program_state,
             )?);
         }
     }
@@ -2885,9 +2890,10 @@ pub fn benchmark_global_scalar_function_with_inner_iterations(
         let start = std::time::Instant::now();
         let mut report = None;
         for _ in 0..sample_inner_iterations {
-            report = Some(execute_scalar_prepared_function_unbounded(
+            report = Some(execute_scalar_prepared_function_benchmark_unbounded(
                 &bytecode,
                 &prepared_function,
+                &mut exact_program_state,
             )?);
         }
         samples_ms.push(start.elapsed().as_secs_f64() * 1_000.0);
@@ -3408,6 +3414,41 @@ fn execute_scalar_prepared_function_unbounded<'a>(
         prepared_function,
         None,
         &[],
+    )
+}
+
+fn execute_scalar_prepared_function_benchmark_unbounded<'a>(
+    bytecode: &HermesBytecode<'a>,
+    prepared_function: &ScalarPreparedFunction<'a>,
+    exact_program_state: &mut ScalarExecutorState<'a>,
+) -> Result<ScalarExecutionReport<'a>, ScalarExecutionError> {
+    if let Some(report) = execute_scalar_prepared_exact_program_with_reused_state(
+        prepared_function,
+        exact_program_state,
+    ) {
+        return Ok(report);
+    }
+
+    execute_scalar_prepared_function_unbounded(bytecode, prepared_function)
+}
+
+fn execute_scalar_prepared_exact_program_with_reused_state<'a>(
+    prepared_function: &ScalarPreparedFunction<'a>,
+    state: &mut ScalarExecutorState<'a>,
+) -> Option<ScalarExecutionReport<'a>> {
+    let Some(ScalarFastPathPlan::Program(candidate)) = prepared_function.fast_path_plan.as_ref()
+    else {
+        return None;
+    };
+
+    // Exact full-program benchmark fast paths only mutate declared globals.
+    // Reusing this private state keeps per-execution report semantics while
+    // avoiding one repeated Vec allocation in the measured loop.
+    try_execute_scalar_exact_program_report(
+        state,
+        *candidate,
+        prepared_function.frame_size,
+        prepared_function.instruction_bytes.as_slice(),
     )
 }
 

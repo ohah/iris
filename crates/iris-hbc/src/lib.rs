@@ -9122,8 +9122,6 @@ fn try_execute_scalar_json_payload_build_loop_candidate<'a>(
     let active_divisor = active_divisor as u32;
     let iteration_count = usize::try_from(limit - start_index).expect("loop count fits in usize");
     state.object_properties.reserve(iteration_count * 7);
-    state.object_property_indices.reserve(iteration_count * 7);
-    state.object_property_names.reserve(iteration_count * 2);
     state.array_lengths.reserve(iteration_count + 1);
     state.array_storage.reserve(iteration_count + 1);
 
@@ -9134,13 +9132,14 @@ fn try_execute_scalar_json_payload_build_loop_candidate<'a>(
     for index in start_index..limit {
         let index_value = f64::from(index);
         let meta = allocate_scalar_object(state);
-        write_scalar_new_object_property(
+        write_scalar_new_object_properties2_unindexed(
             state,
             meta,
             "lane",
             ScalarValue::Number(f64::from(index % lane_divisor)),
+            "label",
+            label_value,
         );
-        write_scalar_new_object_property(state, meta, "label", label_value);
 
         let points = allocate_scalar_array_with_values(
             state,
@@ -9152,16 +9151,24 @@ fn try_execute_scalar_json_payload_build_loop_candidate<'a>(
         );
 
         let row = allocate_scalar_object(state);
-        write_scalar_new_object_property(
+        write_scalar_new_object_properties3_unindexed(
             state,
             row,
             "active",
             ScalarValue::Boolean(index % active_divisor == 0),
+            "id",
+            ScalarValue::Number(index_value),
+            "meta",
+            ScalarValue::Object(meta),
         );
-        write_scalar_new_object_property(state, row, "id", ScalarValue::Number(index_value));
-        write_scalar_new_object_property(state, row, "meta", ScalarValue::Object(meta));
-        write_scalar_new_object_property(state, row, "name", name_value);
-        write_scalar_new_object_property(state, row, "points", ScalarValue::Object(points));
+        write_scalar_new_object_properties2_unindexed(
+            state,
+            row,
+            "name",
+            name_value,
+            "points",
+            ScalarValue::Object(points),
+        );
 
         last_meta = ScalarValue::Object(meta);
         last_points = ScalarValue::Object(points);

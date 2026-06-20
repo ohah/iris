@@ -3055,6 +3055,8 @@ struct ScalarExecutorState<'a> {
     object_properties: Vec<(ScalarObjectHandle, &'a str, ScalarValue)>,
     object_slot_names: Vec<(ScalarObjectHandle, u32, &'a str)>,
     object_slots: Vec<(ScalarObjectHandle, u32, ScalarValue)>,
+    object_traversal_layouts: Vec<ScalarObjectTraversalLayout<'a>>,
+    object_traversal_materialized_objects: Vec<ScalarObjectHandle>,
     pending_constructor_this_values: Vec<(ScalarFunctionHandle, ScalarValue)>,
     recent_bytecode_calls: Vec<ScalarCallFrame>,
     relaxed_host_stubs: bool,
@@ -3072,6 +3074,21 @@ enum ScalarJsonSnapshot<'a> {
     Array(Vec<ScalarJsonSnapshot<'a>>),
     Object(Vec<(&'a str, ScalarJsonSnapshot<'a>)>),
     JsonPayloadRows { length: u32 },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScalarObjectTraversalLayout<'a> {
+    first_object_id: u32,
+    length: u32,
+    active_divisor: u32,
+    score_multiplier: u32,
+    score_divisor: u32,
+    lane_divisor: u32,
+    active_property_name: &'a str,
+    score_property_name: &'a str,
+    id_property_name: &'a str,
+    lane_property_name: &'a str,
+    nested_property_name: &'a str,
 }
 
 impl serde::Serialize for ScalarJsonSnapshot<'_> {
@@ -14550,6 +14567,8 @@ fn try_execute_scalar_object_traversal_build_loop_candidate<'a>(
         return Ok(None);
     };
     if !state.object_properties.is_empty()
+        || !state.object_traversal_layouts.is_empty()
+        || !state.object_traversal_materialized_objects.is_empty()
         || !state.object_getters.is_empty()
         || !state.object_prototypes.is_empty()
         || !start_index.is_finite()
@@ -14591,9 +14610,6 @@ fn try_execute_scalar_object_traversal_build_loop_candidate<'a>(
         return Ok(None);
     }
 
-    let Some(property_count) = iteration_count.checked_mul(5) else {
-        return Ok(None);
-    };
     let Some(object_count) = iteration_count.checked_mul(2) else {
         return Ok(None);
     };
@@ -14605,15 +14621,28 @@ fn try_execute_scalar_object_traversal_build_loop_candidate<'a>(
     };
     let first_object_id = state.next_object_id;
     state.next_object_id = next_object_id;
-    state.object_properties.reserve(property_count);
     state.object_property_indices_incomplete = true;
+    state
+        .object_traversal_layouts
+        .push(ScalarObjectTraversalLayout {
+            first_object_id,
+            length: limit,
+            active_divisor: active_divisor as u32,
+            score_multiplier,
+            score_divisor: score_divisor as u32,
+            lane_divisor: lane_divisor as u32,
+            active_property_name,
+            score_property_name,
+            id_property_name,
+            lane_property_name,
+            nested_property_name: row_nested_property_name,
+        });
     let mut rows_values = Vec::with_capacity(iteration_count);
     let active_divisor = active_divisor as u32;
     let score_divisor = score_divisor as u32;
     let lane_divisor = lane_divisor as u32;
     let mut fused_checksum = 0.0;
     let should_fuse_checksum = program_suffix.is_some();
-    let object_properties = &mut state.object_properties;
 
     for index in 0..limit {
         let index_value = f64::from(index);
@@ -14621,33 +14650,11 @@ fn try_execute_scalar_object_traversal_build_loop_candidate<'a>(
         let score_value = f64::from((index * score_multiplier) % score_divisor);
         let lane_value = index % lane_divisor;
         let object_offset = index.checked_mul(2).expect("object offset fits in u32");
-        let nested = ScalarObjectHandle::Object(
-            first_object_id
-                .checked_add(object_offset)
-                .expect("reserved object id fits in u32"),
-        );
         let row = ScalarObjectHandle::Object(
             first_object_id
                 .checked_add(object_offset + 1)
                 .expect("reserved object id fits in u32"),
         );
-        object_properties.push((
-            nested,
-            active_property_name,
-            ScalarValue::Boolean(active_value),
-        ));
-        object_properties.push((
-            nested,
-            score_property_name,
-            ScalarValue::Number(score_value),
-        ));
-        object_properties.push((row, id_property_name, ScalarValue::Number(index_value)));
-        object_properties.push((
-            row,
-            lane_property_name,
-            ScalarValue::Number(f64::from(lane_value)),
-        ));
-        object_properties.push((row, row_nested_property_name, ScalarValue::Object(nested)));
 
         if should_fuse_checksum {
             if active_value {
@@ -21945,6 +21952,7 @@ fn delete_scalar_property(
             Ok(())
         }
         ScalarValue::Object(handle) => {
+            materialize_scalar_object_traversal_object(state, handle);
             state
                 .object_properties
                 .retain(|(object, name, _)| *object != handle || *name != property_name);
@@ -22267,6 +22275,7 @@ fn write_scalar_named_object_property_index<'a>(
     property_name: &'a str,
     value: ScalarValue,
 ) -> usize {
+    materialize_scalar_object_traversal_object(state, object);
     if !state.object_getters.is_empty() {
         state.object_getters.retain(|(stored_object, name, _)| {
             !(*stored_object == object && *name == property_name)
@@ -22368,6 +22377,7 @@ fn write_scalar_named_object_getter_property<'a>(
     property_name: &'a str,
     getter: ScalarValue,
 ) {
+    materialize_scalar_object_traversal_object(state, object);
     state
         .object_properties
         .retain(|(stored_object, name, _)| !(*stored_object == object && *name == property_name));
@@ -22424,6 +22434,151 @@ fn write_scalar_named_function_property<'a>(
 fn scalar_property_name_matches(stored: &str, requested: &str) -> bool {
     stored.len() == requested.len()
         && (stored.as_ptr() == requested.as_ptr() || stored == requested)
+}
+
+fn scalar_object_traversal_layout_entry<'state, 'a>(
+    state: &'state ScalarExecutorState<'a>,
+    object: ScalarObjectHandle,
+) -> Option<(&'state ScalarObjectTraversalLayout<'a>, u32, bool)> {
+    if state
+        .object_traversal_materialized_objects
+        .contains(&object)
+    {
+        return None;
+    }
+    let ScalarObjectHandle::Object(object_id) = object else {
+        return None;
+    };
+
+    for layout in state.object_traversal_layouts.iter().rev() {
+        let Some(object_count) = layout.length.checked_mul(2) else {
+            continue;
+        };
+        let Some(end_object_id) = layout.first_object_id.checked_add(object_count) else {
+            continue;
+        };
+        if object_id < layout.first_object_id || object_id >= end_object_id {
+            continue;
+        }
+        let offset = object_id - layout.first_object_id;
+        return Some((layout, offset / 2, offset % 2 == 0));
+    }
+
+    None
+}
+
+fn read_scalar_object_traversal_property(
+    state: &ScalarExecutorState<'_>,
+    object: ScalarObjectHandle,
+    property_name: &str,
+) -> Option<ScalarValue> {
+    let (layout, index, is_nested) = scalar_object_traversal_layout_entry(state, object)?;
+    if is_nested {
+        if scalar_property_name_matches(layout.active_property_name, property_name) {
+            return Some(ScalarValue::Boolean(index % layout.active_divisor == 0));
+        }
+        if scalar_property_name_matches(layout.score_property_name, property_name) {
+            let score = index.checked_mul(layout.score_multiplier)? % layout.score_divisor;
+            return Some(ScalarValue::Number(f64::from(score)));
+        }
+        return None;
+    }
+
+    if scalar_property_name_matches(layout.id_property_name, property_name) {
+        return Some(ScalarValue::Number(f64::from(index)));
+    }
+    if scalar_property_name_matches(layout.lane_property_name, property_name) {
+        return Some(ScalarValue::Number(f64::from(index % layout.lane_divisor)));
+    }
+    if scalar_property_name_matches(layout.nested_property_name, property_name) {
+        let nested_object_id = layout.first_object_id.checked_add(index.checked_mul(2)?)?;
+        return Some(ScalarValue::Object(ScalarObjectHandle::Object(
+            nested_object_id,
+        )));
+    }
+    None
+}
+
+fn scalar_object_traversal_property_names<'a>(
+    state: &ScalarExecutorState<'a>,
+    object: ScalarObjectHandle,
+) -> Option<Vec<&'a str>> {
+    let (layout, _, is_nested) = scalar_object_traversal_layout_entry(state, object)?;
+    if is_nested {
+        return Some(vec![
+            layout.active_property_name,
+            layout.score_property_name,
+        ]);
+    }
+    Some(vec![
+        layout.id_property_name,
+        layout.lane_property_name,
+        layout.nested_property_name,
+    ])
+}
+
+fn materialize_scalar_object_traversal_object<'a>(
+    state: &mut ScalarExecutorState<'a>,
+    object: ScalarObjectHandle,
+) {
+    if state
+        .object_traversal_materialized_objects
+        .contains(&object)
+    {
+        return;
+    }
+
+    let Some((layout, index, is_nested)) = scalar_object_traversal_layout_entry(state, object)
+    else {
+        return;
+    };
+    let entries = if is_nested {
+        vec![
+            (
+                layout.active_property_name,
+                ScalarValue::Boolean(index % layout.active_divisor == 0),
+            ),
+            (
+                layout.score_property_name,
+                ScalarValue::Number(f64::from(
+                    index
+                        .checked_mul(layout.score_multiplier)
+                        .expect("object traversal score fits in u32")
+                        % layout.score_divisor,
+                )),
+            ),
+        ]
+    } else {
+        let nested_object_id = layout
+            .first_object_id
+            .checked_add(
+                index
+                    .checked_mul(2)
+                    .expect("object traversal row index fits in u32"),
+            )
+            .expect("object traversal nested id fits in u32");
+        vec![
+            (
+                layout.id_property_name,
+                ScalarValue::Number(f64::from(index)),
+            ),
+            (
+                layout.lane_property_name,
+                ScalarValue::Number(f64::from(index % layout.lane_divisor)),
+            ),
+            (
+                layout.nested_property_name,
+                ScalarValue::Object(ScalarObjectHandle::Object(nested_object_id)),
+            ),
+        ]
+    };
+
+    state.object_traversal_materialized_objects.push(object);
+    state.object_property_indices_incomplete = true;
+    clear_scalar_object_property_operand_cache(state);
+    for (property_name, value) in entries {
+        state.object_properties.push((object, property_name, value));
+    }
 }
 
 fn scalar_string_operand_cache_slot(string_id: u32) -> usize {
@@ -22544,6 +22699,9 @@ fn scalar_linear_object_property_names<'a>(
     object: ScalarObjectHandle,
 ) -> Vec<&'a str> {
     let mut names: Vec<&'a str> = Vec::new();
+    if let Some(compact_names) = scalar_object_traversal_property_names(state, object) {
+        names.extend(compact_names);
+    }
     for (stored_object, name, _) in &state.object_properties {
         if *stored_object == object
             && !names
@@ -22865,8 +23023,9 @@ fn read_scalar_own_object_property(
         .iter()
         .rev()
         .find(|(object, _, name)| *object == handle && *name == property_name)
-        .map(|(_, slot, _)| *slot)?;
-    read_scalar_object_slot_value(state, handle, slot)
+        .map(|(_, slot, _)| *slot);
+    slot.and_then(|slot| read_scalar_object_slot_value(state, handle, slot))
+        .or_else(|| read_scalar_object_traversal_property(state, handle, property_name))
 }
 
 fn read_scalar_rn_object_stub_property(property_name: &str) -> Option<ScalarValue> {
@@ -22899,6 +23058,7 @@ fn scalar_object_has_own_named_property(
     property_name: &str,
 ) -> bool {
     scalar_own_object_property_index(state, handle, property_name).is_some()
+        || read_scalar_object_traversal_property(state, handle, property_name).is_some()
 }
 
 fn read_scalar_function_property(
@@ -27667,6 +27827,99 @@ mod tests {
         assert_eq!(
             execute_global_scalar_function(&bytes),
             Ok(ScalarValue::Number(9.0)),
+        );
+    }
+
+    #[test]
+    fn scalar_object_traversal_layout_reads_and_materializes_properties() {
+        let mut state = ScalarExecutorState::default();
+        state
+            .object_traversal_layouts
+            .push(ScalarObjectTraversalLayout {
+                first_object_id: 10,
+                length: 3,
+                active_divisor: 2,
+                score_multiplier: 17,
+                score_divisor: 1024,
+                lane_divisor: 9,
+                active_property_name: "active",
+                score_property_name: "score",
+                id_property_name: "id",
+                lane_property_name: "lane",
+                nested_property_name: "nested",
+            });
+
+        let first_nested = ScalarObjectHandle::Object(10);
+        let third_nested = ScalarObjectHandle::Object(14);
+        let third_row = ScalarObjectHandle::Object(15);
+
+        assert_eq!(
+            read_scalar_own_object_property(&state, third_row, "id"),
+            Some(ScalarValue::Number(2.0)),
+        );
+        assert_eq!(
+            read_scalar_own_object_property(&state, third_row, "lane"),
+            Some(ScalarValue::Number(2.0)),
+        );
+        assert_eq!(
+            read_scalar_own_object_property(&state, third_row, "nested"),
+            Some(ScalarValue::Object(third_nested)),
+        );
+        assert_eq!(
+            read_scalar_own_object_property(&state, third_nested, "active"),
+            Some(ScalarValue::Boolean(true)),
+        );
+        assert_eq!(
+            read_scalar_own_object_property(&state, third_nested, "score"),
+            Some(ScalarValue::Number(34.0)),
+        );
+        assert_eq!(
+            scalar_linear_object_property_names(&state, third_row),
+            vec!["id", "lane", "nested"],
+        );
+        assert!(scalar_object_has_own_named_property(
+            &state, third_row, "lane"
+        ));
+
+        write_scalar_named_object_property(
+            &mut state,
+            third_row,
+            "lane",
+            ScalarValue::Number(99.0),
+        );
+        assert_eq!(
+            read_scalar_own_object_property(&state, third_row, "id"),
+            Some(ScalarValue::Number(2.0)),
+        );
+        assert_eq!(
+            read_scalar_own_object_property(&state, third_row, "lane"),
+            Some(ScalarValue::Number(99.0)),
+        );
+
+        delete_scalar_property(
+            &mut state,
+            1,
+            HermesInstruction {
+                offset: 123,
+                opcode: DEL_BY_VAL_OPCODE,
+                width: 5,
+            },
+            0,
+            ScalarValue::Object(third_row),
+            ScalarPropertyKey::Name("id"),
+        )
+        .expect("delete compact row property");
+        assert_eq!(
+            read_scalar_own_object_property(&state, third_row, "id"),
+            None
+        );
+        assert_eq!(
+            read_scalar_own_object_property(&state, third_row, "lane"),
+            Some(ScalarValue::Number(99.0)),
+        );
+        assert_eq!(
+            read_scalar_own_object_property(&state, first_nested, "score"),
+            Some(ScalarValue::Number(0.0)),
         );
     }
 

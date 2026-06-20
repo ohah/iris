@@ -3028,6 +3028,7 @@ pub fn profile_hbc_global_scalar_execution(bytes: &[u8]) -> Result<String, Parse
 struct ScalarExecutorState<'a> {
     array_element_indices: HashMap<(ScalarObjectHandle, u32), usize>,
     array_elements: Vec<(ScalarObjectHandle, u32, ScalarValue)>,
+    array_inline3_storage: Vec<Option<[ScalarValue; 3]>>,
     array_lengths: Vec<Option<u32>>,
     array_storage: Vec<Option<Vec<ScalarValue>>>,
     declared_globals: Vec<&'a str>,
@@ -13045,6 +13046,11 @@ fn try_execute_scalar_json_payload_build_loop_candidate<'a>(
             .array_storage
             .resize_with(last_storage_index + 1, || None);
     }
+    if state.array_inline3_storage.len() <= last_storage_index {
+        state
+            .array_inline3_storage
+            .resize_with(last_storage_index + 1, || None);
+    }
 
     let mut payload_values = Vec::with_capacity(iteration_count);
     let mut fused_checksum = 0.0;
@@ -13092,7 +13098,7 @@ fn try_execute_scalar_json_payload_build_loop_candidate<'a>(
         })
         .expect("points array id fits in usize");
         state.array_lengths[points_storage_index] = Some(3);
-        state.array_storage[points_storage_index] = Some(vec![
+        state.array_inline3_storage[points_storage_index] = Some([
             ScalarValue::Number(index_value),
             ScalarValue::Number(point_one_value),
             ScalarValue::Number(point_two_value),
@@ -20967,6 +20973,13 @@ fn write_scalar_array_element(
         if state.array_storage.len() <= storage_index {
             state.array_storage.resize_with(storage_index + 1, || None);
         }
+        if let Some(inline_storage) = state
+            .array_inline3_storage
+            .get_mut(storage_index)
+            .and_then(Option::take)
+        {
+            state.array_storage[storage_index] = Some(inline_storage.to_vec());
+        }
         let storage = state.array_storage[storage_index].get_or_insert_with(Vec::new);
         let index = usize::try_from(index).expect("array index fits in usize");
         if storage.len() <= index {
@@ -21009,8 +21022,20 @@ fn read_scalar_array_element(
 
     if let ScalarObjectHandle::Array(object_id) = array {
         let storage_index = usize::try_from(object_id).expect("array id fits in usize");
-        return state
+        if let Some(value) = state
             .array_storage
+            .get(storage_index)
+            .and_then(Option::as_ref)
+            .and_then(|storage| {
+                storage
+                    .get(usize::try_from(index).expect("array index fits in usize"))
+                    .copied()
+            })
+        {
+            return value;
+        }
+        return state
+            .array_inline3_storage
             .get(storage_index)
             .and_then(Option::as_ref)
             .and_then(|storage| {
@@ -21865,6 +21890,17 @@ fn delete_scalar_property(
                             usize::try_from(object_id).expect("array id fits in usize");
                         if let Some(storage) = state
                             .array_storage
+                            .get_mut(storage_index)
+                            .and_then(Option::as_mut)
+                        {
+                            if let Some(slot) = storage
+                                .get_mut(usize::try_from(index).expect("array index fits in usize"))
+                            {
+                                *slot = ScalarValue::Undefined;
+                            }
+                        }
+                        if let Some(storage) = state
+                            .array_inline3_storage
                             .get_mut(storage_index)
                             .and_then(Option::as_mut)
                         {

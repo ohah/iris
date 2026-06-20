@@ -10499,6 +10499,232 @@ fn try_execute_scalar_json_round_trip_checksum_loop_candidate<'a>(
     Ok(Some(jump_instruction_index + 1))
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ScalarObjectTraversalProgramSuffix<'a> {
+    checksum_string_id: u32,
+    checksum_property_name: &'a str,
+    row_index_string_id: u32,
+    row_index_property_name: &'a str,
+    current_string_id: u32,
+    current_property_name: &'a str,
+    final_checksum_string_id: u32,
+    final_checksum_property_name: &'a str,
+    ret_register: u32,
+    ret_instruction_index: usize,
+}
+
+fn try_read_scalar_object_traversal_program_suffix<'a>(
+    bytecode: &HermesBytecode<'a>,
+    registers: &[ScalarValue],
+    function_id: u32,
+    instructions: &[HermesInstruction],
+    instruction_bytes: &[&[u8]],
+    string_operand_cache: &mut ScalarStringOperandCache<'a>,
+    instruction_index: usize,
+    global_base_register: u32,
+) -> Result<Option<ScalarObjectTraversalProgramSuffix<'a>>, ScalarExecutionError> {
+    let Some(ret_instruction_index) = instruction_index.checked_add(70) else {
+        return Ok(None);
+    };
+    if instructions.get(ret_instruction_index).is_none() {
+        return Ok(None);
+    }
+
+    let suffix_start = instruction_index + 33;
+    let suffix_window = &instructions[suffix_start..=ret_instruction_index];
+    let expected_opcodes = [
+        74, 74, 68, 68, 68, 186, 68, 68, 93, 74, 68, 68, 68, 68, 68, 176, 68, 30, 74, 174, 68, 30,
+        68, 68, 68, 30, 74, 68, 30, 74, 68, 68, 68, 184, 72, 68, 74, 118,
+    ];
+    if suffix_window
+        .iter()
+        .zip(expected_opcodes)
+        .any(|(instruction, expected_opcode)| instruction.opcode != expected_opcode)
+    {
+        return Ok(None);
+    }
+
+    let pre_loop_jump_instruction = instructions[instruction_index + 38];
+    let pre_loop_jump_bytes = instruction_bytes[instruction_index + 38];
+    let pre_loop_delta_width = scalar_jump_delta_width(pre_loop_jump_instruction.opcode);
+    let branch_instruction = instructions[instruction_index + 48];
+    let branch_bytes = instruction_bytes[instruction_index + 48];
+    let branch_delta_width = scalar_jump_delta_width(branch_instruction.opcode);
+    let skip_active_instruction = instructions[instruction_index + 52];
+    let skip_active_bytes = instruction_bytes[instruction_index + 52];
+    let skip_active_delta_width = scalar_jump_delta_width(skip_active_instruction.opcode);
+    let loop_jump_instruction = instructions[instruction_index + 66];
+    let loop_jump_bytes = instruction_bytes[instruction_index + 66];
+    let loop_delta_width = scalar_jump_delta_width(loop_jump_instruction.opcode);
+    if read_scalar_jump_target(
+        pre_loop_jump_instruction,
+        pre_loop_jump_bytes,
+        1,
+        pre_loop_delta_width,
+    ) != instructions[instruction_index + 67].offset
+        || read_scalar_jump_target(branch_instruction, branch_bytes, 1, branch_delta_width)
+            != instructions[instruction_index + 53].offset
+        || read_scalar_jump_target(
+            skip_active_instruction,
+            skip_active_bytes,
+            1,
+            skip_active_delta_width,
+        ) != instructions[instruction_index + 60].offset
+        || read_scalar_jump_target(loop_jump_instruction, loop_jump_bytes, 1, loop_delta_width)
+            != instructions[instruction_index + 39].offset
+    {
+        return Ok(None);
+    }
+
+    let property_checks = [
+        (33, 4, 2, "checksum"),
+        (34, 4, 2, "rowIndex"),
+        (35, 4, 1, "rowIndex"),
+        (36, 4, 1, "rows"),
+        (37, 4, 1, "length"),
+        (39, 4, 1, "rows"),
+        (40, 4, 1, "rowIndex"),
+        (42, 4, 2, "current"),
+        (43, 4, 1, "current"),
+        (44, 4, 1, "nested"),
+        (45, 4, 1, "active"),
+        (46, 4, 1, "checksum"),
+        (47, 4, 1, "current"),
+        (49, 4, 1, "lane"),
+        (51, 4, 2, "checksum"),
+        (53, 4, 1, "id"),
+        (55, 4, 1, "current"),
+        (56, 4, 1, "nested"),
+        (57, 4, 1, "score"),
+        (59, 4, 2, "checksum"),
+        (60, 4, 1, "rowIndex"),
+        (62, 4, 2, "rowIndex"),
+        (63, 4, 1, "rowIndex"),
+        (64, 4, 1, "rows"),
+        (65, 4, 1, "length"),
+        (67, 4, 2, "globalThis"),
+        (68, 4, 1, "checksum"),
+        (69, 4, 2, "__irisStrictHbcChecksum"),
+    ];
+    for (relative_index, operand_offset, operand_width, expected_name) in property_checks {
+        let string_id = read_unsigned_operand(
+            instruction_bytes[instruction_index + relative_index],
+            operand_offset,
+            operand_width,
+        );
+        let property_name = read_cached_scalar_string_operand(
+            bytecode,
+            string_operand_cache,
+            function_id,
+            instructions[instruction_index + relative_index],
+            string_id,
+        )?;
+        if property_name != expected_name {
+            return Ok(None);
+        }
+    }
+
+    let checksum_init_put_bytes = instruction_bytes[instruction_index + 33];
+    let row_index_init_put_bytes = instruction_bytes[instruction_index + 34];
+    let current_put_bytes = instruction_bytes[instruction_index + 42];
+    let checksum_loop_put_bytes = instruction_bytes[instruction_index + 59];
+    let row_index_loop_put_bytes = instruction_bytes[instruction_index + 62];
+    let global_this_get_bytes = instruction_bytes[instruction_index + 67];
+    let final_checksum_get_bytes = instruction_bytes[instruction_index + 68];
+    let final_checksum_put_bytes = instruction_bytes[instruction_index + 69];
+    let ret_bytes = instruction_bytes[ret_instruction_index];
+    for bytes in [
+        instruction_bytes[instruction_index + 35],
+        instruction_bytes[instruction_index + 36],
+        instruction_bytes[instruction_index + 39],
+        instruction_bytes[instruction_index + 40],
+        instruction_bytes[instruction_index + 43],
+        instruction_bytes[instruction_index + 46],
+        instruction_bytes[instruction_index + 47],
+        instruction_bytes[instruction_index + 55],
+        instruction_bytes[instruction_index + 60],
+        instruction_bytes[instruction_index + 63],
+        instruction_bytes[instruction_index + 64],
+        global_this_get_bytes,
+        final_checksum_get_bytes,
+    ] {
+        if read_unsigned_operand(bytes, 2, 1) != global_base_register {
+            return Ok(None);
+        }
+    }
+    for bytes in [
+        checksum_init_put_bytes,
+        row_index_init_put_bytes,
+        current_put_bytes,
+        checksum_loop_put_bytes,
+        row_index_loop_put_bytes,
+    ] {
+        if read_unsigned_operand(bytes, 1, 1) != global_base_register {
+            return Ok(None);
+        }
+    }
+
+    let zero_register = read_unsigned_operand(checksum_init_put_bytes, 2, 1);
+    let row_index_zero_register = read_unsigned_operand(row_index_init_put_bytes, 2, 1);
+    let global_this_register = read_unsigned_operand(global_this_get_bytes, 1, 1);
+    let final_checksum_register = read_unsigned_operand(final_checksum_get_bytes, 1, 1);
+    let ret_register = read_unsigned_operand(ret_bytes, 1, 1);
+    if zero_register != row_index_zero_register
+        || registers.get(zero_register as usize) != Some(&ScalarValue::Number(0.0))
+        || read_unsigned_operand(final_checksum_put_bytes, 1, 1) != global_this_register
+        || read_unsigned_operand(final_checksum_put_bytes, 2, 1) != final_checksum_register
+        || final_checksum_register != ret_register
+        || registers.get(ret_register as usize).is_none()
+    {
+        return Ok(None);
+    }
+
+    let checksum_string_id = read_unsigned_operand(checksum_loop_put_bytes, 4, 2);
+    let row_index_string_id = read_unsigned_operand(row_index_loop_put_bytes, 4, 2);
+    let current_string_id = read_unsigned_operand(current_put_bytes, 4, 2);
+    let final_checksum_string_id = read_unsigned_operand(final_checksum_put_bytes, 4, 2);
+    let checksum_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 59],
+        checksum_string_id,
+    )?;
+    let row_index_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 62],
+        row_index_string_id,
+    )?;
+    let current_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 42],
+        current_string_id,
+    )?;
+    let final_checksum_property_name = read_cached_scalar_string_operand(
+        bytecode,
+        string_operand_cache,
+        function_id,
+        instructions[instruction_index + 69],
+        final_checksum_string_id,
+    )?;
+    Ok(Some(ScalarObjectTraversalProgramSuffix {
+        checksum_string_id,
+        checksum_property_name,
+        row_index_string_id,
+        row_index_property_name,
+        current_string_id,
+        current_property_name,
+        final_checksum_string_id,
+        final_checksum_property_name,
+        ret_register,
+        ret_instruction_index,
+    }))
+}
+
 fn try_execute_scalar_object_traversal_build_loop_candidate<'a>(
     bytecode: &HermesBytecode<'a>,
     state: &mut ScalarExecutorState<'a>,
@@ -10772,6 +10998,16 @@ fn try_execute_scalar_object_traversal_build_loop_candidate<'a>(
     {
         return Ok(None);
     }
+    let program_suffix = try_read_scalar_object_traversal_program_suffix(
+        bytecode,
+        registers,
+        function_id,
+        instructions,
+        instruction_bytes,
+        string_operand_cache,
+        instruction_index,
+        global_base_register,
+    )?;
 
     let ScalarValue::Object(rows_array @ ScalarObjectHandle::Array(rows_id)) =
         read_cached_scalar_global_property(state, rows_string_id, rows_property_name)
@@ -10862,17 +11098,21 @@ fn try_execute_scalar_object_traversal_build_loop_candidate<'a>(
     let lane_divisor = lane_divisor as u32;
     let mut last_nested = ScalarValue::Undefined;
     let mut last_row = ScalarValue::Undefined;
+    let mut fused_checksum = 0.0;
 
     for index in 0..limit {
         let index_value = f64::from(index);
+        let active_value = index % active_divisor == 0;
+        let score_value = (index_value * score_multiplier) % f64::from(score_divisor);
+        let lane_value = index % lane_divisor;
         let nested = allocate_scalar_object(state);
         write_scalar_new_object_properties2_unindexed(
             state,
             nested,
             active_property_name,
-            ScalarValue::Boolean(index % active_divisor == 0),
+            ScalarValue::Boolean(active_value),
             score_property_name,
-            ScalarValue::Number((index_value * score_multiplier) % f64::from(score_divisor)),
+            ScalarValue::Number(score_value),
         );
 
         let row = allocate_scalar_object(state);
@@ -10882,11 +11122,21 @@ fn try_execute_scalar_object_traversal_build_loop_candidate<'a>(
             id_property_name,
             ScalarValue::Number(index_value),
             lane_property_name,
-            ScalarValue::Number(f64::from(index % lane_divisor)),
+            ScalarValue::Number(f64::from(lane_value)),
             row_nested_property_name,
             ScalarValue::Object(nested),
         );
 
+        if program_suffix.is_some() {
+            if active_value {
+                fused_checksum = fused_checksum + index_value + score_value;
+            } else {
+                fused_checksum += f64::from(lane_value);
+            }
+            if !fused_checksum.is_finite() {
+                return Ok(None);
+            }
+        }
         last_nested = ScalarValue::Object(nested);
         last_row = ScalarValue::Object(row);
         rows_values.push(last_row);
@@ -10932,6 +11182,35 @@ fn try_execute_scalar_object_traversal_build_loop_candidate<'a>(
     registers[rows_index_register as usize] = ScalarValue::Number(f64::from(limit - 1));
     registers[rows_row_register as usize] = last_row;
     registers[update_register as usize] = limit_value;
+    if let Some(suffix) = program_suffix {
+        let checksum_value = ScalarValue::Number(fused_checksum);
+        write_cached_scalar_global_property(
+            state,
+            suffix.current_string_id,
+            suffix.current_property_name,
+            last_row,
+        );
+        write_cached_scalar_global_property(
+            state,
+            suffix.checksum_string_id,
+            suffix.checksum_property_name,
+            checksum_value,
+        );
+        write_cached_scalar_global_property(
+            state,
+            suffix.row_index_string_id,
+            suffix.row_index_property_name,
+            limit_value,
+        );
+        write_cached_scalar_global_property(
+            state,
+            suffix.final_checksum_string_id,
+            suffix.final_checksum_property_name,
+            checksum_value,
+        );
+        registers[suffix.ret_register as usize] = checksum_value;
+        return Ok(Some(suffix.ret_instruction_index));
+    }
     Ok(Some(jump_instruction_index + 1))
 }
 

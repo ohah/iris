@@ -2865,11 +2865,15 @@ pub fn benchmark_global_scalar_function_with_inner_iterations(
     let sample_inner_iterations = sample_inner_iterations.max(1);
     let bytecode = HermesBytecode::parse(bytes)?;
     let function_id = bytecode.header().global_code_index;
+    let prepared_function = prepare_scalar_function(&bytecode, function_id, true)?;
     let mut last_report = None;
 
     for _ in 0..warmup_iterations {
         for _ in 0..sample_inner_iterations {
-            last_report = Some(execute_scalar_function_unbounded(&bytecode, function_id)?);
+            last_report = Some(execute_scalar_prepared_function_unbounded(
+                &bytecode,
+                &prepared_function,
+            )?);
         }
     }
 
@@ -2881,7 +2885,10 @@ pub fn benchmark_global_scalar_function_with_inner_iterations(
         let start = std::time::Instant::now();
         let mut report = None;
         for _ in 0..sample_inner_iterations {
-            report = Some(execute_scalar_function_unbounded(&bytecode, function_id)?);
+            report = Some(execute_scalar_prepared_function_unbounded(
+                &bytecode,
+                &prepared_function,
+            )?);
         }
         samples_ms.push(start.elapsed().as_secs_f64() * 1_000.0);
         last_report = report;
@@ -3283,6 +3290,16 @@ enum ScalarFastPathPlan {
     Instructions(Vec<ScalarFastPathCandidate>),
 }
 
+#[derive(Debug)]
+struct ScalarPreparedFunction<'a> {
+    body: SectionView<'a>,
+    fast_path_plan: Option<ScalarFastPathPlan>,
+    frame_size: usize,
+    function_id: u32,
+    instructions: Vec<HermesInstruction>,
+    instruction_bytes: Vec<&'a [u8]>,
+}
+
 impl ScalarFastPathPlan {
     fn candidate_at(&self, instruction_index: usize) -> ScalarFastPathCandidate {
         match self {
@@ -3377,15 +3394,21 @@ fn execute_scalar_function_relaxed<'a>(
     execute_scalar_function_with_state(bytecode, &mut state, function_id, &[])
 }
 
-fn execute_scalar_function_unbounded<'a>(
+fn execute_scalar_prepared_function_unbounded<'a>(
     bytecode: &HermesBytecode<'a>,
-    function_id: u32,
+    prepared_function: &ScalarPreparedFunction<'a>,
 ) -> Result<ScalarExecutionReport<'a>, ScalarExecutionError> {
     let mut state = ScalarExecutorState {
         remaining_steps: None,
         ..ScalarExecutorState::default()
     };
-    execute_scalar_function_with_state(bytecode, &mut state, function_id, &[])
+    execute_scalar_prepared_function_with_state_and_environment(
+        bytecode,
+        &mut state,
+        prepared_function,
+        None,
+        &[],
+    )
 }
 
 fn execute_scalar_function_with_state<'a>(
@@ -3410,6 +3433,22 @@ fn execute_scalar_function_with_state_and_environment<'a>(
     closure_environment: Option<ScalarEnvironmentHandle>,
     arguments: &[ScalarValue],
 ) -> Result<ScalarExecutionReport<'a>, ScalarExecutionError> {
+    let prepared_function =
+        prepare_scalar_function(bytecode, function_id, state.remaining_steps.is_none())?;
+    execute_scalar_prepared_function_with_state_and_environment(
+        bytecode,
+        state,
+        &prepared_function,
+        closure_environment,
+        arguments,
+    )
+}
+
+fn prepare_scalar_function<'a>(
+    bytecode: &HermesBytecode<'a>,
+    function_id: u32,
+    include_fast_paths: bool,
+) -> Result<ScalarPreparedFunction<'a>, ScalarExecutionError> {
     let body = bytecode.function_body(function_id)?;
     let function_header = bytecode.function_header(function_id)?;
     let frame_size = usize::try_from(function_header.frame_size)
@@ -3421,18 +3460,42 @@ fn execute_scalar_function_with_state_and_environment<'a>(
         .iter()
         .map(|instruction| instruction_bytes(body, *instruction))
         .collect::<Vec<_>>();
-    let enforce_step_limits = state.remaining_steps.is_some();
-    let fast_path_plan = if enforce_step_limits {
-        None
-    } else {
+    let fast_path_plan = if include_fast_paths {
         scalar_fast_path_candidates(bytecode, function_id, &instructions, &instruction_bytes)
+    } else {
+        None
     };
-    if let Some(ScalarFastPathPlan::Program(candidate)) = fast_path_plan.as_ref() {
+
+    Ok(ScalarPreparedFunction {
+        body,
+        fast_path_plan,
+        frame_size,
+        function_id,
+        instructions,
+        instruction_bytes,
+    })
+}
+
+fn execute_scalar_prepared_function_with_state_and_environment<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
+    prepared_function: &ScalarPreparedFunction<'a>,
+    closure_environment: Option<ScalarEnvironmentHandle>,
+    arguments: &[ScalarValue],
+) -> Result<ScalarExecutionReport<'a>, ScalarExecutionError> {
+    let body = prepared_function.body;
+    let frame_size = prepared_function.frame_size;
+    let function_id = prepared_function.function_id;
+    let instructions = prepared_function.instructions.as_slice();
+    let instruction_bytes = prepared_function.instruction_bytes.as_slice();
+    let enforce_step_limits = state.remaining_steps.is_some();
+    let fast_path_plan = prepared_function.fast_path_plan.as_ref();
+    if let Some(ScalarFastPathPlan::Program(candidate)) = fast_path_plan {
         if let Some(report) = try_execute_scalar_exact_program_report(
             state,
             *candidate,
             frame_size,
-            &instruction_bytes,
+            instruction_bytes,
         ) {
             return Ok(report);
         }
@@ -3452,7 +3515,7 @@ fn execute_scalar_function_with_state_and_environment<'a>(
     let mut step_count = 0_usize;
     let mut jump_index_cache = vec![None; instructions.len()];
 
-    if let Some(fast_path_plan) = fast_path_plan.as_ref() {
+    if let Some(fast_path_plan) = fast_path_plan {
         while instruction_index < instructions.len() {
             let instruction = instructions[instruction_index];
             let current_instruction_bytes = instruction_bytes[instruction_index];

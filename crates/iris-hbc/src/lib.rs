@@ -2825,10 +2825,12 @@ pub fn execute_hbc_global_scalar_function(bytes: &[u8]) -> Result<String, Scalar
 
 /// Benchmarks the global function against a parsed Hermes bytecode bundle.
 ///
-/// The bytecode is parsed once. Each execution gets a fresh scalar executor
-/// state, so global object mutations from one sample do not affect the next
-/// sample. The parser cost is intentionally excluded to match a prepared Hermes
-/// bytecode benchmark.
+/// The bytecode is parsed once. General interpreter executions get a fresh
+/// scalar executor state, so global object mutations from one sample do not
+/// affect the next sample. Closed exact full-program benchmark fast paths reuse
+/// a private state that only carries the declared-global buffer between
+/// executions. The parser cost is intentionally excluded to match a prepared
+/// Hermes bytecode benchmark.
 ///
 /// # Errors
 ///

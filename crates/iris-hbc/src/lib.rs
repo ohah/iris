@@ -19391,6 +19391,16 @@ fn execute_scalar_instruction<'a>(
                 )?;
                 return Ok(ScalarInstructionResult::Continue);
             }
+            if try_write_cached_scalar_math_intrinsic_operand(
+                state,
+                registers,
+                string_operand_cache,
+                base_register,
+                destination,
+                string_id,
+            ) {
+                return Ok(ScalarInstructionResult::Continue);
+            }
             let property_name = read_cached_scalar_string_operand(
                 bytecode,
                 string_operand_cache,
@@ -25509,6 +25519,41 @@ fn try_write_cached_scalar_global_math_operand(
     true
 }
 
+#[inline(never)]
+fn try_write_cached_scalar_math_intrinsic_operand(
+    state: &ScalarExecutorState<'_>,
+    registers: &mut [ScalarValue],
+    string_operand_cache: &ScalarStringOperandCache<'_>,
+    base_register: u32,
+    destination: u32,
+    string_id: u32,
+) -> bool {
+    let cache_slot = scalar_string_operand_cache_slot(string_id);
+    let Some((cached_id, property_name)) = string_operand_cache.entries[cache_slot] else {
+        return false;
+    };
+    if cached_id != string_id {
+        return false;
+    }
+    let Some(value) = read_scalar_math_intrinsic_property(property_name) else {
+        return false;
+    };
+    if !matches!(
+        registers.get(base_register as usize),
+        Some(ScalarValue::Object(ScalarObjectHandle::Math))
+    ) || !state.object_getters.is_empty()
+        || read_scalar_object_prototype(state, ScalarObjectHandle::Math).is_some()
+    {
+        return false;
+    }
+    let Some(destination_slot) = registers.get_mut(destination as usize) else {
+        return false;
+    };
+
+    *destination_slot = value;
+    true
+}
+
 fn read_cached_scalar_global_property<'a>(
     state: &mut ScalarExecutorState<'a>,
     string_id: u32,
@@ -31358,6 +31403,45 @@ mod tests {
             Ok(ScalarInstructionResult::Continue),
         );
         assert_eq!(registers[0], ScalarValue::Object(ScalarObjectHandle::Math),);
+    }
+
+    #[test]
+    fn scalar_get_by_id_math_intrinsic_cache_path_writes_function() {
+        let bytes = fixture_bytecode();
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid Hermes bytecode");
+        let instruction = HermesInstruction {
+            offset: 123,
+            opcode: GET_BY_ID_SHORT_OPCODE,
+            width: 6,
+        };
+        let instruction_bytes = [GET_BY_ID_SHORT_OPCODE, 0, 1, 0, 1, 0];
+        let mut state = ScalarExecutorState::default();
+        let mut registers = [
+            ScalarValue::Empty,
+            ScalarValue::Object(ScalarObjectHandle::Math),
+        ];
+        let mut string_operand_cache = ScalarStringOperandCache::default();
+        let cache_slot = scalar_string_operand_cache_slot(1);
+        string_operand_cache.entries[cache_slot] = Some((1, "sqrt"));
+
+        assert_eq!(
+            execute_scalar_instruction(
+                &bytecode,
+                &mut state,
+                &mut registers,
+                &[],
+                1,
+                &instruction_bytes,
+                &mut string_operand_cache,
+                instruction,
+                None,
+            ),
+            Ok(ScalarInstructionResult::Continue),
+        );
+        assert_eq!(
+            registers[0],
+            ScalarValue::Function(ScalarFunctionHandle::NativeMathSqrt),
+        );
     }
 
     #[test]

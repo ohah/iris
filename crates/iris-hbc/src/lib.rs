@@ -25094,9 +25094,10 @@ fn scalar_object_traversal_layout_entry<'state, 'a>(
     state: &'state ScalarExecutorState<'a>,
     object: ScalarObjectHandle,
 ) -> Option<(&'state ScalarObjectTraversalLayout<'a>, u32, bool)> {
-    if state
-        .object_traversal_materialized_objects
-        .contains(&object)
+    if !state.object_traversal_materialized_objects.is_empty()
+        && state
+            .object_traversal_materialized_objects
+            .contains(&object)
     {
         return None;
     }
@@ -25229,7 +25230,9 @@ fn scalar_json_payload_layout_entry<'state, 'a>(
     state: &'state ScalarExecutorState<'a>,
     object: ScalarObjectHandle,
 ) -> Option<(&'state ScalarJsonPayloadLayout<'a>, u32, bool)> {
-    if state.json_payload_materialized_objects.contains(&object) {
+    if !state.json_payload_materialized_objects.is_empty()
+        && state.json_payload_materialized_objects.contains(&object)
+    {
         return None;
     }
     let ScalarObjectHandle::Object(object_id) = object else {
@@ -25316,7 +25319,9 @@ fn materialize_scalar_json_payload_object<'a>(
     state: &mut ScalarExecutorState<'a>,
     object: ScalarObjectHandle,
 ) {
-    if state.json_payload_materialized_objects.contains(&object) {
+    if !state.json_payload_materialized_objects.is_empty()
+        && state.json_payload_materialized_objects.contains(&object)
+    {
         return;
     }
 
@@ -25381,9 +25386,10 @@ fn materialize_scalar_object_traversal_object<'a>(
     state: &mut ScalarExecutorState<'a>,
     object: ScalarObjectHandle,
 ) {
-    if state
-        .object_traversal_materialized_objects
-        .contains(&object)
+    if !state.object_traversal_materialized_objects.is_empty()
+        && state
+            .object_traversal_materialized_objects
+            .contains(&object)
     {
         return;
     }

@@ -19369,6 +19369,22 @@ fn execute_scalar_instruction<'a>(
                 write_scalar_register(registers, function_id, instruction, destination, value)?;
                 return Ok(ScalarInstructionResult::Continue);
             }
+            if let Some(ScalarValue::Object(handle @ ScalarObjectHandle::Object(_))) =
+                registers.get(base_register as usize).copied()
+                && let Some(index) =
+                    scalar_cached_own_object_property_index(state, handle, string_id)
+                && state.object_getters.is_empty()
+                && read_scalar_object_prototype(state, handle).is_none()
+            {
+                write_scalar_register(
+                    registers,
+                    function_id,
+                    instruction,
+                    destination,
+                    state.object_properties[index].2,
+                )?;
+                return Ok(ScalarInstructionResult::Continue);
+            }
             let property_name = read_cached_scalar_string_operand(
                 bytecode,
                 string_operand_cache,
@@ -25178,15 +25194,26 @@ fn read_cached_scalar_own_object_property<'a>(
     property_name: &'a str,
 ) -> Option<ScalarValue> {
     let slot = scalar_string_operand_cache_slot(string_id);
-    if let Some((cached_object, cached_id, index)) = state.object_property_operand_cache[slot] {
-        if cached_object == object && cached_id == string_id {
-            return Some(state.object_properties[index].2);
-        }
+    if let Some(index) = scalar_cached_own_object_property_index(state, object, string_id) {
+        return Some(state.object_properties[index].2);
     }
 
     let index = scalar_own_object_property_index(state, object, property_name)?;
     state.object_property_operand_cache[slot] = Some((object, string_id, index));
     Some(state.object_properties[index].2)
+}
+
+fn scalar_cached_own_object_property_index(
+    state: &ScalarExecutorState<'_>,
+    object: ScalarObjectHandle,
+    string_id: u32,
+) -> Option<usize> {
+    let slot = scalar_string_operand_cache_slot(string_id);
+    let (cached_object, cached_id, index) = state.object_property_operand_cache[slot]?;
+    if cached_object == object && cached_id == string_id {
+        return Some(index);
+    }
+    None
 }
 
 fn read_scalar_global_property(

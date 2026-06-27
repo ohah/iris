@@ -19731,6 +19731,19 @@ fn execute_scalar_instruction<'a>(
             let destination = read_unsigned_operand(instruction_bytes, 1, 1);
             let base_register = read_unsigned_operand(instruction_bytes, 2, 1);
             let key_register = read_unsigned_operand(instruction_bytes, 3, 1);
+            if let (
+                Some(ScalarValue::Object(handle @ ScalarObjectHandle::Array(_))),
+                Some(ScalarValue::Number(key_number)),
+                Some(destination_slot),
+            ) = (
+                registers.get(base_register as usize).copied(),
+                registers.get(key_register as usize).copied(),
+                registers.get_mut(destination as usize),
+            ) && let Some(index) = scalar_number_to_u32(key_number)
+            {
+                *destination_slot = read_scalar_array_element(state, handle, index);
+                return Ok(ScalarInstructionResult::Continue);
+            }
             let key_value =
                 read_scalar_register(registers, function_id, instruction, key_register)?;
             if let Some(index) = scalar_value_to_u32(key_value) {

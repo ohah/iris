@@ -19911,6 +19911,13 @@ fn execute_scalar_instruction<'a>(
         108 | 110 | 111 | 112 => {
             let destination = read_unsigned_operand(instruction_bytes, 1, 1);
             let callee_register = read_unsigned_operand(instruction_bytes, 2, 1);
+            if try_execute_scalar_native_math_call2_direct(
+                registers,
+                instruction,
+                instruction_bytes,
+            ) {
+                return Ok(ScalarInstructionResult::Continue);
+            }
             let callee =
                 read_scalar_register(registers, function_id, instruction, callee_register)?;
             let value = call_scalar_direct_function(
@@ -20837,6 +20844,37 @@ fn call_scalar_native_math_number(
         _ => return None,
     };
     Some(ScalarValue::Number(value))
+}
+
+#[inline]
+fn try_execute_scalar_native_math_call2_direct(
+    registers: &mut [ScalarValue],
+    instruction: HermesInstruction,
+    instruction_bytes: &[u8],
+) -> bool {
+    if instruction.opcode != 110 {
+        return false;
+    }
+
+    let destination = read_unsigned_operand(instruction_bytes, 1, 1);
+    let callee_register = read_unsigned_operand(instruction_bytes, 2, 1);
+    let value_register = read_unsigned_operand(instruction_bytes, 4, 1);
+    let Some(ScalarValue::Function(function)) = registers.get(callee_register as usize).copied()
+    else {
+        return false;
+    };
+    let Some(ScalarValue::Number(value)) = registers.get(value_register as usize).copied() else {
+        return false;
+    };
+    let Some(result) = call_scalar_native_math_number(function, value) else {
+        return false;
+    };
+    let Some(destination_slot) = registers.get_mut(destination as usize) else {
+        return false;
+    };
+
+    *destination_slot = result;
+    true
 }
 
 fn scalar_constructor_arguments(
@@ -32157,6 +32195,38 @@ mod tests {
             ),
             Ok(None),
         );
+        assert_eq!(registers[0], ScalarValue::Empty);
+    }
+
+    #[test]
+    fn scalar_native_math_call2_direct_writes_number_result() {
+        let instruction = HermesInstruction {
+            offset: 123,
+            opcode: CALL2_OPCODE,
+            width: 5,
+        };
+        let instruction_bytes = [CALL2_OPCODE, 0, 1, 2, 3];
+        let mut registers = [
+            ScalarValue::Empty,
+            ScalarValue::Function(ScalarFunctionHandle::NativeMathSqrt),
+            ScalarValue::Undefined,
+            ScalarValue::Number(9.0),
+        ];
+
+        assert!(try_execute_scalar_native_math_call2_direct(
+            &mut registers,
+            instruction,
+            &instruction_bytes,
+        ));
+        assert_eq!(registers[0], ScalarValue::Number(3.0));
+
+        registers[0] = ScalarValue::Empty;
+        registers[1] = ScalarValue::Function(ScalarFunctionHandle::NativeJsonParse);
+        assert!(!try_execute_scalar_native_math_call2_direct(
+            &mut registers,
+            instruction,
+            &instruction_bytes,
+        ));
         assert_eq!(registers[0], ScalarValue::Empty);
     }
 

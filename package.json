@@ -37,6 +37,7 @@
     "bench:strict-hbc-global-access": "bun run tools/bench/run-strict-hbc-engine-comparison.ts --case=global-access-diagnostic --case=global-access-lexical-diagnostic --warmup=5 --iterations=15 --rounds=2 --output=artifacts/bench/strict-hbc-engine-comparison-global-access.json",
     "bench:strict-hbc-math-lookup": "bun run tools/bench/run-strict-hbc-engine-comparison.ts --case=math-lookup-diagnostic --case=math-lookup-bound-diagnostic --warmup=5 --iterations=15 --rounds=2 --output=artifacts/bench/strict-hbc-engine-comparison-math-lookup.json",
     "bench:strict-hbc-profile": "bun run tools/bench/run-strict-hbc-profile.ts",
+    "bench:strict-hbc-timing-profile": "bun run tools/bench/run-strict-hbc-timing-profile.ts",
     "bench:strict-hbc-source-shape": "bun run tools/bench/run-strict-hbc-engine-comparison.ts --case=numeric-loop --case=numeric-loop-lexical --case=js-compute --case=js-compute-lexical --case=property-loop --case=property-loop-lexical --case=typed-array-copy --case=typed-array-copy-lexical --warmup=5 --iterations=15 --rounds=2 --output=artifacts/bench/strict-hbc-engine-comparison-lexical-shape.json",
     "format": "oxfmt --write .",
     "format:check": "oxfmt --check .",

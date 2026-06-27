@@ -20151,7 +20151,43 @@ fn execute_scalar_instruction<'a>(
                 Ok(ScalarInstructionResult::Continue)
             }
         }
-        184..=206 => {
+        184 => {
+            let left_register = read_unsigned_operand(instruction_bytes, 5, 1);
+            let right_register = read_unsigned_operand(instruction_bytes, 6, 1);
+            if let (Some(ScalarValue::Number(left)), Some(ScalarValue::Number(right))) = (
+                registers.get(left_register as usize).copied(),
+                registers.get(right_register as usize).copied(),
+            ) {
+                if !left.is_nan() && !right.is_nan() && left < right {
+                    return Ok(ScalarInstructionResult::Jump(read_scalar_jump_target(
+                        instruction,
+                        instruction_bytes,
+                        1,
+                        4,
+                    )));
+                }
+                return Ok(ScalarInstructionResult::Continue);
+            }
+
+            let left_value =
+                read_scalar_register(registers, function_id, instruction, left_register)?;
+            let right_value =
+                read_scalar_register(registers, function_id, instruction, right_register)?;
+            let left = scalar_to_number(left_value);
+            let right = scalar_to_number(right_value);
+
+            if !left.is_nan() && !right.is_nan() && left < right {
+                Ok(ScalarInstructionResult::Jump(read_scalar_jump_target(
+                    instruction,
+                    instruction_bytes,
+                    1,
+                    4,
+                )))
+            } else {
+                Ok(ScalarInstructionResult::Continue)
+            }
+        }
+        185..=206 => {
             let delta_width = scalar_jump_delta_width(instruction.opcode);
             let left_register = read_unsigned_operand(instruction_bytes, 1 + delta_width, 1);
             let right_register = read_unsigned_operand(instruction_bytes, 2 + delta_width, 1);

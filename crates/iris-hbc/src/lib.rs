@@ -19380,7 +19380,8 @@ fn execute_scalar_instruction<'a>(
                 && let Some(index) =
                     scalar_cached_own_object_property_index(state, handle, string_id)
                 && state.object_getters.is_empty()
-                && read_scalar_object_prototype(state, handle).is_none()
+                && (state.object_prototypes.is_empty()
+                    || read_scalar_object_prototype(state, handle).is_none())
             {
                 write_scalar_register(
                     registers,

@@ -19444,6 +19444,21 @@ fn execute_scalar_instruction<'a>(
             let base_register = read_unsigned_operand(instruction_bytes, 1, 1);
             let value_register = read_unsigned_operand(instruction_bytes, 2, 1);
             let string_id = read_unsigned_operand(instruction_bytes, 4, 2);
+            if matches!(
+                registers.get(base_register as usize),
+                Some(ScalarValue::Object(ScalarObjectHandle::Global))
+            ) && let Some(index) = scalar_cached_global_property_index(state, string_id)
+                && matches!(state.global_properties[index].1, ScalarValue::Number(_))
+            {
+                let value =
+                    read_scalar_register(registers, function_id, instruction, value_register)?;
+                if matches!(value, ScalarValue::Number(_)) {
+                    let property_name = state.global_properties[index].0;
+                    state.global_properties[index].1 =
+                        map_scalar_global_write(property_name, value);
+                    return Ok(ScalarInstructionResult::Continue);
+                }
+            }
             let property_name = read_cached_scalar_string_operand(
                 bytecode,
                 string_operand_cache,
@@ -25069,13 +25084,20 @@ fn try_read_cached_scalar_global_property(
     state: &ScalarExecutorState<'_>,
     string_id: u32,
 ) -> Option<ScalarValue> {
+    let index = scalar_cached_global_property_index(state, string_id)?;
+    Some(state.global_properties[index].1)
+}
+
+fn scalar_cached_global_property_index(
+    state: &ScalarExecutorState<'_>,
+    string_id: u32,
+) -> Option<usize> {
     let slot = scalar_string_operand_cache_slot(string_id);
     let (cached_id, index) = state.global_property_operand_cache[slot]?;
     if cached_id != string_id {
         return None;
     }
-
-    Some(state.global_properties[index].1)
+    Some(index)
 }
 
 fn read_cached_scalar_global_property<'a>(

@@ -23859,6 +23859,11 @@ fn read_cached_scalar_object_property_for_get<'a>(
                 read_scalar_array_length(state, handle).map_or(0.0, f64::from),
             ));
         }
+        if handle == ScalarObjectHandle::Math
+            && let Some(value) = read_scalar_math_intrinsic_property(property_name)
+        {
+            return Ok(value);
+        }
         if let Some(value) =
             read_cached_scalar_own_object_property(state, handle, string_id, property_name)
         {

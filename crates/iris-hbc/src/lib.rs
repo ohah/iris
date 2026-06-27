@@ -24538,8 +24538,12 @@ fn write_scalar_named_object_property_index<'a>(
     property_name: &'a str,
     value: ScalarValue,
 ) -> usize {
-    materialize_scalar_object_traversal_object(state, object);
-    materialize_scalar_json_payload_object(state, object);
+    if !state.object_traversal_layouts.is_empty() {
+        materialize_scalar_object_traversal_object(state, object);
+    }
+    if !state.json_payload_layouts.is_empty() {
+        materialize_scalar_json_payload_object(state, object);
+    }
     if !state.object_getters.is_empty() {
         state.object_getters.retain(|(stored_object, name, _)| {
             !(*stored_object == object && *name == property_name)

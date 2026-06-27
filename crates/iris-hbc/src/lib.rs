@@ -25059,7 +25059,7 @@ fn try_read_cached_scalar_global_property(
         return None;
     }
 
-    state.global_properties.get(index).map(|(_, value)| *value)
+    Some(state.global_properties[index].1)
 }
 
 fn read_cached_scalar_global_property<'a>(
@@ -25073,9 +25073,7 @@ fn read_cached_scalar_global_property<'a>(
             // A Hermes string id fixes the property name within this bytecode,
             // and global property slots are updated in place rather than
             // deleted or reordered.
-            if let Some((_, value)) = state.global_properties.get(index) {
-                return *value;
-            }
+            return state.global_properties[index].1;
         }
     }
 

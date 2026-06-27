@@ -23792,6 +23792,14 @@ fn read_cached_scalar_object_property_for_get<'a>(
     property_name: &'a str,
 ) -> Result<ScalarValue, ScalarExecutionError> {
     if state.object_getters.is_empty() && read_scalar_object_prototype(state, handle).is_none() {
+        if matches!(property_name, "byteLength" | "length")
+            && let ScalarObjectHandle::Uint8Array(_) = handle
+            && state.object_properties.is_empty()
+        {
+            return Ok(ScalarValue::Number(
+                read_scalar_array_length(state, handle).map_or(0.0, f64::from),
+            ));
+        }
         if let Some(value) =
             read_cached_scalar_own_object_property(state, handle, string_id, property_name)
         {

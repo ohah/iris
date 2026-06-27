@@ -19354,6 +19354,14 @@ fn execute_scalar_instruction<'a>(
                 registers.get(base_register as usize),
                 Some(ScalarValue::Object(ScalarObjectHandle::Global))
             ) {
+                let cache_slot = scalar_string_operand_cache_slot(string_id);
+                if let Some((cached_id, index)) = state.global_property_operand_cache[cache_slot]
+                    && cached_id == string_id
+                    && let Some(destination_slot) = registers.get_mut(destination as usize)
+                {
+                    *destination_slot = state.global_properties[index].1;
+                    return Ok(ScalarInstructionResult::Continue);
+                }
                 if let Some(value) = try_read_cached_scalar_global_property(state, string_id) {
                     write_scalar_register(registers, function_id, instruction, destination, value)?;
                     return Ok(ScalarInstructionResult::Continue);
@@ -19392,6 +19400,24 @@ fn execute_scalar_instruction<'a>(
                 instruction,
                 string_id,
             )?;
+            if matches!(property_name, "byteLength" | "length")
+                && state.object_getters.is_empty()
+                && state.object_properties.is_empty()
+                && let Some(ScalarValue::Object(handle @ ScalarObjectHandle::Uint8Array(_))) =
+                    registers.get(base_register as usize).copied()
+                && read_scalar_object_prototype(state, handle).is_none()
+            {
+                write_scalar_register(
+                    registers,
+                    function_id,
+                    instruction,
+                    destination,
+                    ScalarValue::Number(
+                        read_scalar_array_length(state, handle).map_or(0.0, f64::from),
+                    ),
+                )?;
+                return Ok(ScalarInstructionResult::Continue);
+            }
             let value = read_cached_scalar_property(
                 bytecode,
                 state,

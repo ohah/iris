@@ -19576,6 +19576,36 @@ fn execute_scalar_instruction<'a>(
             let base_register = read_unsigned_operand(instruction_bytes, 1, 1);
             let key_register = read_unsigned_operand(instruction_bytes, 2, 1);
             let value_register = read_unsigned_operand(instruction_bytes, 3, 1);
+            if let (
+                Some(ScalarValue::Object(ScalarObjectHandle::Uint8Array(object_id))),
+                Some(ScalarValue::Number(key_number)),
+                Some(ScalarValue::Number(value_number)),
+            ) = (
+                registers.get(base_register as usize).copied(),
+                registers.get(key_register as usize).copied(),
+                registers.get(value_register as usize).copied(),
+            ) && let Some(index) = scalar_number_to_u32(key_number)
+            {
+                let storage_index =
+                    usize::try_from(object_id).expect("Uint8Array id fits in usize");
+                let has_lazy_layout = state
+                    .uint8_array_modulo_layouts
+                    .get(storage_index)
+                    .is_some_and(Option::is_some);
+                if !has_lazy_layout
+                    && let Some(storage) = state
+                        .uint8_array_storage
+                        .get_mut(storage_index)
+                        .and_then(Option::as_mut)
+                {
+                    let index = usize::try_from(index).expect("Uint8Array index fits in usize");
+                    if let Some(slot) = storage.get_mut(index) {
+                        *slot = scalar_number_to_uint8(value_number);
+                    }
+                    return Ok(ScalarInstructionResult::Continue);
+                }
+            }
+
             let key_value =
                 read_scalar_register(registers, function_id, instruction, key_register)?;
             let value = read_scalar_register(registers, function_id, instruction, value_register)?;
@@ -22356,17 +22386,23 @@ fn call_scalar_metro_import_all(arguments: &[ScalarValue]) -> ScalarValue {
 
 fn scalar_value_to_u32(value: ScalarValue) -> Option<u32> {
     match value {
-        ScalarValue::Number(value)
-            if value.is_finite() && value >= 0.0 && value <= f64::from(u32::MAX) =>
-        {
-            Some(value as u32)
-        }
+        ScalarValue::Number(value) => scalar_number_to_u32(value),
         _ => None,
     }
 }
 
 fn scalar_to_uint8(value: ScalarValue) -> u8 {
-    let number = scalar_to_number(value);
+    scalar_number_to_uint8(scalar_to_number(value))
+}
+
+fn scalar_number_to_u32(value: f64) -> Option<u32> {
+    if value.is_finite() && value >= 0.0 && value <= f64::from(u32::MAX) {
+        return Some(value as u32);
+    }
+    None
+}
+
+fn scalar_number_to_uint8(number: f64) -> u8 {
     if !number.is_finite() || number == 0.0 {
         return 0;
     }

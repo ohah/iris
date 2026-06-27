@@ -78,9 +78,13 @@ RN strict engine comparison은 `tools/bench/strict-rn-benchmark-contract.ts`의 
 
 Iris가 기존 RN 앱 소스 수정을 요구하지 않고 Hermes보다 빨라지려면, zero-copy bridge 이전에 일반 JS property access 비용을 줄여야 한다. 최적화 후보는 `bench-strict-hbc-timing-profile`의 `topPropertyTimings`, `topIndexedTimings`, `topCallTargetTimings`로 먼저 확인하고, strict HBC repeat artifact와 gate 비교로만 채택한다.
 
-현재 우선순위는 다음이다.
+2026-06-28 `artifacts/bench/strict-hbc-object-tail-index-elision-all-timing-20260628.json` 기준 현재 우선순위는 다음이다.
 
-- `GetByIdShort`/`TryGetById`/`PutByIdLoose`의 hot property shape를 property 이름, base kind, opcode offset별로 분리한다.
+- `typed-array-copy`: `get:global:index/source`, `get:uint8-array:length`, `put-index:uint8-array:numeric`가 남은 가장 큰 절대 병목이다.
+- `js-compute`: `get:global:index/Math`, `get:math:sin/sqrt`, `NativeMathSin/Sqrt` call 비용이 남아 있다.
+- `property-loop`/`numeric-loop`/`branch-loop`: `global.index`, `global.row`, `global.checksum` read/write와 숫자 산술 opcode 비용이 중심이다.
+- `object-traversal`: tail-contiguous index elision 뒤에도 `GetByIdShort` plain-object read와 일부 plain-object write가 Hermes 대비 느리다.
+- `json-round-trip`: 현재 strict HBC generic scalar path에서는 Hermes보다 빠른 case지만, RN strict engine comparison으로 일반화하지 않는다.
 - broad global cache나 broad named get/put expansion은 과거 A/B에서 여러 번 회귀했으므로 기본 후보로 두지 않는다.
 - hot path 상태를 새로 늘리는 보조 캐시는 단발 timing이 아니라 repeat/gate로 이득이 확인될 때만 채택한다.
 - getter/prototype/own-property shadowing을 보존할 수 있는 좁은 guard를 먼저 둔다.

@@ -3108,6 +3108,7 @@ struct ScalarExecutorState<'a> {
     object_getters: Vec<(ScalarObjectHandle, &'a str, ScalarValue)>,
     object_property_operand_cache:
         [Option<(ScalarObjectHandle, u32, usize)>; SCALAR_STRING_OPERAND_CACHE_SLOTS],
+    object_property_first_indices: Vec<Option<usize>>,
     object_property_indices_incomplete: bool,
     object_property_indices: HashMap<(ScalarObjectHandle, &'a str), usize>,
     object_property_names: HashMap<ScalarObjectHandle, Vec<&'a str>>,
@@ -25679,17 +25680,98 @@ fn append_scalar_named_object_property_index<'a>(
     property_name: &'a str,
     value: ScalarValue,
 ) -> usize {
+    append_scalar_named_object_property_index_with_mode(state, object, property_name, value, true)
+}
+
+fn append_scalar_tail_named_object_property_index<'a>(
+    state: &mut ScalarExecutorState<'a>,
+    object: ScalarObjectHandle,
+    property_name: &'a str,
+    value: ScalarValue,
+) -> usize {
+    append_scalar_named_object_property_index_with_mode(state, object, property_name, value, false)
+}
+
+fn append_scalar_named_object_property_index_with_mode<'a>(
+    state: &mut ScalarExecutorState<'a>,
+    object: ScalarObjectHandle,
+    property_name: &'a str,
+    value: ScalarValue,
+    store_property_index: bool,
+) -> usize {
     let property_index = state.object_properties.len();
-    state
-        .object_property_indices
-        .insert((object, property_name), property_index);
+    if store_property_index {
+        state
+            .object_property_indices
+            .insert((object, property_name), property_index);
+    }
     state
         .object_property_names
         .entry(object)
         .or_default()
         .push(property_name);
+    set_scalar_object_property_first_index(state, object, property_index);
     state.object_properties.push((object, property_name, value));
     property_index
+}
+
+fn scalar_object_storage_index(object: ScalarObjectHandle) -> Option<usize> {
+    let ScalarObjectHandle::Object(object_id) = object else {
+        return None;
+    };
+    Some(usize::try_from(object_id).expect("object id fits in usize"))
+}
+
+fn set_scalar_object_property_first_index(
+    state: &mut ScalarExecutorState<'_>,
+    object: ScalarObjectHandle,
+    property_index: usize,
+) {
+    let Some(storage_index) = scalar_object_storage_index(object) else {
+        return;
+    };
+    if state.object_property_first_indices.len() <= storage_index {
+        state
+            .object_property_first_indices
+            .resize_with(storage_index + 1, || None);
+    }
+    state.object_property_first_indices[storage_index].get_or_insert(property_index);
+}
+
+fn scalar_object_property_first_index(
+    state: &ScalarExecutorState<'_>,
+    object: ScalarObjectHandle,
+) -> Option<usize> {
+    let storage_index = scalar_object_storage_index(object)?;
+    state
+        .object_property_first_indices
+        .get(storage_index)
+        .copied()
+        .flatten()
+}
+
+fn scalar_contiguous_own_object_property_index(
+    state: &ScalarExecutorState<'_>,
+    object: ScalarObjectHandle,
+    property_name: &str,
+) -> Option<Option<usize>> {
+    let first_index = scalar_object_property_first_index(state, object)?;
+    let names = state.object_property_names.get(&object)?;
+    for (offset, name) in names.iter().enumerate() {
+        if !scalar_property_name_matches(name, property_name) {
+            continue;
+        }
+        let property_index = first_index.checked_add(offset)?;
+        let Some((stored_object, stored_name, _)) = state.object_properties.get(property_index)
+        else {
+            return None;
+        };
+        if *stored_object == object && scalar_property_name_matches(stored_name, property_name) {
+            return Some(Some(property_index));
+        }
+        return None;
+    }
+    Some(None)
 }
 
 fn write_scalar_named_object_property_index<'a>(
@@ -25730,7 +25812,7 @@ fn write_scalar_named_object_property_index<'a>(
                     state.object_properties[property_index].2 = value;
                     return property_index;
                 }
-                return append_scalar_named_object_property_index(
+                return append_scalar_tail_named_object_property_index(
                     state,
                     object,
                     property_name,
@@ -25738,7 +25820,12 @@ fn write_scalar_named_object_property_index<'a>(
                 );
             }
         } else if tail_count == 0 {
-            return append_scalar_named_object_property_index(state, object, property_name, value);
+            return append_scalar_tail_named_object_property_index(
+                state,
+                object,
+                property_name,
+                value,
+            );
         }
     }
     let property_may_exist = scalar_object_property_names_contain(state, object, property_name);
@@ -25750,6 +25837,36 @@ fn write_scalar_named_object_property_index<'a>(
         {
             state.object_properties[property_index].2 = value;
             return property_index;
+        }
+        if !state.object_property_indices_incomplete
+            && let Some(Some(property_index)) =
+                scalar_contiguous_own_object_property_index(state, object, property_name)
+        {
+            state.object_properties[property_index].2 = value;
+            return property_index;
+        }
+        if !state.object_property_indices_incomplete {
+            reindex_scalar_object_properties(state);
+            if let Some(property_index) = state
+                .object_property_indices
+                .get(&(object, property_name))
+                .copied()
+            {
+                state.object_properties[property_index].2 = value;
+                return property_index;
+            }
+        }
+    }
+
+    if !state.object_property_indices_incomplete
+        && let Some(names_len) = state
+            .object_property_names
+            .get(&object)
+            .map(std::vec::Vec::len)
+    {
+        let (tail_count, _) = scalar_tail_own_object_property_index(state, object, property_name);
+        if tail_count != names_len {
+            reindex_scalar_object_properties(state);
         }
     }
 
@@ -25821,18 +25938,19 @@ fn write_scalar_named_object_getter_property<'a>(
 
 fn reindex_scalar_object_properties<'a>(state: &mut ScalarExecutorState<'a>) {
     clear_scalar_object_property_operand_cache(state);
+    state.object_property_first_indices.clear();
     state.object_property_indices.clear();
     state.object_property_names.clear();
     state.object_property_indices_incomplete = false;
-    for (index, (object, name, _)) in state.object_properties.iter().enumerate() {
-        state
-            .object_property_indices
-            .insert((*object, *name), index);
+    for index in 0..state.object_properties.len() {
+        let (object, name, _) = state.object_properties[index];
+        state.object_property_indices.insert((object, name), index);
         state
             .object_property_names
-            .entry(*object)
+            .entry(object)
             .or_default()
-            .push(*name);
+            .push(name);
+        set_scalar_object_property_first_index(state, object, index);
     }
 }
 
@@ -26412,6 +26530,13 @@ fn scalar_own_object_property_index(
 ) -> Option<usize> {
     if state.object_properties.len() <= SCALAR_LINEAR_OBJECT_PROPERTY_LIMIT {
         return scalar_linear_own_object_property_index(state, object, property_name);
+    }
+
+    if !state.object_property_indices_incomplete
+        && let Some(index) =
+            scalar_contiguous_own_object_property_index(state, object, property_name)
+    {
+        return index;
     }
 
     let indexed_property = state
@@ -31730,6 +31855,52 @@ mod tests {
         assert_eq!(
             execute_global_scalar_function(&bytes),
             Ok(ScalarValue::Number(9.0)),
+        );
+    }
+
+    #[test]
+    fn scalar_tail_object_property_index_elision_reindexes_on_non_tail_append() {
+        let mut state = ScalarExecutorState::default();
+        let first = allocate_scalar_object(&mut state);
+        const NAMES: [&str; 21] = [
+            "p00", "p01", "p02", "p03", "p04", "p05", "p06", "p07", "p08", "p09", "p10", "p11",
+            "p12", "p13", "p14", "p15", "p16", "p17", "p18", "p19", "p20",
+        ];
+
+        for (index, name) in NAMES[..20].iter().copied().enumerate() {
+            write_scalar_named_object_property(
+                &mut state,
+                first,
+                name,
+                ScalarValue::Number(index as f64),
+            );
+        }
+        assert_eq!(
+            read_scalar_own_object_property(&state, first, "p19"),
+            Some(ScalarValue::Number(19.0)),
+        );
+
+        let second = allocate_scalar_object(&mut state);
+        write_scalar_named_object_property(&mut state, second, "q00", ScalarValue::Number(100.0));
+        write_scalar_named_object_property(&mut state, first, "p20", ScalarValue::Number(20.0));
+
+        assert_eq!(
+            read_scalar_own_object_property(&state, first, "p00"),
+            Some(ScalarValue::Number(0.0)),
+        );
+        assert_eq!(
+            read_scalar_own_object_property(&state, first, "p19"),
+            Some(ScalarValue::Number(19.0)),
+        );
+        assert_eq!(
+            read_scalar_own_object_property(&state, first, "p20"),
+            Some(ScalarValue::Number(20.0)),
+        );
+
+        write_scalar_named_object_property(&mut state, first, "p19", ScalarValue::Number(190.0));
+        assert_eq!(
+            read_scalar_own_object_property(&state, first, "p19"),
+            Some(ScalarValue::Number(190.0)),
         );
     }
 

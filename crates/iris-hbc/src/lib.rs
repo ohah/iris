@@ -21052,6 +21052,14 @@ fn try_scalar_value_to_json_payload_rows_snapshot<'a>(
         return None;
     }
 
+    if let Some(snapshot) = try_scalar_json_payload_rows_snapshot_from_compact_layout(
+        bytecode,
+        state,
+        &storage[..required_len],
+    ) {
+        return Some(snapshot);
+    }
+
     if let Some(snapshot) =
         try_scalar_json_payload_rows_snapshot_from_layout(bytecode, state, &storage[..required_len])
     {
@@ -21066,6 +21074,64 @@ fn try_scalar_value_to_json_payload_rows_snapshot<'a>(
     }
 
     Some(ScalarJsonSnapshot::JsonPayloadRows { length })
+}
+
+fn try_scalar_json_payload_rows_snapshot_from_compact_layout<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &ScalarExecutorState<'a>,
+    rows: &[ScalarValue],
+) -> Option<ScalarJsonSnapshot<'a>> {
+    if !state.json_payload_materialized_objects.is_empty() {
+        return None;
+    }
+
+    let length = u32::try_from(rows.len()).ok()?;
+    for layout in state.json_payload_layouts.iter().rev() {
+        if layout.start_index != 0
+            || layout.length != length
+            || layout.lane_divisor != 7
+            || layout.active_divisor != 3
+            || !scalar_property_name_matches(layout.lane_property_name, "lane")
+            || !scalar_property_name_matches(layout.label_property_name, "label")
+            || !scalar_property_name_matches(layout.active_property_name, "active")
+            || !scalar_property_name_matches(layout.id_property_name, "id")
+            || !scalar_property_name_matches(layout.meta_property_name, "meta")
+            || !scalar_property_name_matches(layout.name_property_name, "name")
+            || !scalar_property_name_matches(layout.points_property_name, "points")
+            || !scalar_value_string_matches(bytecode, state, layout.label_value, "group")
+            || !scalar_value_string_matches(bytecode, state, layout.name_value, "item")
+        {
+            continue;
+        }
+
+        let mut matches_layout = true;
+        for (row_offset, row_value) in rows.iter().copied().enumerate() {
+            let row_offset = u32::try_from(row_offset).expect("JSON payload row index fits in u32");
+            let object_offset = row_offset.checked_mul(3)?;
+            let expected_points =
+                ScalarObjectHandle::Array(layout.first_object_id.checked_add(object_offset + 1)?);
+            let expected_row = ScalarValue::Object(ScalarObjectHandle::Object(
+                layout.first_object_id.checked_add(object_offset + 2)?,
+            ));
+            if row_value != expected_row
+                || read_scalar_array_length(state, expected_points) != Some(3)
+                || read_scalar_array_element(state, expected_points, 0)
+                    != ScalarValue::Number(f64::from(row_offset))
+                || read_scalar_array_element(state, expected_points, 1)
+                    != ScalarValue::Number(f64::from(row_offset) * 2.0)
+                || read_scalar_array_element(state, expected_points, 2)
+                    != ScalarValue::Number(f64::from(row_offset) * 3.0)
+            {
+                matches_layout = false;
+                break;
+            }
+        }
+        if matches_layout {
+            return Some(ScalarJsonSnapshot::JsonPayloadRows { length });
+        }
+    }
+
+    None
 }
 
 fn try_scalar_json_payload_rows_snapshot_from_layout<'a>(

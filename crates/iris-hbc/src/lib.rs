@@ -19091,28 +19091,26 @@ fn execute_scalar_instruction<'a>(
             let left_register = read_unsigned_operand(instruction_bytes, 2, 1);
             let right_register = read_unsigned_operand(instruction_bytes, 3, 1);
             // Most strict HBC hot loops reach these opcodes with number operands.
-            // Keep generic Add(32) on the full coercion path for string behavior.
-            if instruction.opcode != 32 {
-                if let (
-                    Some(ScalarValue::Number(left)),
-                    Some(ScalarValue::Number(right)),
-                    Some(destination_slot),
-                ) = (
-                    registers.get(left_register as usize).copied(),
-                    registers.get(right_register as usize).copied(),
-                    registers.get_mut(destination as usize),
-                ) {
-                    let value = match instruction.opcode {
-                        30 | 31 => left + right,
-                        33 | 34 => left * right,
-                        35 | 36 => left / right,
-                        37 => left % right,
-                        38 | 39 => left - right,
-                        _ => unreachable!("matched number arithmetic opcodes"),
-                    };
-                    *destination_slot = ScalarValue::Number(value);
-                    return Ok(ScalarInstructionResult::Continue);
-                }
+            // Add(32) still falls back to the generic path when string coercion is possible.
+            if let (
+                Some(ScalarValue::Number(left)),
+                Some(ScalarValue::Number(right)),
+                Some(destination_slot),
+            ) = (
+                registers.get(left_register as usize).copied(),
+                registers.get(right_register as usize).copied(),
+                registers.get_mut(destination as usize),
+            ) {
+                let value = match instruction.opcode {
+                    30..=32 => left + right,
+                    33 | 34 => left * right,
+                    35 | 36 => left / right,
+                    37 => left % right,
+                    38 | 39 => left - right,
+                    _ => unreachable!("matched number arithmetic opcodes"),
+                };
+                *destination_slot = ScalarValue::Number(value);
+                return Ok(ScalarInstructionResult::Continue);
             }
             let left_value =
                 read_scalar_register(registers, function_id, instruction, left_register)?;
@@ -19475,13 +19473,11 @@ fn execute_scalar_instruction<'a>(
                 Some(ScalarValue::Object(ScalarObjectHandle::Global))
             ) && let Some(index) = scalar_cached_global_property_index(state, string_id)
                 && matches!(state.global_properties[index].1, ScalarValue::Number(_))
+                && let Some(value @ ScalarValue::Number(_)) =
+                    registers.get(value_register as usize).copied()
             {
-                let value =
-                    read_scalar_register(registers, function_id, instruction, value_register)?;
-                if matches!(value, ScalarValue::Number(_)) {
-                    state.global_properties[index].1 = value;
-                    return Ok(ScalarInstructionResult::Continue);
-                }
+                state.global_properties[index].1 = value;
+                return Ok(ScalarInstructionResult::Continue);
             }
             if let Some(ScalarValue::Object(handle @ ScalarObjectHandle::Object(_))) =
                 registers.get(base_register as usize).copied()
@@ -19492,9 +19488,9 @@ fn execute_scalar_instruction<'a>(
                     scalar_cached_own_object_property_index(state, handle, string_id)
                 && matches!(state.object_properties[index].2, ScalarValue::Number(_))
             {
-                let value =
-                    read_scalar_register(registers, function_id, instruction, value_register)?;
-                if matches!(value, ScalarValue::Number(_)) {
+                if let Some(value @ ScalarValue::Number(_)) =
+                    registers.get(value_register as usize).copied()
+                {
                     state.object_properties[index].2 = value;
                     return Ok(ScalarInstructionResult::Continue);
                 }

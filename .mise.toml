@@ -181,6 +181,10 @@ run = "bun run bench:strict-hbc-math-lookup"
 description = "Profile host-side strict Hermes bytecode scalar executor hot paths"
 run = "bun run bench:strict-hbc-profile"
 
+[tasks.bench-strict-hbc-timing-profile]
+description = "Time-profile host-side strict Hermes bytecode scalar executor hot paths"
+run = "bun run bench:strict-hbc-timing-profile"
+
 [tasks.bench-strict-hbc-source-shape]
 description = "Compare strict Hermes bytecode source-shape variants for global var and lexical bindings"
 run = "bun run bench:strict-hbc-source-shape"

@@ -3066,6 +3066,23 @@ pub fn profile_hbc_global_scalar_execution(bytes: &[u8]) -> Result<String, Parse
     Ok(format_scalar_profile_execution_report(&report))
 }
 
+/// Profiles the global function with strict scalar semantics and reports the
+/// dynamic instruction hot paths by wall-clock time.
+///
+/// This is a diagnostic path for optimizer work. It uses the same scalar
+/// instruction semantics as `hbc-bench`, but it keeps timing outside the normal
+/// benchmark loop so benchmark hot paths do not pay profiling overhead.
+///
+/// # Errors
+///
+/// Returns [`ParseError`] if the bytecode is structurally invalid before
+/// scalar execution begins.
+pub fn profile_hbc_global_scalar_timing(bytes: &[u8]) -> Result<String, ParseError> {
+    let bytecode = HermesBytecode::parse(bytes)?;
+    let report = profile_scalar_function_timing(&bytecode, bytecode.header().global_code_index)?;
+    Ok(format_scalar_timing_profile_execution_report(&report))
+}
+
 #[derive(Debug, Default)]
 struct ScalarExecutorState<'a> {
     array_element_indices: HashMap<(ScalarObjectHandle, u32), usize>,
@@ -3378,6 +3395,16 @@ struct ScalarProfileExecutionReport<'a> {
 }
 
 #[derive(Debug)]
+struct ScalarTimingProfileExecutionReport<'a> {
+    declared_global_count: usize,
+    error: Option<String>,
+    function_id: u32,
+    profile: ScalarInstructionProfile<'a>,
+    timing: ScalarTimingProfile,
+    value: Option<ScalarValue>,
+}
+
+#[derive(Debug)]
 struct ScalarInstructionProfile<'a> {
     call_argument_kind_counts:
         HashMap<(&'static str, &'static str, &'static str, &'static str), u64>,
@@ -3404,6 +3431,65 @@ impl Default for ScalarInstructionProfile<'_> {
             string_operand_counts: HashMap::new(),
             total_instructions: 0,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ScalarTimingBucket {
+    count: u64,
+    max_ns: u128,
+    total_ns: u128,
+}
+
+impl ScalarTimingBucket {
+    fn record(&mut self, elapsed_ns: u128) {
+        self.count = self.count.saturating_add(1);
+        self.total_ns = self.total_ns.saturating_add(elapsed_ns);
+        self.max_ns = self.max_ns.max(elapsed_ns);
+    }
+
+    fn average_ns(self) -> u128 {
+        if self.count == 0 {
+            0
+        } else {
+            self.total_ns / u128::from(self.count)
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ScalarTimingProfile {
+    category_timings: HashMap<&'static str, ScalarTimingBucket>,
+    instruction_offset_timings: HashMap<(u32, u8), ScalarTimingBucket>,
+    opcode_timings: [ScalarTimingBucket; HERMES_OPCODE_COUNT],
+    total_ns: u128,
+}
+
+impl Default for ScalarTimingProfile {
+    fn default() -> Self {
+        Self {
+            category_timings: HashMap::new(),
+            instruction_offset_timings: HashMap::new(),
+            opcode_timings: [ScalarTimingBucket::default(); HERMES_OPCODE_COUNT],
+            total_ns: 0,
+        }
+    }
+}
+
+impl ScalarTimingProfile {
+    fn record(&mut self, instruction: HermesInstruction, elapsed_ns: u128) {
+        self.total_ns = self.total_ns.saturating_add(elapsed_ns);
+        if let Some(bucket) = self.opcode_timings.get_mut(usize::from(instruction.opcode)) {
+            bucket.record(elapsed_ns);
+        }
+        self.instruction_offset_timings
+            .entry((instruction.offset, instruction.opcode))
+            .or_default()
+            .record(elapsed_ns);
+        self.category_timings
+            .entry(scalar_timing_category(instruction.opcode))
+            .or_default()
+            .record(elapsed_ns);
     }
 }
 
@@ -17585,6 +17671,17 @@ fn profile_scalar_function<'a>(
     execute_scalar_function_profiled(bytecode, &mut state, function_id, &[])
 }
 
+fn profile_scalar_function_timing<'a>(
+    bytecode: &HermesBytecode<'a>,
+    function_id: u32,
+) -> Result<ScalarTimingProfileExecutionReport<'a>, ParseError> {
+    let mut state = ScalarExecutorState {
+        remaining_steps: None,
+        ..ScalarExecutorState::default()
+    };
+    execute_scalar_function_timing_profiled(bytecode, &mut state, function_id, &[])
+}
+
 fn execute_scalar_function_profiled<'a>(
     bytecode: &HermesBytecode<'a>,
     state: &mut ScalarExecutorState<'a>,
@@ -17716,6 +17813,150 @@ fn execute_scalar_function_profiled<'a>(
         error: Some(ScalarExecutionError::MissingReturn { function_id }.to_string()),
         function_id,
         profile,
+        value: None,
+    })
+}
+
+fn execute_scalar_function_timing_profiled<'a>(
+    bytecode: &HermesBytecode<'a>,
+    state: &mut ScalarExecutorState<'a>,
+    function_id: u32,
+    arguments: &[ScalarValue],
+) -> Result<ScalarTimingProfileExecutionReport<'a>, ParseError> {
+    let body = bytecode.function_body(function_id)?;
+    let function_header = bytecode.function_header(function_id)?;
+    let frame_size = usize::try_from(function_header.frame_size)
+        .expect("Hermes function frame size fits in usize on supported targets");
+    let mut registers = vec![ScalarValue::Empty; frame_size];
+    let instructions = bytecode
+        .function_instructions(function_id)?
+        .collect::<Result<Vec<_>, _>>()?;
+    let instruction_bytes = instructions
+        .iter()
+        .map(|instruction| instruction_bytes(body, *instruction))
+        .collect::<Vec<_>>();
+    let mut string_operand_cache = ScalarStringOperandCache::default();
+    let mut instruction_index = 0_usize;
+    let mut jump_index_cache = vec![None; instructions.len()];
+    let mut profile = ScalarInstructionProfile::default();
+    let mut timing = ScalarTimingProfile::default();
+
+    while instruction_index < instructions.len() {
+        let instruction = instructions[instruction_index];
+        let current_instruction_bytes = instruction_bytes[instruction_index];
+        record_scalar_instruction_profile(
+            bytecode,
+            &mut profile,
+            function_id,
+            instruction,
+            current_instruction_bytes,
+        );
+        record_scalar_property_access_profile(
+            bytecode,
+            &mut profile,
+            &registers,
+            function_id,
+            instruction,
+            current_instruction_bytes,
+        );
+        record_scalar_indexed_access_profile(
+            &mut profile,
+            &registers,
+            instruction,
+            current_instruction_bytes,
+        );
+        record_scalar_call_target_profile(
+            &mut profile,
+            &registers,
+            instruction,
+            current_instruction_bytes,
+        );
+
+        let started_at = std::time::Instant::now();
+        let result = execute_scalar_instruction(
+            bytecode,
+            state,
+            &mut registers,
+            arguments,
+            function_id,
+            current_instruction_bytes,
+            &mut string_operand_cache,
+            instruction,
+            None,
+        );
+        timing.record(instruction, started_at.elapsed().as_nanos());
+
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                return Ok(ScalarTimingProfileExecutionReport {
+                    declared_global_count: state.declared_globals.len(),
+                    error: Some(error.to_string()),
+                    function_id,
+                    profile,
+                    timing,
+                    value: None,
+                });
+            }
+        };
+
+        match result {
+            ScalarInstructionResult::Continue => {
+                instruction_index += 1;
+            }
+            ScalarInstructionResult::Jump(target) => {
+                profile.jumps_taken = profile.jumps_taken.saturating_add(1);
+                if let Some(target_index) = jump_index_cache[instruction_index] {
+                    instruction_index = target_index;
+                } else {
+                    let target_index = match instructions
+                        .binary_search_by_key(&target, |instruction| instruction.offset)
+                    {
+                        Ok(target_index) => target_index,
+                        Err(_) => {
+                            return Ok(ScalarTimingProfileExecutionReport {
+                                declared_global_count: state.declared_globals.len(),
+                                error: Some(
+                                    ParseError::InvalidJumpTarget {
+                                        function_id,
+                                        offset: instruction.offset,
+                                        opcode: instruction.opcode,
+                                        target: i64::from(target),
+                                        body_start: body.offset,
+                                        body_end: body.offset + body.len(),
+                                    }
+                                    .to_string(),
+                                ),
+                                function_id,
+                                profile,
+                                timing,
+                                value: None,
+                            });
+                        }
+                    };
+                    jump_index_cache[instruction_index] = Some(target_index);
+                    instruction_index = target_index;
+                }
+            }
+            ScalarInstructionResult::Return(value) => {
+                return Ok(ScalarTimingProfileExecutionReport {
+                    declared_global_count: state.declared_globals.len(),
+                    error: None,
+                    function_id,
+                    profile,
+                    timing,
+                    value: Some(value),
+                });
+            }
+        }
+    }
+
+    Ok(ScalarTimingProfileExecutionReport {
+        declared_global_count: state.declared_globals.len(),
+        error: Some(ScalarExecutionError::MissingReturn { function_id }.to_string()),
+        function_id,
+        profile,
+        timing,
         value: None,
     })
 }
@@ -18384,6 +18625,191 @@ fn format_scalar_profile_execution_report(report: &ScalarProfileExecutionReport<
         format_scalar_profile_call_target_counts(&report.profile, 12),
         format_scalar_profile_call_argument_kind_counts(&report.profile, 16)
     )
+}
+
+fn format_scalar_timing_profile_execution_report(
+    report: &ScalarTimingProfileExecutionReport<'_>,
+) -> String {
+    let status = if report.error.is_some() {
+        "frontier"
+    } else {
+        "completed"
+    };
+    let value = report
+        .value
+        .map_or_else(|| "none".to_owned(), |value| format!("{value:?}"));
+    let error = report
+        .error
+        .as_ref()
+        .map_or_else(|| "none".to_owned(), |error| error.clone());
+    format!(
+        "status={status}, function={}, value={value}, error={error}, declaredGlobals={}, totalInstructions={}, jumpsTaken={}, totalMeasuredNs={}, topOpcodeTimings=[{}], topInstructionTimings=[{}], topCategoryTimings=[{}], topOpcodes=[{}], topInstructionOffsets=[{}], topStringOperands=[{}], topPropertyAccesses=[{}], topIndexedAccesses=[{}], topCallTargets=[{}], topCallArgumentKinds=[{}]",
+        report.function_id,
+        report.declared_global_count,
+        report.profile.total_instructions,
+        report.profile.jumps_taken,
+        report.timing.total_ns,
+        format_scalar_timing_opcode_counts(&report.timing, 16),
+        format_scalar_timing_instruction_offset_counts(&report.timing, 20),
+        format_scalar_timing_category_counts(&report.timing, 12),
+        format_scalar_profile_opcode_counts(&report.profile, 12),
+        format_scalar_profile_instruction_offset_counts(&report.profile, 16),
+        format_scalar_profile_string_counts(&report.profile, 16),
+        format_scalar_profile_property_access_counts(&report.profile, 16),
+        format_scalar_profile_indexed_access_counts(&report.profile, 12),
+        format_scalar_profile_call_target_counts(&report.profile, 12),
+        format_scalar_profile_call_argument_kind_counts(&report.profile, 16)
+    )
+}
+
+fn format_scalar_timing_bucket(bucket: ScalarTimingBucket) -> String {
+    format!(
+        "count:{}|totalNs:{}|avgNs:{}|maxNs:{}",
+        bucket.count,
+        bucket.total_ns,
+        bucket.average_ns(),
+        bucket.max_ns
+    )
+}
+
+fn scalar_timing_category(opcode: u8) -> &'static str {
+    let opcode_name = hermes_opcode_name(opcode);
+    if opcode_name.starts_with("GetBy")
+        || opcode_name.starts_with("TryGetBy")
+        || opcode_name.starts_with("GetArgumentsProp")
+    {
+        "property-read"
+    } else if opcode_name.starts_with("PutBy")
+        || opcode_name.starts_with("PutNewOwn")
+        || opcode_name.starts_with("DefineOwn")
+        || opcode_name.starts_with("DelBy")
+    {
+        "property-write"
+    } else if opcode_name.starts_with("Call") || opcode_name.starts_with("Construct") {
+        "call"
+    } else if opcode_name.starts_with('J') || opcode_name.starts_with("Switch") {
+        "branch"
+    } else if opcode_name.starts_with("Add")
+        || opcode_name.starts_with("Sub")
+        || opcode_name.starts_with("Mul")
+        || opcode_name.starts_with("Div")
+        || opcode_name.starts_with("Mod")
+        || opcode_name.starts_with("Inc")
+        || opcode_name.starts_with("Dec")
+        || opcode_name.starts_with("Negate")
+        || opcode_name.starts_with("Bit")
+        || opcode_name.starts_with("LShift")
+        || opcode_name.starts_with("RShift")
+        || opcode_name.starts_with("URshift")
+    {
+        "numeric"
+    } else if opcode_name.starts_with("New")
+        || opcode_name.starts_with("Create")
+        || opcode_name.starts_with("Alloc")
+    {
+        "allocation"
+    } else if opcode_name.contains("Environment") {
+        "environment"
+    } else if opcode_name.starts_with("Load") || opcode_name.starts_with("Store") {
+        "load-store"
+    } else if opcode_name.starts_with("Iterator") {
+        "iterator"
+    } else {
+        "other"
+    }
+}
+
+fn format_scalar_timing_opcode_counts(profile: &ScalarTimingProfile, limit: usize) -> String {
+    let mut counts = profile
+        .opcode_timings
+        .iter()
+        .enumerate()
+        .filter_map(|(opcode, bucket)| {
+            if bucket.count == 0 {
+                None
+            } else {
+                Some((opcode_index_to_u8(opcode), *bucket))
+            }
+        })
+        .collect::<Vec<_>>();
+    counts.sort_by(|(left_opcode, left_bucket), (right_opcode, right_bucket)| {
+        right_bucket
+            .total_ns
+            .cmp(&left_bucket.total_ns)
+            .then_with(|| right_bucket.count.cmp(&left_bucket.count))
+            .then_with(|| left_opcode.cmp(right_opcode))
+    });
+
+    counts
+        .into_iter()
+        .take(limit)
+        .map(|(opcode, bucket)| {
+            format!(
+                "{}({opcode})={}",
+                hermes_opcode_name(opcode),
+                format_scalar_timing_bucket(bucket)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn format_scalar_timing_instruction_offset_counts(
+    profile: &ScalarTimingProfile,
+    limit: usize,
+) -> String {
+    let mut counts = profile
+        .instruction_offset_timings
+        .iter()
+        .map(|((offset, opcode), bucket)| (*offset, *opcode, *bucket))
+        .collect::<Vec<_>>();
+    counts.sort_by(
+        |(left_offset, left_opcode, left_bucket), (right_offset, right_opcode, right_bucket)| {
+            right_bucket
+                .total_ns
+                .cmp(&left_bucket.total_ns)
+                .then_with(|| right_bucket.count.cmp(&left_bucket.count))
+                .then_with(|| left_opcode.cmp(right_opcode))
+                .then_with(|| left_offset.cmp(right_offset))
+        },
+    );
+
+    counts
+        .into_iter()
+        .take(limit)
+        .map(|(offset, opcode, bucket)| {
+            format!(
+                "{}({opcode})@{offset}={}",
+                hermes_opcode_name(opcode),
+                format_scalar_timing_bucket(bucket)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn format_scalar_timing_category_counts(profile: &ScalarTimingProfile, limit: usize) -> String {
+    let mut counts = profile
+        .category_timings
+        .iter()
+        .map(|(category, bucket)| (*category, *bucket))
+        .collect::<Vec<_>>();
+    counts.sort_by(
+        |(left_category, left_bucket), (right_category, right_bucket)| {
+            right_bucket
+                .total_ns
+                .cmp(&left_bucket.total_ns)
+                .then_with(|| right_bucket.count.cmp(&left_bucket.count))
+                .then_with(|| left_category.cmp(right_category))
+        },
+    );
+
+    counts
+        .into_iter()
+        .take(limit)
+        .map(|(category, bucket)| format!("{category}={}", format_scalar_timing_bucket(bucket)))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn format_scalar_profile_opcode_counts(
@@ -29225,6 +29651,44 @@ mod tests {
         assert!(report.contains("get:global:cdef=1"));
         assert!(report.contains("topCallTargets=[]"));
         assert!(report.contains("topCallArgumentKinds=[]"));
+    }
+
+    #[test]
+    fn profiles_strict_scalar_execution_timing_hot_paths() {
+        let mut bytes = fixture_bytecode();
+        replace_global_body(
+            &mut bytes,
+            &[
+                DECLARE_GLOBAL_VAR_OPCODE,
+                1,
+                0,
+                0,
+                0,
+                GET_GLOBAL_OBJECT_OPCODE,
+                0,
+                TRY_GET_BY_ID_OPCODE,
+                1,
+                0,
+                0,
+                1,
+                0,
+                LOAD_CONST_UNDEFINED_OPCODE,
+                0,
+                RET_OPCODE,
+                0,
+            ],
+        );
+
+        let report = profile_hbc_global_scalar_timing(&bytes).expect("valid timing profile report");
+
+        assert!(report.contains("status=completed"));
+        assert!(report.contains("totalInstructions=5"));
+        assert!(report.contains("totalMeasuredNs="));
+        assert!(report.contains("topOpcodeTimings=["));
+        assert!(report.contains("topInstructionTimings=["));
+        assert!(report.contains("topCategoryTimings=["));
+        assert!(report.contains("DeclareGlobalVar(67)=count:1|totalNs:"));
+        assert!(report.contains("get:global:cdef=1"));
     }
 
     #[test]

@@ -15,6 +15,7 @@ mise run bench-strict-hbc-compare-gate -- --baseline=artifacts/bench/strict-hbc-
 mise run bench-strict-hbc-call-targets
 mise run bench-strict-hbc-math-lookup
 mise run bench-strict-hbc-profile
+mise run bench-strict-hbc-timing-profile
 mise run bench-strict-hbc-source-shape
 mise run bench-qjs-smoke
 mise run bench-qjs
@@ -55,6 +56,7 @@ mise run rn-ios-build-release
 - `bench-strict-hbc-call-targets`는 `js-compute`와 Math 함수 binding diagnostic case를 비교해 global/property lookup 비용과 native Math call 비용을 분리한다.
 - `bench-strict-hbc-math-lookup`은 Math 함수를 호출하지 않고 `Math.sin/sqrt` property lookup만 반복하는 diagnostic case와 bound function reference case를 비교한다.
 - `bench-strict-hbc-profile`은 같은 strict HBC case를 Hermes bytecode로 컴파일하고 Iris scalar executor의 동적 opcode/property/call hot path profile을 `artifacts/bench/strict-hbc-profile.txt`와 `artifacts/bench/strict-hbc-profile.json`에 남긴다. JSON artifact schema는 `iris.benchmark.strict-hbc-profile.v1`이며 `topInstructionOffsets`, `topPropertyAccesses`, `topIndexedAccesses`, `topCallTargets`를 case별로 구조화한다. 이 값은 성능 ratio가 아니라 다음 최적화 후보 선정용 계측이다. 기본 profile도 `*-lexical.js`와 `*-diagnostic.js` case를 자동 포함하지 않는다.
+- `bench-strict-hbc-timing-profile`은 같은 strict HBC case를 Hermes bytecode로 컴파일하고 Iris scalar executor의 opcode, instruction offset, helper category별 elapsed ns를 `artifacts/bench/strict-hbc-timing-profile.txt`와 `artifacts/bench/strict-hbc-timing-profile.json`에 남긴다. JSON artifact schema는 `iris.benchmark.strict-hbc-timing-profile.v1`이며 `topOpcodeTimings`, `topInstructionTimings`, `topCategoryTimings`와 기존 count profile 필드를 함께 기록한다. 계측 오버헤드가 포함된 진단값이므로 strict engine ratio가 아니라 다음 최적화 후보의 우선순위 산정에만 사용한다. 기본 timing profile도 `*-lexical.js`와 `*-diagnostic.js` case를 자동 포함하지 않는다.
 - `bench-strict-hbc-source-shape`는 전역 `var` 기반 case와 top-level lexical binding case를 같이 실행해 source shape가 HBC opcode mix와 Iris/Hermes ratio에 주는 영향을 분리한다.
 - `bench-qjs-smoke`는 짧은 반복으로 host-side Iris QuickJS backend microbenchmark와 checksum을 확인한다.
 - `bench-qjs`는 같은 JS benchmark case를 host-side `iris-qjs` backend에서 release 빌드로 실행한다. 이 값은 RN strict engine comparison이 아니라 backend microbenchmark다.

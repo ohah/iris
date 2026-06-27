@@ -21459,58 +21459,91 @@ fn scalar_value_from_json_payload_rows_snapshot<'a>(
     state: &mut ScalarExecutorState<'a>,
     length: u32,
 ) -> ScalarValue {
+    if length == 0 {
+        return ScalarValue::Object(allocate_scalar_array(state, 0));
+    }
+
     let label_value = scalar_string_value_for_name(bytecode, "group")
         .unwrap_or_else(|| allocate_scalar_dynamic_string(state, "group".to_string()));
     let name_value = scalar_string_value_for_name(bytecode, "item")
         .unwrap_or_else(|| allocate_scalar_dynamic_string(state, "item".to_string()));
-    let length_usize = usize::try_from(length).expect("JSON payload length fits in usize");
-
     state.object_property_indices_incomplete = true;
-    state
-        .object_properties
-        .reserve(length_usize.saturating_mul(7));
-    state.array_lengths.reserve(length_usize.saturating_add(1));
-    state.array_storage.reserve(length_usize.saturating_add(1));
 
-    let mut payload_values = Vec::with_capacity(length_usize);
-    for index in 0..length {
-        let index_value = f64::from(index);
-        let row = allocate_scalar_object(state);
-        state
-            .object_properties
-            .push((row, "active", ScalarValue::Boolean(index % 3 == 0)));
-        state
-            .object_properties
-            .push((row, "id", ScalarValue::Number(index_value)));
+    let payload = allocate_scalar_array(state, length);
+    let Some(object_count) = length.checked_mul(3) else {
+        return ScalarValue::Object(payload);
+    };
+    let first_object_id = state.next_object_id;
+    let Some(next_object_id) = first_object_id.checked_add(object_count) else {
+        return ScalarValue::Object(payload);
+    };
+    state.next_object_id = next_object_id;
+    state.json_payload_layouts.push(ScalarJsonPayloadLayout {
+        first_object_id,
+        start_index: 0,
+        length,
+        lane_divisor: 7,
+        active_divisor: 3,
+        label_value,
+        name_value,
+        lane_property_name: "lane",
+        label_property_name: "label",
+        active_property_name: "active",
+        id_property_name: "id",
+        meta_property_name: "meta",
+        name_property_name: "name",
+        points_property_name: "points",
+    });
 
-        let meta = allocate_scalar_object(state);
+    let last_storage_index = usize::try_from(next_object_id - 1).expect("object id fits in usize");
+    if state.array_lengths.len() <= last_storage_index {
         state
-            .object_properties
-            .push((meta, "lane", ScalarValue::Number(f64::from(index % 7))));
-        state.object_properties.push((meta, "label", label_value));
-
-        let points = allocate_scalar_array_with_values(
-            state,
-            vec![
-                ScalarValue::Number(index_value),
-                ScalarValue::Number(index_value * 2.0),
-                ScalarValue::Number(index_value * 3.0),
-            ],
-        );
-
+            .array_lengths
+            .resize_with(last_storage_index + 1, || None);
+    }
+    if state.array_storage.len() <= last_storage_index {
         state
-            .object_properties
-            .push((row, "meta", ScalarValue::Object(meta)));
-        state.object_properties.push((row, "name", name_value));
+            .array_storage
+            .resize_with(last_storage_index + 1, || None);
+    }
+    if state.array_inline3_storage.len() <= last_storage_index {
         state
-            .object_properties
-            .push((row, "points", ScalarValue::Object(points)));
-        payload_values.push(ScalarValue::Object(row));
+            .array_inline3_storage
+            .resize_with(last_storage_index + 1, || None);
     }
 
-    ScalarValue::Object(allocate_scalar_array_with_values(state, payload_values))
-}
+    let ScalarObjectHandle::Array(payload_id) = payload else {
+        unreachable!("allocated payload is an array");
+    };
+    let payload_storage_index = usize::try_from(payload_id).expect("array id fits in usize");
+    let storage = state.array_storage[payload_storage_index]
+        .as_mut()
+        .expect("payload array storage initialized");
+    for index in 0..length {
+        let index_value = f64::from(index);
+        let object_offset = index
+            .checked_mul(3)
+            .expect("JSON payload object offset fits in u32");
+        let points_id = first_object_id
+            .checked_add(object_offset + 1)
+            .expect("reserved JSON payload points id fits in u32");
+        let row_id = first_object_id
+            .checked_add(object_offset + 2)
+            .expect("reserved JSON payload row id fits in u32");
+        let points_storage_index =
+            usize::try_from(points_id).expect("points array id fits in usize");
+        state.array_lengths[points_storage_index] = Some(3);
+        state.array_inline3_storage[points_storage_index] = Some([
+            ScalarValue::Number(index_value),
+            ScalarValue::Number(index_value * 2.0),
+            ScalarValue::Number(index_value * 3.0),
+        ]);
+        storage[usize::try_from(index).expect("array index fits in usize")] =
+            ScalarValue::Object(ScalarObjectHandle::Object(row_id));
+    }
 
+    ScalarValue::Object(payload)
+}
 fn scalar_property_name_for_json_key<'a>(
     bytecode: &HermesBytecode<'a>,
     state: &mut ScalarExecutorState<'a>,
@@ -23861,6 +23894,12 @@ fn read_cached_scalar_object_property_for_get<'a>(
         }
         if handle == ScalarObjectHandle::Math
             && let Some(value) = read_scalar_math_intrinsic_property(property_name)
+        {
+            return Ok(value);
+        }
+        if !state.json_payload_layouts.is_empty()
+            && let ScalarObjectHandle::Object(_) = handle
+            && let Some(value) = read_scalar_json_payload_property(state, handle, property_name)
         {
             return Ok(value);
         }
@@ -32095,6 +32134,7 @@ mod tests {
             )
         );
 
+        let object_properties_before_parse = state.object_properties.len();
         let parsed = call_scalar_json_parse(
             &bytecode,
             &mut state,
@@ -32114,6 +32154,12 @@ mod tests {
             read_scalar_array_element(&state, points, 2),
             ScalarValue::Number(3.0),
         );
+        assert_eq!(
+            state.object_properties.len(),
+            object_properties_before_parse
+        );
+        assert_eq!(state.json_payload_layouts.len(), 1);
+        assert!(state.json_payload_materialized_objects.is_empty());
     }
 
     #[test]

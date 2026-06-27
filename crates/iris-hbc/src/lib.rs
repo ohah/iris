@@ -22688,6 +22688,39 @@ fn call_scalar_direct_function<'a>(
             )
         }
         110 => {
+            if let ScalarValue::Function(function) = callee {
+                let value_argument = read_scalar_call_argument_operand(
+                    registers,
+                    function_id,
+                    instruction,
+                    instruction_bytes,
+                    1,
+                )?;
+                if let ScalarValue::Number(value) = value_argument {
+                    if let Some(value) = call_scalar_native_math_number(function, value) {
+                        return Ok(value);
+                    }
+                }
+
+                let this_argument = read_scalar_call_argument_operand(
+                    registers,
+                    function_id,
+                    instruction,
+                    instruction_bytes,
+                    0,
+                )?;
+                let arguments = [this_argument, value_argument];
+                return call_scalar_function(
+                    bytecode,
+                    state,
+                    function_id,
+                    instruction,
+                    callee_register,
+                    callee,
+                    &arguments,
+                );
+            }
+
             let this_argument = read_scalar_call_argument_operand(
                 registers,
                 function_id,
@@ -23221,6 +23254,24 @@ fn write_scalar_array_element(
 ) {
     if let ScalarObjectHandle::Uint8Array(object_id) = array {
         let storage_index = usize::try_from(object_id).expect("Uint8Array id fits in usize");
+        let has_lazy_layout = state
+            .uint8_array_modulo_layouts
+            .get(storage_index)
+            .is_some_and(Option::is_some);
+        if !has_lazy_layout {
+            if let Some(storage) = state
+                .uint8_array_storage
+                .get_mut(storage_index)
+                .and_then(Option::as_mut)
+            {
+                let index = usize::try_from(index).expect("Uint8Array index fits in usize");
+                if let Some(slot) = storage.get_mut(index) {
+                    *slot = scalar_to_uint8(value);
+                }
+                return;
+            }
+        }
+
         materialize_scalar_uint8_array_layout(state, object_id);
         let Some(storage) = state
             .uint8_array_storage

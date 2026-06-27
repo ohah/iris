@@ -19457,6 +19457,22 @@ fn execute_scalar_instruction<'a>(
                     return Ok(ScalarInstructionResult::Continue);
                 }
             }
+            if let Some(ScalarValue::Object(handle @ ScalarObjectHandle::Object(_))) =
+                registers.get(base_register as usize).copied()
+                && state.object_getters.is_empty()
+                && state.object_traversal_layouts.is_empty()
+                && state.json_payload_layouts.is_empty()
+                && let Some(index) =
+                    scalar_cached_own_object_property_index(state, handle, string_id)
+                && matches!(state.object_properties[index].2, ScalarValue::Number(_))
+            {
+                let value =
+                    read_scalar_register(registers, function_id, instruction, value_register)?;
+                if matches!(value, ScalarValue::Number(_)) {
+                    state.object_properties[index].2 = value;
+                    return Ok(ScalarInstructionResult::Continue);
+                }
+            }
             let property_name = read_cached_scalar_string_operand(
                 bytecode,
                 string_operand_cache,

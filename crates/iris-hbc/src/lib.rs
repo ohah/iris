@@ -20015,6 +20015,20 @@ fn execute_scalar_instruction<'a>(
             let delta_width = scalar_jump_delta_width(instruction.opcode);
             let left_register = read_unsigned_operand(instruction_bytes, 1 + delta_width, 1);
             let right_register = read_unsigned_operand(instruction_bytes, 2 + delta_width, 1);
+            if let (Some(ScalarValue::Number(left)), Some(ScalarValue::Number(right))) = (
+                registers.get(left_register as usize).copied(),
+                registers.get(right_register as usize).copied(),
+            ) {
+                if scalar_relational_jump_matches(instruction.opcode, left, right) {
+                    return Ok(ScalarInstructionResult::Jump(read_scalar_jump_target(
+                        instruction,
+                        instruction_bytes,
+                        1,
+                        delta_width,
+                    )));
+                }
+                return Ok(ScalarInstructionResult::Continue);
+            }
             let left_value =
                 read_scalar_register(registers, function_id, instruction, left_register)?;
             let right_value =

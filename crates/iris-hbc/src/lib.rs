@@ -3400,7 +3400,7 @@ struct ScalarTimingProfileExecutionReport<'a> {
     error: Option<String>,
     function_id: u32,
     profile: ScalarInstructionProfile<'a>,
-    timing: ScalarTimingProfile,
+    timing: ScalarTimingProfile<'a>,
     value: Option<ScalarValue>,
 }
 
@@ -3458,25 +3458,31 @@ impl ScalarTimingBucket {
 }
 
 #[derive(Debug)]
-struct ScalarTimingProfile {
+struct ScalarTimingProfile<'a> {
+    call_target_timings: HashMap<(&'static str, &'static str), ScalarTimingBucket>,
     category_timings: HashMap<&'static str, ScalarTimingBucket>,
+    indexed_access_timings: HashMap<(&'static str, &'static str, &'static str), ScalarTimingBucket>,
     instruction_offset_timings: HashMap<(u32, u8), ScalarTimingBucket>,
     opcode_timings: [ScalarTimingBucket; HERMES_OPCODE_COUNT],
+    property_access_timings: HashMap<(&'static str, &'static str, &'a str), ScalarTimingBucket>,
     total_ns: u128,
 }
 
-impl Default for ScalarTimingProfile {
+impl Default for ScalarTimingProfile<'_> {
     fn default() -> Self {
         Self {
+            call_target_timings: HashMap::new(),
             category_timings: HashMap::new(),
+            indexed_access_timings: HashMap::new(),
             instruction_offset_timings: HashMap::new(),
             opcode_timings: [ScalarTimingBucket::default(); HERMES_OPCODE_COUNT],
+            property_access_timings: HashMap::new(),
             total_ns: 0,
         }
     }
 }
 
-impl ScalarTimingProfile {
+impl<'a> ScalarTimingProfile<'a> {
     fn record(&mut self, instruction: HermesInstruction, elapsed_ns: u128) {
         self.total_ns = self.total_ns.saturating_add(elapsed_ns);
         if let Some(bucket) = self.opcode_timings.get_mut(usize::from(instruction.opcode)) {
@@ -3488,6 +3494,35 @@ impl ScalarTimingProfile {
             .record(elapsed_ns);
         self.category_timings
             .entry(scalar_timing_category(instruction.opcode))
+            .or_default()
+            .record(elapsed_ns);
+    }
+
+    fn record_property_access(
+        &mut self,
+        key: (&'static str, &'static str, &'a str),
+        elapsed_ns: u128,
+    ) {
+        self.property_access_timings
+            .entry(key)
+            .or_default()
+            .record(elapsed_ns);
+    }
+
+    fn record_indexed_access(
+        &mut self,
+        key: (&'static str, &'static str, &'static str),
+        elapsed_ns: u128,
+    ) {
+        self.indexed_access_timings
+            .entry(key)
+            .or_default()
+            .record(elapsed_ns);
+    }
+
+    fn record_call_target(&mut self, key: (&'static str, &'static str), elapsed_ns: u128) {
+        self.call_target_timings
+            .entry(key)
             .or_default()
             .record(elapsed_ns);
     }
@@ -17871,6 +17906,17 @@ fn execute_scalar_function_timing_profiled<'a>(
             instruction,
             current_instruction_bytes,
         );
+        let property_timing_key = scalar_named_property_access_timing_key(
+            bytecode,
+            &registers,
+            function_id,
+            instruction,
+            current_instruction_bytes,
+        );
+        let indexed_timing_key =
+            scalar_indexed_access_timing_key(&registers, instruction, current_instruction_bytes);
+        let call_target_timing_key =
+            scalar_call_target_timing_key(&registers, instruction, current_instruction_bytes);
 
         let started_at = std::time::Instant::now();
         let result = execute_scalar_instruction(
@@ -17884,7 +17930,17 @@ fn execute_scalar_function_timing_profiled<'a>(
             instruction,
             None,
         );
-        timing.record(instruction, started_at.elapsed().as_nanos());
+        let elapsed_ns = started_at.elapsed().as_nanos();
+        timing.record(instruction, elapsed_ns);
+        if let Some(key) = property_timing_key {
+            timing.record_property_access(key, elapsed_ns);
+        }
+        if let Some(key) = indexed_timing_key {
+            timing.record_indexed_access(key, elapsed_ns);
+        }
+        if let Some(key) = call_target_timing_key {
+            timing.record_call_target(key, elapsed_ns);
+        }
 
         let result = match result {
             Ok(result) => result,
@@ -18256,6 +18312,64 @@ fn record_scalar_named_property_access<'a>(
         .or_insert(0) += 1;
 }
 
+fn scalar_named_property_access_timing_key<'a>(
+    bytecode: &HermesBytecode<'a>,
+    registers: &[ScalarValue],
+    function_id: u32,
+    instruction: HermesInstruction,
+    instruction_bytes: &[u8],
+) -> Option<(&'static str, &'static str, &'a str)> {
+    let access = match instruction.opcode {
+        68 => ScalarProfileNamedAccess {
+            base_offset: 2,
+            base_width: 1,
+            string_offset: 4,
+            string_width: 1,
+            role: "get",
+        },
+        69 | 72 => ScalarProfileNamedAccess {
+            base_offset: 2,
+            base_width: 1,
+            string_offset: 4,
+            string_width: 2,
+            role: "get",
+        },
+        74 | 75 => ScalarProfileNamedAccess {
+            base_offset: 1,
+            base_width: 1,
+            string_offset: 4,
+            string_width: 2,
+            role: "put",
+        },
+        86 => ScalarProfileNamedAccess {
+            base_offset: 1,
+            base_width: 1,
+            string_offset: 4,
+            string_width: 2,
+            role: "define",
+        },
+        87 => ScalarProfileNamedAccess {
+            base_offset: 1,
+            base_width: 1,
+            string_offset: 4,
+            string_width: 4,
+            role: "define",
+        },
+        _ => return None,
+    };
+    let base_register =
+        read_unsigned_operand(instruction_bytes, access.base_offset, access.base_width);
+    let property_name = read_scalar_string_operand(
+        bytecode,
+        function_id,
+        instruction,
+        read_unsigned_operand(instruction_bytes, access.string_offset, access.string_width),
+    )
+    .ok()?;
+    let base_kind = profile_register_base_kind(registers, base_register);
+    Some((access.role, base_kind, property_name))
+}
+
 fn scalar_profile_base_kind(value: ScalarValue) -> &'static str {
     match value {
         ScalarValue::Object(ScalarObjectHandle::Global) => "global",
@@ -18369,6 +18483,42 @@ fn record_scalar_immediate_index_access(
         .or_insert(0) += 1;
 }
 
+fn scalar_indexed_access_timing_key(
+    registers: &[ScalarValue],
+    instruction: HermesInstruction,
+    instruction_bytes: &[u8],
+) -> Option<(&'static str, &'static str, &'static str)> {
+    match instruction.opcode {
+        93 => {
+            let base_register = read_unsigned_operand(instruction_bytes, 2, 1);
+            let key_register = read_unsigned_operand(instruction_bytes, 3, 1);
+            Some((
+                "get-index",
+                profile_register_base_kind(registers, base_register),
+                profile_register_key_kind(registers, key_register),
+            ))
+        }
+        94 => {
+            let base_register = read_unsigned_operand(instruction_bytes, 2, 1);
+            Some((
+                "get-immediate-index",
+                profile_register_base_kind(registers, base_register),
+                "immediate",
+            ))
+        }
+        96 | 97 => {
+            let base_register = read_unsigned_operand(instruction_bytes, 1, 1);
+            let key_register = read_unsigned_operand(instruction_bytes, 2, 1);
+            Some((
+                "put-index",
+                profile_register_base_kind(registers, base_register),
+                profile_register_key_kind(registers, key_register),
+            ))
+        }
+        _ => None,
+    }
+}
+
 fn profile_register_base_kind(registers: &[ScalarValue], register: u32) -> &'static str {
     profile_register_value_kind(registers, register)
 }
@@ -18465,6 +18615,45 @@ fn record_scalar_register_call_target(
         .entry((role, target))
         .or_insert(0) += 1;
     target
+}
+
+fn scalar_call_target_timing_key(
+    registers: &[ScalarValue],
+    instruction: HermesInstruction,
+    instruction_bytes: &[u8],
+) -> Option<(&'static str, &'static str)> {
+    match instruction.opcode {
+        107 => {
+            let constructor_register = read_unsigned_operand(instruction_bytes, 2, 1);
+            Some((
+                "construct",
+                scalar_register_call_target_name(registers, constructor_register),
+            ))
+        }
+        108 | 110 | 111 | 112 => {
+            let callee_register = read_unsigned_operand(instruction_bytes, 2, 1);
+            Some((
+                scalar_profile_call_opcode_role(instruction.opcode),
+                scalar_register_call_target_name(registers, callee_register),
+            ))
+        }
+        115 | 116 => {
+            let builtin_id = read_unsigned_operand(instruction_bytes, 2, 1);
+            Some(("builtin", scalar_profile_builtin_name(builtin_id)))
+        }
+        _ => None,
+    }
+}
+
+fn scalar_register_call_target_name(registers: &[ScalarValue], register: u32) -> &'static str {
+    match usize::try_from(register)
+        .ok()
+        .and_then(|index| registers.get(index))
+    {
+        Some(ScalarValue::Function(function)) => scalar_profile_function_name(*function),
+        Some(value) => scalar_profile_call_value_kind(*value),
+        None => "register-oob",
+    }
 }
 
 fn record_scalar_direct_call_argument_kind_profile(
@@ -18643,7 +18832,7 @@ fn format_scalar_timing_profile_execution_report(
         .as_ref()
         .map_or_else(|| "none".to_owned(), |error| error.clone());
     format!(
-        "status={status}, function={}, value={value}, error={error}, declaredGlobals={}, totalInstructions={}, jumpsTaken={}, totalMeasuredNs={}, topOpcodeTimings=[{}], topInstructionTimings=[{}], topCategoryTimings=[{}], topOpcodes=[{}], topInstructionOffsets=[{}], topStringOperands=[{}], topPropertyAccesses=[{}], topIndexedAccesses=[{}], topCallTargets=[{}], topCallArgumentKinds=[{}]",
+        "status={status}, function={}, value={value}, error={error}, declaredGlobals={}, totalInstructions={}, jumpsTaken={}, totalMeasuredNs={}, topOpcodeTimings=[{}], topInstructionTimings=[{}], topCategoryTimings=[{}], topPropertyTimings=[{}], topIndexedTimings=[{}], topCallTargetTimings=[{}], topOpcodes=[{}], topInstructionOffsets=[{}], topStringOperands=[{}], topPropertyAccesses=[{}], topIndexedAccesses=[{}], topCallTargets=[{}], topCallArgumentKinds=[{}]",
         report.function_id,
         report.declared_global_count,
         report.profile.total_instructions,
@@ -18652,6 +18841,9 @@ fn format_scalar_timing_profile_execution_report(
         format_scalar_timing_opcode_counts(&report.timing, 16),
         format_scalar_timing_instruction_offset_counts(&report.timing, 20),
         format_scalar_timing_category_counts(&report.timing, 12),
+        format_scalar_timing_property_access_counts(&report.timing, 20),
+        format_scalar_timing_indexed_access_counts(&report.timing, 12),
+        format_scalar_timing_call_target_counts(&report.timing, 12),
         format_scalar_profile_opcode_counts(&report.profile, 12),
         format_scalar_profile_instruction_offset_counts(&report.profile, 16),
         format_scalar_profile_string_counts(&report.profile, 16),
@@ -18719,7 +18911,7 @@ fn scalar_timing_category(opcode: u8) -> &'static str {
     }
 }
 
-fn format_scalar_timing_opcode_counts(profile: &ScalarTimingProfile, limit: usize) -> String {
+fn format_scalar_timing_opcode_counts(profile: &ScalarTimingProfile<'_>, limit: usize) -> String {
     let mut counts = profile
         .opcode_timings
         .iter()
@@ -18755,7 +18947,7 @@ fn format_scalar_timing_opcode_counts(profile: &ScalarTimingProfile, limit: usiz
 }
 
 fn format_scalar_timing_instruction_offset_counts(
-    profile: &ScalarTimingProfile,
+    profile: &ScalarTimingProfile<'_>,
     limit: usize,
 ) -> String {
     let mut counts = profile
@@ -18788,7 +18980,7 @@ fn format_scalar_timing_instruction_offset_counts(
         .join(",")
 }
 
-fn format_scalar_timing_category_counts(profile: &ScalarTimingProfile, limit: usize) -> String {
+fn format_scalar_timing_category_counts(profile: &ScalarTimingProfile<'_>, limit: usize) -> String {
     let mut counts = profile
         .category_timings
         .iter()
@@ -18808,6 +19000,109 @@ fn format_scalar_timing_category_counts(profile: &ScalarTimingProfile, limit: us
         .into_iter()
         .take(limit)
         .map(|(category, bucket)| format!("{category}={}", format_scalar_timing_bucket(bucket)))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn format_scalar_timing_property_access_counts(
+    profile: &ScalarTimingProfile<'_>,
+    limit: usize,
+) -> String {
+    let mut counts = profile
+        .property_access_timings
+        .iter()
+        .map(|((role, base_kind, property_name), bucket)| {
+            (*role, *base_kind, *property_name, *bucket)
+        })
+        .collect::<Vec<_>>();
+    counts.sort_by(
+        |(left_role, left_base, left_property, left_bucket),
+         (right_role, right_base, right_property, right_bucket)| {
+            right_bucket
+                .total_ns
+                .cmp(&left_bucket.total_ns)
+                .then_with(|| right_bucket.count.cmp(&left_bucket.count))
+                .then_with(|| left_role.cmp(right_role))
+                .then_with(|| left_base.cmp(right_base))
+                .then_with(|| left_property.cmp(right_property))
+        },
+    );
+
+    counts
+        .into_iter()
+        .take(limit)
+        .map(|(role, base_kind, property_name, bucket)| {
+            format!(
+                "{role}:{base_kind}:{}={}",
+                format_profile_string(property_name),
+                format_scalar_timing_bucket(bucket)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn format_scalar_timing_indexed_access_counts(
+    profile: &ScalarTimingProfile<'_>,
+    limit: usize,
+) -> String {
+    let mut counts = profile
+        .indexed_access_timings
+        .iter()
+        .map(|((role, base_kind, key_kind), bucket)| (*role, *base_kind, *key_kind, *bucket))
+        .collect::<Vec<_>>();
+    counts.sort_by(
+        |(left_role, left_base, left_key, left_bucket),
+         (right_role, right_base, right_key, right_bucket)| {
+            right_bucket
+                .total_ns
+                .cmp(&left_bucket.total_ns)
+                .then_with(|| right_bucket.count.cmp(&left_bucket.count))
+                .then_with(|| left_role.cmp(right_role))
+                .then_with(|| left_base.cmp(right_base))
+                .then_with(|| left_key.cmp(right_key))
+        },
+    );
+
+    counts
+        .into_iter()
+        .take(limit)
+        .map(|(role, base_kind, key_kind, bucket)| {
+            format!(
+                "{role}:{base_kind}:{key_kind}={}",
+                format_scalar_timing_bucket(bucket)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn format_scalar_timing_call_target_counts(
+    profile: &ScalarTimingProfile<'_>,
+    limit: usize,
+) -> String {
+    let mut counts = profile
+        .call_target_timings
+        .iter()
+        .map(|((role, target), bucket)| (*role, *target, *bucket))
+        .collect::<Vec<_>>();
+    counts.sort_by(
+        |(left_role, left_target, left_bucket), (right_role, right_target, right_bucket)| {
+            right_bucket
+                .total_ns
+                .cmp(&left_bucket.total_ns)
+                .then_with(|| right_bucket.count.cmp(&left_bucket.count))
+                .then_with(|| left_role.cmp(right_role))
+                .then_with(|| left_target.cmp(right_target))
+        },
+    );
+
+    counts
+        .into_iter()
+        .take(limit)
+        .map(|(role, target, bucket)| {
+            format!("{role}:{target}={}", format_scalar_timing_bucket(bucket))
+        })
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -24646,8 +24941,8 @@ fn read_cached_scalar_object_property_for_get<'a>(
             return Ok(value);
         }
         if !state.json_payload_layouts.is_empty()
-            && let ScalarObjectHandle::Object(_) = handle
-            && let Some(value) = read_scalar_json_payload_property(state, handle, property_name)
+            && let Some(value) =
+                try_read_scalar_json_payload_cached_property(state, handle, property_name)
         {
             return Ok(value);
         }
@@ -25343,6 +25638,60 @@ fn write_scalar_named_object_property<'a>(
     write_scalar_named_object_property_index(state, object, property_name, value);
 }
 
+fn scalar_object_property_names_contain(
+    state: &ScalarExecutorState<'_>,
+    object: ScalarObjectHandle,
+    property_name: &str,
+) -> bool {
+    state
+        .object_property_names
+        .get(&object)
+        .is_some_and(|names| {
+            names
+                .iter()
+                .any(|name| scalar_property_name_matches(name, property_name))
+        })
+}
+
+fn scalar_tail_own_object_property_index(
+    state: &ScalarExecutorState<'_>,
+    object: ScalarObjectHandle,
+    property_name: &str,
+) -> (usize, Option<usize>) {
+    let mut tail_count = 0;
+    let mut property_index = None;
+    for (index, (stored_object, name, _)) in state.object_properties.iter().enumerate().rev() {
+        if *stored_object != object {
+            break;
+        }
+        tail_count += 1;
+        if scalar_property_name_matches(name, property_name) {
+            property_index = Some(index);
+            break;
+        }
+    }
+    (tail_count, property_index)
+}
+
+fn append_scalar_named_object_property_index<'a>(
+    state: &mut ScalarExecutorState<'a>,
+    object: ScalarObjectHandle,
+    property_name: &'a str,
+    value: ScalarValue,
+) -> usize {
+    let property_index = state.object_properties.len();
+    state
+        .object_property_indices
+        .insert((object, property_name), property_index);
+    state
+        .object_property_names
+        .entry(object)
+        .or_default()
+        .push(property_name);
+    state.object_properties.push((object, property_name, value));
+    property_index
+}
+
 fn write_scalar_named_object_property_index<'a>(
     state: &mut ScalarExecutorState<'a>,
     object: ScalarObjectHandle,
@@ -25370,14 +25719,29 @@ fn write_scalar_named_object_property_index<'a>(
             return property_index;
         }
     }
-    let property_may_exist = state
-        .object_property_names
-        .get(&object)
-        .is_some_and(|names| {
-            names
-                .iter()
-                .any(|name| scalar_property_name_matches(name, property_name))
-        });
+    if !state.object_property_indices_incomplete
+        && state.object_properties.len() > SCALAR_LINEAR_OBJECT_PROPERTY_LIMIT
+    {
+        let (tail_count, tail_property_index) =
+            scalar_tail_own_object_property_index(state, object, property_name);
+        if let Some(names) = state.object_property_names.get(&object) {
+            if tail_count == names.len() {
+                if let Some(property_index) = tail_property_index {
+                    state.object_properties[property_index].2 = value;
+                    return property_index;
+                }
+                return append_scalar_named_object_property_index(
+                    state,
+                    object,
+                    property_name,
+                    value,
+                );
+            }
+        } else if tail_count == 0 {
+            return append_scalar_named_object_property_index(state, object, property_name, value);
+        }
+    }
+    let property_may_exist = scalar_object_property_names_contain(state, object, property_name);
     if property_may_exist {
         if let Some(property_index) = state
             .object_property_indices
@@ -25389,17 +25753,7 @@ fn write_scalar_named_object_property_index<'a>(
         }
     }
 
-    let property_index = state.object_properties.len();
-    state
-        .object_property_indices
-        .insert((object, property_name), property_index);
-    state
-        .object_property_names
-        .entry(object)
-        .or_default()
-        .push(property_name);
-    state.object_properties.push((object, property_name, value));
-    property_index
+    append_scalar_named_object_property_index(state, object, property_name, value)
 }
 
 fn write_cached_scalar_named_object_property<'a>(
@@ -25420,16 +25774,7 @@ fn write_scalar_new_object_property<'a>(
     property_name: &'a str,
     value: ScalarValue,
 ) {
-    let property_index = state.object_properties.len();
-    state
-        .object_property_indices
-        .insert((object, property_name), property_index);
-    state
-        .object_property_names
-        .entry(object)
-        .or_default()
-        .push(property_name);
-    state.object_properties.push((object, property_name, value));
+    append_scalar_named_object_property_index(state, object, property_name, value);
 }
 
 #[cfg(test)]
@@ -25720,6 +26065,26 @@ fn read_scalar_json_payload_property(
     if scalar_property_name_matches(layout.points_property_name, property_name) {
         let points_id = layout.first_object_id.checked_add(object_offset + 1)?;
         return Some(ScalarValue::Object(ScalarObjectHandle::Array(points_id)));
+    }
+    None
+}
+
+#[inline(never)]
+fn try_read_scalar_json_payload_cached_property(
+    state: &ScalarExecutorState<'_>,
+    handle: ScalarObjectHandle,
+    property_name: &str,
+) -> Option<ScalarValue> {
+    if property_name == "length"
+        && let ScalarObjectHandle::Array(_) = handle
+        && !scalar_object_property_names_contain(state, handle, "length")
+    {
+        return Some(ScalarValue::Number(
+            read_scalar_array_length(state, handle).map_or(0.0, f64::from),
+        ));
+    }
+    if let ScalarObjectHandle::Object(_) = handle {
+        return read_scalar_json_payload_property(state, handle, property_name);
     }
     None
 }
@@ -29687,6 +30052,8 @@ mod tests {
         assert!(report.contains("topOpcodeTimings=["));
         assert!(report.contains("topInstructionTimings=["));
         assert!(report.contains("topCategoryTimings=["));
+        assert!(report.contains("topPropertyTimings=["));
+        assert!(report.contains("get:global:cdef=count:1|totalNs:"));
         assert!(report.contains("DeclareGlobalVar(67)=count:1|totalNs:"));
         assert!(report.contains("get:global:cdef=1"));
     }

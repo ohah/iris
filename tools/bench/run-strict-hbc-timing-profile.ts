@@ -33,6 +33,23 @@ type CategoryTimingEntry = TimingEntry & {
   category: string;
 };
 
+type PropertyAccessTimingEntry = TimingEntry & {
+  role: string;
+  baseKind: string;
+  propertyName: string;
+};
+
+type IndexedAccessTimingEntry = TimingEntry & {
+  role: string;
+  baseKind: string;
+  keyKind: string;
+};
+
+type CallTargetTimingEntry = TimingEntry & {
+  role: string;
+  target: string;
+};
+
 type OpcodeCountEntry = CountEntry & {
   name: string;
   opcode: number;
@@ -83,6 +100,9 @@ type ParsedTimingProfileReport = {
   topOpcodeTimings: OpcodeTimingEntry[];
   topInstructionTimings: InstructionTimingEntry[];
   topCategoryTimings: CategoryTimingEntry[];
+  topPropertyTimings: PropertyAccessTimingEntry[];
+  topIndexedTimings: IndexedAccessTimingEntry[];
+  topCallTargetTimings: CallTargetTimingEntry[];
   topOpcodes: OpcodeCountEntry[];
   topInstructionOffsets: InstructionOffsetCountEntry[];
   topStringOperands: StringOperandCountEntry[];
@@ -366,6 +386,77 @@ function parseCategoryTimings(rawValue: string): CategoryTimingEntry[] {
   });
 }
 
+function parsePropertyAccessTimings(rawValue: string): PropertyAccessTimingEntry[] {
+  return splitProfileList(rawValue).flatMap((entry) => {
+    const parsed = timingEntry(entry);
+    if (parsed == null) {
+      return [];
+    }
+    const parts = parsed.key.split(":");
+    if (parts.length < 3) {
+      return [];
+    }
+    return [
+      {
+        role: parts[0],
+        baseKind: parts[1],
+        propertyName: parts.slice(2).join(":"),
+        count: parsed.count,
+        totalNs: parsed.totalNs,
+        averageNs: parsed.averageNs,
+        maxNs: parsed.maxNs,
+      },
+    ];
+  });
+}
+
+function parseIndexedAccessTimings(rawValue: string): IndexedAccessTimingEntry[] {
+  return splitProfileList(rawValue).flatMap((entry) => {
+    const parsed = timingEntry(entry);
+    if (parsed == null) {
+      return [];
+    }
+    const [role, baseKind, keyKind] = parsed.key.split(":");
+    if (role == null || baseKind == null || keyKind == null) {
+      return [];
+    }
+    return [
+      {
+        role,
+        baseKind,
+        keyKind,
+        count: parsed.count,
+        totalNs: parsed.totalNs,
+        averageNs: parsed.averageNs,
+        maxNs: parsed.maxNs,
+      },
+    ];
+  });
+}
+
+function parseCallTargetTimings(rawValue: string): CallTargetTimingEntry[] {
+  return splitProfileList(rawValue).flatMap((entry) => {
+    const parsed = timingEntry(entry);
+    if (parsed == null) {
+      return [];
+    }
+    const separator = parsed.key.indexOf(":");
+    if (separator < 0) {
+      return [];
+    }
+    return [
+      {
+        role: parsed.key.slice(0, separator),
+        target: parsed.key.slice(separator + 1),
+        count: parsed.count,
+        totalNs: parsed.totalNs,
+        averageNs: parsed.averageNs,
+        maxNs: parsed.maxNs,
+      },
+    ];
+  });
+}
+
 function parseOpcodeCounts(rawValue: string): OpcodeCountEntry[] {
   return splitProfileList(rawValue).flatMap((entry) => {
     const parsed = countEntry(entry);
@@ -511,6 +602,9 @@ function parseTimingProfileReport(report: string): ParsedTimingProfileReport {
       readBracketList(report, "topInstructionTimings"),
     ),
     topCategoryTimings: parseCategoryTimings(readBracketList(report, "topCategoryTimings")),
+    topPropertyTimings: parsePropertyAccessTimings(readBracketList(report, "topPropertyTimings")),
+    topIndexedTimings: parseIndexedAccessTimings(readBracketList(report, "topIndexedTimings")),
+    topCallTargetTimings: parseCallTargetTimings(readBracketList(report, "topCallTargetTimings")),
     topOpcodes: parseOpcodeCounts(readBracketList(report, "topOpcodes")),
     topInstructionOffsets: parseInstructionOffsetCounts(
       readBracketList(report, "topInstructionOffsets"),

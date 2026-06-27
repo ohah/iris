@@ -3080,6 +3080,7 @@ struct ScalarExecutorState<'a> {
     environment_parents: Vec<(ScalarEnvironmentHandle, Option<ScalarEnvironmentHandle>)>,
     environment_slots: Vec<(ScalarEnvironmentHandle, u32, ScalarValue)>,
     function_properties: Vec<(ScalarFunctionHandle, &'a str, ScalarValue)>,
+    global_math_shadowed: bool,
     global_property_operand_cache: [Option<(u32, usize)>; SCALAR_STRING_OPERAND_CACHE_SLOTS],
     global_properties: Vec<(&'a str, ScalarValue)>,
     json_property_name_cache: HashMap<String, Option<&'a str>>,
@@ -24591,6 +24592,9 @@ fn delete_scalar_property(
             state
                 .global_properties
                 .retain(|(name, _)| *name != property_name);
+            if property_name == "Math" {
+                state.global_math_shadowed = false;
+            }
             clear_scalar_global_property_operand_cache(state);
             Ok(())
         }
@@ -25505,11 +25509,7 @@ fn try_write_cached_scalar_global_math_operand(
     if cached_id != string_id || property_name != "Math" {
         return false;
     }
-    if state
-        .global_properties
-        .iter()
-        .any(|(name, _)| scalar_property_name_matches(name, "Math"))
-    {
+    if state.global_math_shadowed {
         return false;
     }
     let Some(destination_slot) = registers.get_mut(destination as usize) else {
@@ -25595,6 +25595,9 @@ fn write_scalar_global_property<'a>(
     value: ScalarValue,
 ) -> usize {
     let value = map_scalar_global_write(property_name, value);
+    if property_name == "Math" {
+        state.global_math_shadowed = true;
+    }
     if let Some(index) = scalar_global_property_index(state, property_name) {
         state.global_properties[index].1 = value;
         return index;
@@ -31370,6 +31373,7 @@ mod tests {
         string_operand_cache.entries[cache_slot] = Some((1, "Math"));
 
         write_cached_scalar_global_property(&mut state, 1, "Math", ScalarValue::Number(42.0));
+        assert!(state.global_math_shadowed);
         assert_eq!(
             execute_scalar_instruction(
                 &bytecode,
@@ -31386,8 +31390,16 @@ mod tests {
         );
         assert_eq!(registers[0], ScalarValue::Number(42.0));
 
-        state.global_properties.clear();
-        clear_scalar_global_property_operand_cache(&mut state);
+        delete_scalar_property(
+            &mut state,
+            1,
+            instruction,
+            1,
+            ScalarValue::Object(ScalarObjectHandle::Global),
+            ScalarPropertyKey::Name("Math"),
+        )
+        .expect("delete global Math shadow");
+        assert!(!state.global_math_shadowed);
         registers[0] = ScalarValue::Empty;
         assert_eq!(
             execute_scalar_instruction(

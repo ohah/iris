@@ -25180,13 +25180,7 @@ fn read_cached_scalar_own_object_property<'a>(
     let slot = scalar_string_operand_cache_slot(string_id);
     if let Some((cached_object, cached_id, index)) = state.object_property_operand_cache[slot] {
         if cached_object == object && cached_id == string_id {
-            if let Some((stored_object, stored_name, value)) = state.object_properties.get(index) {
-                if *stored_object == object
-                    && scalar_property_name_matches(stored_name, property_name)
-                {
-                    return Some(*value);
-                }
-            }
+            return Some(state.object_properties[index].2);
         }
     }
 

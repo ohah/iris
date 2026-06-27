@@ -19453,9 +19453,7 @@ fn execute_scalar_instruction<'a>(
                 let value =
                     read_scalar_register(registers, function_id, instruction, value_register)?;
                 if matches!(value, ScalarValue::Number(_)) {
-                    let property_name = state.global_properties[index].0;
-                    state.global_properties[index].1 =
-                        map_scalar_global_write(property_name, value);
+                    state.global_properties[index].1 = value;
                     return Ok(ScalarInstructionResult::Continue);
                 }
             }

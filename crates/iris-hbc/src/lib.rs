@@ -19433,6 +19433,18 @@ fn execute_scalar_instruction<'a>(
             let destination = read_unsigned_operand(instruction_bytes, 1, 1);
             let base_register = read_unsigned_operand(instruction_bytes, 2, 1);
             let string_id = read_unsigned_operand(instruction_bytes, 4, 2);
+            if instruction.opcode == 72
+                && try_write_cached_scalar_global_math_operand(
+                    state,
+                    registers,
+                    string_operand_cache,
+                    base_register,
+                    destination,
+                    string_id,
+                )
+            {
+                return Ok(ScalarInstructionResult::Continue);
+            }
             let property_name = read_cached_scalar_string_operand(
                 bytecode,
                 string_operand_cache,
@@ -25460,6 +25472,43 @@ fn scalar_cached_global_property_index(
     Some(index)
 }
 
+#[inline(never)]
+fn try_write_cached_scalar_global_math_operand(
+    state: &ScalarExecutorState<'_>,
+    registers: &mut [ScalarValue],
+    string_operand_cache: &ScalarStringOperandCache<'_>,
+    base_register: u32,
+    destination: u32,
+    string_id: u32,
+) -> bool {
+    if !matches!(
+        registers.get(base_register as usize),
+        Some(ScalarValue::Object(ScalarObjectHandle::Global))
+    ) {
+        return false;
+    }
+    let cache_slot = scalar_string_operand_cache_slot(string_id);
+    let Some((cached_id, property_name)) = string_operand_cache.entries[cache_slot] else {
+        return false;
+    };
+    if cached_id != string_id || property_name != "Math" {
+        return false;
+    }
+    if state
+        .global_properties
+        .iter()
+        .any(|(name, _)| scalar_property_name_matches(name, "Math"))
+    {
+        return false;
+    }
+    let Some(destination_slot) = registers.get_mut(destination as usize) else {
+        return false;
+    };
+
+    *destination_slot = ScalarValue::Object(ScalarObjectHandle::Math);
+    true
+}
+
 fn read_cached_scalar_global_property<'a>(
     state: &mut ScalarExecutorState<'a>,
     string_id: u32,
@@ -31253,6 +31302,62 @@ mod tests {
             read_scalar_global_property(&state, "Symbol"),
             ScalarValue::Function(ScalarFunctionHandle::NativeSymbolConstructor),
         );
+    }
+
+    #[test]
+    fn scalar_try_get_by_id_math_cache_path_respects_global_shadow() {
+        let bytes = fixture_bytecode();
+        let bytecode = HermesBytecode::parse(&bytes).expect("valid Hermes bytecode");
+        let instruction = HermesInstruction {
+            offset: 123,
+            opcode: TRY_GET_BY_ID_OPCODE,
+            width: 6,
+        };
+        let instruction_bytes = [TRY_GET_BY_ID_OPCODE, 0, 1, 0, 1, 0];
+        let mut state = ScalarExecutorState::default();
+        let mut registers = [
+            ScalarValue::Empty,
+            ScalarValue::Object(ScalarObjectHandle::Global),
+        ];
+        let mut string_operand_cache = ScalarStringOperandCache::default();
+        let cache_slot = scalar_string_operand_cache_slot(1);
+        string_operand_cache.entries[cache_slot] = Some((1, "Math"));
+
+        write_cached_scalar_global_property(&mut state, 1, "Math", ScalarValue::Number(42.0));
+        assert_eq!(
+            execute_scalar_instruction(
+                &bytecode,
+                &mut state,
+                &mut registers,
+                &[],
+                1,
+                &instruction_bytes,
+                &mut string_operand_cache,
+                instruction,
+                None,
+            ),
+            Ok(ScalarInstructionResult::Continue),
+        );
+        assert_eq!(registers[0], ScalarValue::Number(42.0));
+
+        state.global_properties.clear();
+        clear_scalar_global_property_operand_cache(&mut state);
+        registers[0] = ScalarValue::Empty;
+        assert_eq!(
+            execute_scalar_instruction(
+                &bytecode,
+                &mut state,
+                &mut registers,
+                &[],
+                1,
+                &instruction_bytes,
+                &mut string_operand_cache,
+                instruction,
+                None,
+            ),
+            Ok(ScalarInstructionResult::Continue),
+        );
+        assert_eq!(registers[0], ScalarValue::Object(ScalarObjectHandle::Math),);
     }
 
     #[test]
